@@ -907,6 +907,13 @@ def _run_chrome_fallback_command(
                 _si = subprocess.STARTUPINFO()
                 _si.dwFlags |= subprocess.STARTF_USESTDHANDLES
                 _popen_extra["startupinfo"] = _si
+            else:
+                # POSIX: run browser in a new session so signals to the parent
+                # (e.g. SIGINT from /api/shutdown or systemd stop) do not
+                # propagate to the Chromium/agent-browser daemon grandchild.
+                # This prevents "saw-the-branch" exits where a browser smoke
+                # started during an agent turn kills the WebUI main process.
+                _popen_extra["start_new_session"] = True
             proc = subprocess.Popen(
                 full, stdout=stdout_fd, stderr=stderr_fd,
                 stdin=subprocess.DEVNULL, env=browser_env,
@@ -2068,6 +2075,10 @@ def _run_browser_command(
                 _si = subprocess.STARTUPINFO()
                 _si.dwFlags |= subprocess.STARTF_USESTDHANDLES
                 _popen_extra["startupinfo"] = _si
+            else:
+                # POSIX: isolate browser daemon from parent's signal/session.
+                # Must match the other Popen site in this file.
+                _popen_extra["start_new_session"] = True
             proc = subprocess.Popen(
                 cmd_parts,
                 stdout=stdout_fd,

@@ -370,7 +370,7 @@ class BaseEnvironment(ABC):
         _quoted_snap = shlex.quote(self._snapshot_path)
         _quoted_cwd_file = shlex.quote(self._cwd_file)
         bootstrap = (
-            f"export -p > {_quoted_snap}\n"
+            f"export -p | grep -viE 'TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL|AUTH' > {_quoted_snap}\n"
             f"declare -f | grep -vE '^_[^_]' >> {_quoted_snap}\n"
             f"alias -p >> {_quoted_snap}\n"
             f"echo 'shopt -s expand_aliases' >> {_quoted_snap}\n"
