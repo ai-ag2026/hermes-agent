@@ -97,7 +97,7 @@ class TestAuxiliaryReasoningMaxTokensFloor:
     def test_other_providers_keep_tiny_budget(self):
         assert _apply_aux_max_tokens_floor("openrouter", "some-model", 16, None) == 16
 
-    def test_build_call_kwargs_applies_deepseek_floor(self):
+    def test_build_call_kwargs_omits_deepseek_floor_for_openai_compatible(self):
         kwargs = _build_call_kwargs(
             "ollama-cloud",
             "deepseek-v4-flash",
@@ -105,7 +105,7 @@ class TestAuxiliaryReasoningMaxTokensFloor:
             max_tokens=16,
             base_url="https://ollama.com/v1",
         )
-        assert kwargs["max_tokens"] == 64
+        assert "max_tokens" not in kwargs
 
 
 class TestAuxiliaryMaxTokensParam:
