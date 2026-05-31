@@ -126,6 +126,35 @@ def _resolve_request_toolset_override(
     return sorted(set(clean)), None
 
 
+def _api_stream_progress_event(
+    event_type: str,
+    *,
+    message_id: str,
+    tool_name: Optional[str] = None,
+    preview: Optional[str] = None,
+    args: Optional[Any] = None,
+) -> Optional[tuple[str, Dict[str, Any]]]:
+    """Map agent progress callbacks to API stream events.
+
+    Reasoning/thinking progress is not a tool call. Keep it on a separate
+    event name so no-tools clients can safely treat ``tool.*`` as real tool
+    activity instead of tripping over an internal thinking update.
+    """
+    if event_type == "reasoning.available":
+        return "reasoning.available", {
+            "message_id": message_id,
+            "delta": preview or "",
+        }
+    if event_type in {"tool.started", "tool.completed", "tool.failed"}:
+        return event_type, {
+            "message_id": message_id,
+            "tool_name": tool_name,
+            "preview": preview,
+            "args": args,
+        }
+    return None
+
+
 def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     """Normalize boolean-like API payload values.
 
@@ -1655,11 +1684,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
-            if event_type == "reasoning.available":
-                _enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
-            elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
-                event_name = event_type.replace("tool.", "tool.")
-                _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
+            mapped = _api_stream_progress_event(
+                event_type,
+                message_id=message_id,
+                tool_name=tool_name,
+                preview=preview,
+                args=args,
+            )
+            if mapped is not None:
+                name, payload = mapped
+                _enqueue(name, payload)
 
         async def _run_and_signal() -> None:
             try:
