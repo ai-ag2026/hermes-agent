@@ -46,6 +46,40 @@ def test_request_can_restrict_to_enabled_subset_only():
     assert error is None
 
 
+def test_api_stream_progress_event_keeps_reasoning_separate_from_tool_events():
+    mapped = api_server._api_stream_progress_event(
+        "reasoning.available",
+        message_id="msg_1",
+        tool_name="_thinking",
+        preview="thinking text",
+    )
+
+    assert mapped == (
+        "reasoning.available",
+        {"message_id": "msg_1", "delta": "thinking text"},
+    )
+
+
+def test_api_stream_progress_event_preserves_real_tool_events():
+    mapped = api_server._api_stream_progress_event(
+        "tool.started",
+        message_id="msg_1",
+        tool_name="terminal",
+        preview="ls",
+        args={"command": "ls"},
+    )
+
+    assert mapped == (
+        "tool.started",
+        {
+            "message_id": "msg_1",
+            "tool_name": "terminal",
+            "preview": "ls",
+            "args": {"command": "ls"},
+        },
+    )
+
+
 def test_request_toolset_override_rejects_expansion_beyond_platform_surface():
     override, error = api_server._resolve_request_toolset_override(
         {"enabled_toolsets": ["web", "terminal"]},
