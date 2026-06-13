@@ -1858,7 +1858,12 @@ def connect(
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
                 conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
+                # SQLite's default 1000 pages keeps checkpoint churn low under
+                # worker bursts while synchronous=FULL still fsyncs committed WAL
+                # frames.  A lower value forces frequent checkpoints and expands
+                # the window for integrity probes/invariants to observe hot main
+                # DB state mid-checkpoint.
+                conn.execute("PRAGMA wal_autocheckpoint=1000")
                 conn.execute("PRAGMA foreign_keys=ON")
                 # Zero freed pages so a later torn write cannot expose stale
                 # cell content; persisted in the DB header for new DBs.
@@ -2365,9 +2370,15 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
     """Read the SQLite header page_count and compare against actual file size.
 
     Raises sqlite3.DatabaseError if the file is shorter than the header claims
-    (torn-extend corruption).
+    (torn-extend corruption).  This invariant is only meaningful for rollback
+    journal modes.  In WAL mode the main DB file may legitimately lag while
+    committed frames still live in ``-wal``; comparing only the main file there
+    races normal checkpoints and false-positives under parallel kanban workers.
     """
     try:
+        journal_mode_row = conn.execute("PRAGMA journal_mode").fetchone()
+        if journal_mode_row and str(journal_mode_row[0]).lower() == "wal":
+            return
         row = conn.execute("PRAGMA database_list").fetchone()
         if row is None:
             return

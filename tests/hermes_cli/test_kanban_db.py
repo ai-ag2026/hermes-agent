@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import multiprocessing
 import os
 import sqlite3
 import subprocess
@@ -15,6 +16,25 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+def _kanban_multiprocess_writer(db_path: str, proc_idx: int, n: int, queue):
+    """Small real-process writer used by the WAL concurrency regression test."""
+    try:
+        for i in range(n):
+            with kb.connect_closing(db_path=Path(db_path)) as conn:
+                kb.create_task(
+                    conn,
+                    title=f"stress p{proc_idx} #{i}",
+                    body="multiprocess kanban sqlite stress",
+                    assignee="worker",
+                    created_by=f"proc-{proc_idx}",
+                    workspace_kind="dir",
+                    workspace_path=str(Path(db_path).parent),
+                )
+        queue.put(None)
+    except Exception as exc:  # pragma: no cover - surfaced in parent assertion
+        queue.put(f"{type(exc).__name__}: {exc}")
 
 
 @pytest.fixture
@@ -4088,6 +4108,81 @@ def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
 # Corruption guard (issue #30687)
 # ---------------------------------------------------------------------------
 
+def test_file_length_invariant_is_skipped_in_wal_mode(tmp_path, monkeypatch):
+    """Main-file length checks are invalid while committed frames live in WAL."""
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+
+    with kb.connect(db_path=db_path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        calls = []
+
+        def fake_getsize(_path):
+            calls.append(_path)
+            return 0
+
+        monkeypatch.setattr(kb.os.path, "getsize", fake_getsize)
+        kb._check_file_length_invariant(conn)
+
+    assert calls == []
+
+
+def test_file_length_invariant_still_protects_rollback_journal(tmp_path, monkeypatch):
+    """The torn-extend guard still applies when the main DB is authoritative."""
+    db_path = tmp_path / "delete-mode.db"
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO t(value) VALUES ('x')")
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+        monkeypatch.setattr(kb.os.path, "getsize", lambda _path: 0)
+        with pytest.raises(sqlite3.DatabaseError, match="torn-extend detected"):
+            kb._check_file_length_invariant(conn)
+    finally:
+        conn.close()
+
+
+def test_wal_multiprocess_writes_preserve_parallelism_without_false_corruption(tmp_path):
+    """Real worker processes should not need a global write sidecar lock.
+
+    This is intentionally a small smoke, not a benchmark.  The historical
+    regression was that hot WAL writers could trip the post-commit main-file
+    length invariant even when the final DB was healthy.
+    """
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    workers = 6
+    per_worker = 40
+    procs = [
+        ctx.Process(
+            target=_kanban_multiprocess_writer,
+            args=(str(db_path), idx, per_worker, queue),
+        )
+        for idx in range(workers)
+    ]
+    for proc in procs:
+        proc.start()
+
+    errors = [queue.get(timeout=30) for _ in procs]
+    for proc in procs:
+        proc.join(timeout=30)
+        assert proc.exitcode == 0
+
+    errors = [err for err in errors if err is not None]
+    assert errors == []
+
+    with sqlite3.connect(str(db_path)) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == workers * per_worker
+
+    assert not db_path.with_name(db_path.name + ".lock").exists()
+
+
 def _write_corrupt_db(path: Path) -> bytes:
     """Write a kanban DB with a VALID SQLite header but malformed page content.
 
@@ -4464,8 +4559,8 @@ def test_write_txn_healthy_commit_no_exception(tmp_path):
     conn.close()
 
 
-def test_write_txn_raises_on_truncated_file(tmp_path):
-    """A mocked smaller file size triggers the torn-extend check."""
+def test_write_txn_skips_main_file_length_false_positive_in_wal(tmp_path):
+    """A mocked smaller main DB file must not fail a WAL-mode write."""
     from hermes_cli.kanban_db import connect, write_txn
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
@@ -4478,13 +4573,15 @@ def test_write_txn_raises_on_truncated_file(tmp_path):
         real_size = original_getsize(path)
         return max(0, real_size - page_size)
 
-    with pytest.raises(sqlite3.DatabaseError, match="torn-extend|page count mismatch"):
-        with unittest.mock.patch("hermes_cli.kanban_db.os.path.getsize", side_effect=fake_getsize):
-            with write_txn(conn) as c:
-                c.execute(
-                    "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
-                    "VALUES ('t_test02', 'test task 2', 'tester', 'todo', 0, 1234567890)"
-                )
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    with unittest.mock.patch("hermes_cli.kanban_db.os.path.getsize", side_effect=fake_getsize):
+        with write_txn(conn) as c:
+            c.execute(
+                "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
+                "VALUES ('t_test02', 'test task 2', 'tester', 'todo', 0, 1234567890)"
+            )
+    row = conn.execute("SELECT title FROM tasks WHERE id='t_test02'").fetchone()
+    assert row["title"] == "test task 2"
     conn.close()
 
 
@@ -4513,13 +4610,13 @@ def test_write_txn_post_commit_check_fires_every_call(tmp_path):
     conn.close()
 
 
-def test_connect_sets_wal_autocheckpoint_100(tmp_path):
-    """connect() sets wal_autocheckpoint to 100."""
+def test_connect_sets_default_wal_autocheckpoint_1000(tmp_path):
+    """connect() keeps SQLite's default 1000-page WAL auto-checkpoint."""
     from hermes_cli.kanban_db import connect
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
     val = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
-    assert val == 100
+    assert val == 1000
     conn.close()
 
 
@@ -4546,7 +4643,7 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
     # Now open and check — should raise
     # We can't use connect() because _validate_sqlite_header may block; use a raw connection
     raw_conn = sqlite3.connect(str(db), isolation_level=None)
-    with pytest.raises(sqlite3.DatabaseError, match="torn-extend|page count mismatch"):
+    with pytest.raises(sqlite3.DatabaseError, match="database disk image is malformed|torn-extend|page count mismatch"):
         _check_file_length_invariant(raw_conn)
     raw_conn.close()
 
