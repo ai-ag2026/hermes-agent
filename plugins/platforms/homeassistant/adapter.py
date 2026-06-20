@@ -463,23 +463,26 @@ async def _standalone_send(
     media_files: Optional[list] = None,
     force_document: bool = False,
 ) -> Dict[str, Any]:
-    """Send a notification via the HA ``notify.notify`` service without a
-    live gateway adapter.
+    """Send a persistent notification without a live gateway adapter.
 
     Used by ``tools/send_message_tool._send_via_adapter`` when the gateway
     runner is not in this process (typical for cron jobs running
-    out-of-process).  The HTTP path is the same one the legacy
-    ``_send_homeassistant`` helper used in ``tools/send_message_tool.py``
-    before this migration.
+    out-of-process).
+
+    Prefer ``persistent_notification.create`` over ``notify.notify``. Some HA
+    installs expose ``notify.notify`` but return HTTP 500 for the generic
+    service when no concrete target exists; persistent notifications are the
+    adapter's live outbound path and are stable for Hermes system messages.
 
     Reads ``HASS_TOKEN`` from ``pconfig.token`` (set by the gateway config
     loader from env) and falls back to the ``HASS_TOKEN`` env var.  Server
     URL comes from ``pconfig.extra["url"]`` (seeded by the env loader in
     ``gateway/config.py``) or the ``HASS_URL`` env var.
 
-    ``thread_id``, ``media_files`` and ``force_document`` are accepted for
-    signature parity with other standalone senders.  HA notifications have
-    no native threading or attachment model — these arguments are ignored.
+    ``chat_id``, ``thread_id``, ``media_files`` and ``force_document`` are
+    accepted for signature parity with other standalone senders. HA
+    persistent notifications have no native threading or attachment model —
+    these arguments are ignored.
     """
     if not AIOHTTP_AVAILABLE:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
@@ -495,12 +498,15 @@ async def _standalone_send(
             )
         }
 
-    url = f"{hass_url}/api/services/notify/notify"
+    url = f"{hass_url}/api/services/persistent_notification/create"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    payload = {"message": message, "target": chat_id}
+    payload = {
+        "title": "Hermes Agent",
+        "message": message[:HomeAssistantAdapter.MAX_MESSAGE_LENGTH],
+    }
 
     try:
         async with aiohttp.ClientSession(
