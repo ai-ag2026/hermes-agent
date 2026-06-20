@@ -260,8 +260,10 @@ def _install_fake_gateway_run(monkeypatch):
         sys.modules,
         "gateway.run",
         SimpleNamespace(
-            _resolve_runtime_agent_kwargs=lambda: {"api_key": "key", "base_url": "http://example.test"},
+            _current_max_iterations=lambda: 50,
+            _resolve_runtime_agent_kwargs=lambda: {"api_key": "***", "base_url": "http://example.test"},
             _resolve_gateway_model=lambda: "test-model",
+            _load_gateway_config=lambda: {},
             GatewayRunner=FakeGatewayRunner,
         ),
     )
