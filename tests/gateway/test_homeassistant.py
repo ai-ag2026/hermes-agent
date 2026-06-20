@@ -17,6 +17,7 @@ from gateway.config import (
 from plugins.platforms.homeassistant.adapter import (
     HomeAssistantAdapter,
     check_ha_requirements,
+    _standalone_send,
 )
 
 
@@ -563,6 +564,30 @@ class TestSendViaRestApi:
         # WS should NOT have been used for sending
         adapter._ws.send_json.assert_not_called()
         adapter._ws.receive_json.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_uses_persistent_notification(self):
+        config = PlatformConfig(
+            enabled=True,
+            token="tok",
+            extra={"url": "http://ha.local:8123"},
+        )
+        mock_session = self._mock_aiohttp_session(200)
+
+        with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+            mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+            mock_aiohttp.ClientTimeout = lambda total: total
+
+            result = await _standalone_send(config, "ignored", "Standalone test")
+
+        assert result["success"] is True
+        call_args = mock_session.post.call_args
+        assert "/api/services/persistent_notification/create" in call_args[0][0]
+        assert call_args[1]["json"] == {
+            "title": "Hermes Agent",
+            "message": "Standalone test",
+        }
+        assert "target" not in call_args[1]["json"]
 
 
 # ---------------------------------------------------------------------------
