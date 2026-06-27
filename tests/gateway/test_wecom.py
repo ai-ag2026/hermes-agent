@@ -124,8 +124,8 @@ class TestWeComConnect:
 
     @pytest.mark.asyncio
     async def test_open_connection_cleans_up_session_when_ws_connect_fails(self, monkeypatch):
-        import gateway.platforms.wecom as wecom_module
-        from gateway.platforms.wecom import WeComAdapter
+        import plugins.platforms.wecom.adapter as wecom_module
+        from plugins.platforms.wecom.adapter import WeComAdapter
 
         class FailingSession:
             def ws_connect(self, *args, **kwargs):
