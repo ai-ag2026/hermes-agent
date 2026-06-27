@@ -10959,6 +10959,34 @@ def _worker_env_strip_keys() -> tuple[str, ...]:
     return tuple(keys)
 
 
+def _resolve_board_bank(board: Optional[str]) -> Optional[str]:
+    """TARS carry (P6 Option 2, dispatcher path): map a kanban board to a Hindsight
+    memory bank, so the shared background dispatcher (which runs in ONE context) never
+    lands professional cards in the private bank or vice versa.
+
+    Reads ``<hermes-root>/ops/kanban-board-banks.json``:
+        {"<board-slug>": "<bank>", "_default": "<bank>"}
+    Returns the bank to force, or None (no override → the worker keeps the bank it
+    inherited from the dispatcher's env). ``_default`` (optional) covers unmapped
+    boards — set it to a quarantine bank for strict no-mix. Read per spawn (edit the
+    map without restarting). Fail-soft: any error → None (never break dispatch)."""
+    try:
+        path = kanban_home() / "ops" / "kanban-board-banks.json"
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        # Underscore-prefixed keys are meta (_README, _default) — never board slugs.
+        bank = (data.get(board) if (board and not board.startswith("_")) else None) or data.get("_default")
+        bank = str(bank).strip() if bank else ""
+        if bank and re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", bank):
+            return bank
+        return None
+    except Exception:
+        return None
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -11109,6 +11137,16 @@ def _default_spawn(
     # highest-precedence interface override; dropping the env var covers
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
+
+    # TARS carry (P6 Option 2, dispatcher path): force the worker's memory bank by
+    # board context. The shared dispatcher runs in ONE context (private/default), so
+    # without this every dispatched worker would inherit the private bank — mixing
+    # professional cards into private memory (or vice versa). Set explicitly so it
+    # survives the worker's own profile .env (load_hermes_dotenv override=True).
+    # Unmapped board → no override (worker keeps the inherited bank). Fail-soft.
+    _board_bank = _resolve_board_bank(resolved_board)
+    if _board_bank:
+        env["HINDSIGHT_BANK_ID"] = _board_bank
 
     cmd = [
         *_resolve_hermes_argv(),
