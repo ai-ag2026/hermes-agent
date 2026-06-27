@@ -137,6 +137,9 @@ def _minimal_adapter(monkeypatch):
     adapter._background_tasks = set()
     adapter._get_platform_enabled_toolsets = lambda: ["web", "terminal"]
     adapter._parse_session_key_header = lambda request: (None, None)
+    # Upstream added a concurrent-run cap (_concurrency_limited_response); 0 disables it.
+    # __init__ is bypassed here, so set it explicitly for the minimal adapter.
+    adapter._max_concurrent_runs = 0
     return adapter
 
 
