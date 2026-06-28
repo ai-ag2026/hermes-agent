@@ -15520,6 +15520,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 # Main Entry Point
 # ============================================================================
 
+# Bounded wait for in-flight async (background) delegations to drain before a
+# goal_mode worker exits, so it can collect their results and terminate the card
+# in the SAME run instead of exiting clean-but-running (which the dispatcher reaps
+# as a protocol violation). Capped well under delegation.child_timeout_seconds so
+# a hung subagent can never wedge the worker; the protocol-violation backstop still
+# catches a worker that is genuinely stuck after the drain.
+_KANBAN_ASYNC_DRAIN_BUDGET_S = 180
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -16059,6 +16068,51 @@ def main(
                                 _run_kanban_goal_loop_q(cli, response)
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
+                            # A goal_mode worker that fanned out async (background)
+                            # delegations can finish its loop while those subagents
+                            # are still in flight. Exiting now reads as a protocol
+                            # violation (clean exit, card still ``running``) and burns
+                            # a dispatcher retry. Instead: wait — bounded — for the
+                            # delegations to drain, then run one more goal-loop pass so
+                            # the model collects their results and terminates the card
+                            # in the SAME run. Fail-open; if the card is still not
+                            # terminal afterwards, the existing protocol-violation /
+                            # breaker backstop still applies (no infinite requeue).
+                            try:
+                                from tools.async_delegation import active_count as _async_active
+                                _kb_task_id = os.environ.get("HERMES_KANBAN_TASK") or ""
+                                if _kb_task_id and _async_active() > 0:
+                                    from hermes_cli import kanban_db as _kb_drain
+
+                                    def _kb_task_open() -> bool:
+                                        _c = _kb_drain.connect()
+                                        try:
+                                            _t = _kb_drain.get_task(_c, _kb_task_id)
+                                            return _t is not None and _t.status in ("running", "ready")
+                                        except Exception:
+                                            return False
+                                        finally:
+                                            try:
+                                                _c.close()
+                                            except Exception:
+                                                pass
+
+                                    if _kb_task_open():
+                                        import time as _t_drain
+                                        _drain_deadline = _t_drain.time() + _KANBAN_ASYNC_DRAIN_BUDGET_S
+                                        while (
+                                            _async_active() > 0
+                                            and _t_drain.time() < _drain_deadline
+                                            and _kb_task_open()
+                                        ):
+                                            _t_drain.sleep(2)
+                                        if _kb_task_open():
+                                            logger.debug(
+                                                "kanban async-drain: running collect pass "
+                                                "(active=%s)", _async_active())
+                                            _run_kanban_goal_loop_q(cli, "")
+                            except Exception as _drain_exc:
+                                logger.debug("kanban async-drain collect pass failed: %s", _drain_exc)
 
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
