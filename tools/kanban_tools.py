@@ -56,8 +56,18 @@ def _profile_has_kanban_toolset() -> bool:
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
-        toolsets = cfg.get("toolsets", [])
-        return "kanban" in toolsets
+        # Historical configs used top-level ``toolsets``. Current profile
+        # tooling stores per-surface selections under ``platform_toolsets``
+        # (e.g. ``platform_toolsets.cli``). Accept both so orchestrator
+        # profiles like pm/reviewer can expose kanban tools without a duplicate
+        # legacy key.
+        configured = set(cfg.get("toolsets") or [])
+        platform_toolsets = cfg.get("platform_toolsets") or {}
+        if isinstance(platform_toolsets, dict):
+            for values in platform_toolsets.values():
+                if isinstance(values, (list, tuple, set)):
+                    configured.update(str(v) for v in values)
+        return "kanban" in configured
     except Exception:
         return False
 
