@@ -118,7 +118,7 @@ Scoped to the Feishu document-comment handler. Drives comment read/write operati
 
 ## `kanban` toolset
 
-Registered when the agent is either (a) spawned by the kanban dispatcher (`HERMES_KANBAN_TASK` env set) or (b) running in a profile that explicitly enables the `kanban` toolset. Task-scoped workers use lifecycle tools for their assigned task; orchestrator profiles additionally get board-routing tools like `kanban_list` and `kanban_unblock`. See [Kanban Multi-Agent](/user-guide/features/kanban) for the full workflow.
+Registered when the agent is either (a) spawned by the kanban dispatcher (`HERMES_KANBAN_TASK` env set) or (b) running in a profile that explicitly enables the `kanban` toolset in its per-platform config (`platform_toolsets.<platform>`, such as `platform_toolsets.cli`) or legacy top-level `toolsets`. Task-scoped workers use lifecycle tools for their assigned task; orchestrator profiles additionally get board-routing tools like `kanban_list` and `kanban_unblock`. See [Kanban Multi-Agent](/user-guide/features/kanban) for the full workflow.
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
