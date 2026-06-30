@@ -5222,6 +5222,28 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
+        # Defensive invariant repair: older/racy code paths could leak an
+        # active task_runs row that was no longer referenced by
+        # tasks.current_run_id. _end_run() intentionally closes only the
+        # current run, so archive must sweep *all* remaining open attempts for
+        # this task. Otherwise an archived board can still report a running
+        # attempt forever.
+        now = int(time.time())
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'reclaimed',
+                   outcome = 'reclaimed',
+                   summary = COALESCE(summary, 'task archived with orphaned active run'),
+                   ended_at = ?,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE task_id = ?
+               AND ended_at IS NULL
+            """,
+            (now, task_id),
+        )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
@@ -7736,6 +7758,8 @@ def _default_spawn(
         pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
+    if task.session_id:
+        env["HERMES_SESSION_ID"] = task.session_id
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and

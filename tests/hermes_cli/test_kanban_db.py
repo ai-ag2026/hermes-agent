@@ -1499,6 +1499,44 @@ def test_archive_hides_from_default_list(kanban_home):
         assert len(kb.list_tasks(conn, include_archived=True)) == 1
 
 
+def test_archive_task_closes_orphaned_active_runs(kanban_home):
+    """Archive must close active runs even when current_run_id lost track of them."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="orphaned run", assignee="worker")
+        kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        current = task.current_run_id
+        assert current is not None
+        conn.execute(
+            """
+            INSERT INTO task_runs (task_id, profile, status, started_at)
+            VALUES (?, 'worker', 'running', ?)
+            """,
+            (tid, int(time.time())),
+        )
+        orphan_run = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.execute(
+            "UPDATE tasks SET status='done', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        assert kb.archive_task(conn, tid)
+
+        rows = conn.execute(
+            "SELECT id, status, outcome, ended_at, summary FROM task_runs WHERE task_id=? ORDER BY id",
+            (tid,),
+        ).fetchall()
+
+    assert {row["id"] for row in rows} == {current, orphan_run}
+    assert all(row["ended_at"] is not None for row in rows)
+    assert all(row["status"] == "reclaimed" for row in rows)
+    assert all(row["outcome"] == "reclaimed" for row in rows)
+    assert any(row["summary"] == "task archived with orphaned active run" for row in rows)
+
+
 def test_delete_archived_task_removes_related_rows(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
@@ -2951,6 +2989,44 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+
+    def test_dispatcher_spawn_propagates_task_session_id(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_bound_session",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            session_id="origin-session-1",
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        assert captured["env"]["HERMES_SESSION_ID"] == "origin-session-1"
 
 
 # ---------------------------------------------------------------------------
