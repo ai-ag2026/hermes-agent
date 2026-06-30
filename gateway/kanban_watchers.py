@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -203,8 +204,9 @@ class GatewayKanbanWatchersMixin:
                         for platform in self.adapters.keys()
                     }
                     if not active_platforms:
-                        logger.debug("kanban notifier: no connected adapters; skipping tick")
-                        return deliveries
+                        logger.debug(
+                            "kanban notifier: no connected adapters; polling session subscriptions only"
+                        )
 
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
@@ -262,7 +264,7 @@ class GatewayKanbanWatchersMixin:
                                         )
                                         continue
                                 platform = (sub.get("platform") or "").lower()
-                                if platform not in active_platforms:
+                                if platform != "__session__" and platform not in active_platforms:
                                     logger.debug(
                                         "kanban notifier: subscription for %s on %s skipped; adapter not connected",
                                         sub.get("task_id"), platform or "<missing>",
@@ -301,27 +303,29 @@ class GatewayKanbanWatchersMixin:
                     task = d["task"]
                     board_slug = d.get("board")
                     platform_str = (sub["platform"] or "").lower()
-                    try:
-                        plat = _Platform(platform_str)
-                    except ValueError:
-                        # Unknown platform string; skip and advance cursor so
-                        # we don't replay forever.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
-                        continue
+                    adapter = None
+                    plat = None
                     sub_profile = sub.get("notifier_profile") or ""
-                    # Route via the SAME chokepoint the authorization path uses
-                    # (gateway/authz_mixin.py::_authorization_adapter): a stamped
-                    # profile with its own adapter-registry entry must be served
-                    # by THAT profile's same-platform adapter and must NOT silently
-                    # fall back to the default profile's adapter — otherwise a
-                    # secondary profile's task notification is delivered by the
-                    # wrong bot (the cross-profile mis-delivery this whole change
-                    # exists to fix). The helper returns None only when the profile
-                    # (or default) genuinely has no adapter for the platform.
-                    adapter = self._authorization_adapter(plat, sub_profile or None)
-                    if adapter is None:
+                    if platform_str != "__session__":
+                        try:
+                            plat = _Platform(platform_str)
+                        except ValueError:
+                            # Unknown platform string; skip and advance cursor so
+                            # we don't replay forever.
+                            await asyncio.to_thread(
+                                self._kanban_advance, sub, d["cursor"], board_slug,
+                            )
+                            continue
+                        # Route via the SAME chokepoint the authorization path uses
+                        # (gateway/authz_mixin.py::_authorization_adapter): a stamped
+                        # profile with its own adapter-registry entry must be served
+                        # by THAT profile's same-platform adapter and must NOT silently
+                        # fall back to the default profile's adapter — otherwise a
+                        # secondary profile's task notification is delivered by the
+                        # wrong bot. The helper returns None only when the profile
+                        # (or default) genuinely has no adapter for the platform.
+                        adapter = self._authorization_adapter(plat, sub_profile or None)
+                    if platform_str != "__session__" and adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
                             platform_str, sub["task_id"],
@@ -361,15 +365,29 @@ class GatewayKanbanWatchersMixin:
                                 lines = task.result.strip().splitlines()
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}"
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                            workflow_msg = await asyncio.to_thread(
+                                self._kanban_workflow_completed_message,
+                                sub["task_id"],
+                                board_slug,
                             )
+                            if workflow_msg == "":
+                                continue
+                            if workflow_msg is not None:
+                                msg = workflow_msg
+                            else:
+                                msg = (
+                                    f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
+                                    f" — {title}{handoff}"
+                                )
                         elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                            msg = await asyncio.to_thread(
+                                self._kanban_blocked_message,
+                                sub["task_id"],
+                                title,
+                                tag,
+                                ev.payload,
+                                board_slug,
+                            )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -413,9 +431,16 @@ class GatewayKanbanWatchersMixin:
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
-                            await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
-                            )
+                            if platform_str == "__session__":
+                                await asyncio.to_thread(
+                                    self._kanban_append_session_message,
+                                    sub["chat_id"],
+                                    msg,
+                                )
+                            else:
+                                await adapter.send(
+                                    sub["chat_id"], msg, metadata=metadata,
+                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -429,7 +454,7 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed":
+                            if kind == "completed" and adapter is not None:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
@@ -491,7 +516,7 @@ class GatewayKanbanWatchersMixin:
                         task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                        if _wake_kinds:
+                        if _wake_kinds and platform_str != "__session__" and adapter is not None and plat is not None:
                             try:
                                 _session_key = getattr(task, "session_id", None) or ""
                                 if _session_key:
@@ -631,6 +656,366 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    def _kanban_append_session_message(self, session_id: str, text: str) -> None:
+        """Append a kanban notification to a workflow origin/result session."""
+        if not session_id or not text:
+            return
+        try:
+            from hermes_constants import get_hermes_home
+            from hermes_state import SessionDB
+
+            db = SessionDB(get_hermes_home() / "state.db")
+            try:
+                if not db.get_session(session_id):
+                    logger.warning(
+                        "kanban notifier: session delivery skipped; bound session %s not found",
+                        session_id,
+                    )
+                    return
+                db.append_message(session_id, role="assistant", content=text)
+            finally:
+                db.close()
+        except Exception as exc:
+            logger.warning("kanban notifier: session delivery to %s failed: %s", session_id, exc)
+
+    def _kanban_blocked_message(
+        self,
+        task_id: str,
+        title: str,
+        tag: str,
+        payload: Optional[dict],
+        board: Optional[str] = None,
+    ) -> str:
+        """Build a concise, decision-ready human notification for blocked tasks."""
+        from hermes_cli import kanban_db as _kb
+
+        reason = ""
+        block_kind = ""
+        if payload and payload.get("kind"):
+            block_kind = str(payload["kind"])[:40]
+        if payload and payload.get("reason"):
+            reason = str(payload["reason"]).strip()
+
+        board_part = f" --board {board}" if board and board != "default" else ""
+        is_review = reason.lower().startswith("review-required")
+        decision = self._kanban_block_decision(block_kind, is_review)
+        default = self._kanban_recommended_default(reason, block_kind, is_review)
+
+        bullets: list[str] = []
+        try:
+            conn = _kb.connect(board=board)
+            try:
+                bullets = self._kanban_block_context_bullets(
+                    conn,
+                    task_id,
+                    review_required=is_review,
+                )
+                if block_kind == "capability":
+                    task = _kb.get_task(conn, task_id)
+                    remediation = self._kanban_capability_remediation_hint(
+                        reason,
+                        getattr(task, "assignee", None) if task else None,
+                    )
+                    if remediation:
+                        bullets.insert(0, remediation)
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.debug("kanban notifier: failed loading block context for %s: %s", task_id, exc)
+
+        lines = [
+            f"⏸ {tag}Kanban {task_id} blocked ({block_kind or 'unspecified'}) — {title}",
+            f"Reason: {self._kanban_compact_line(reason, 500) if reason else 'not provided'}",
+            f"Decision needed: {decision}",
+        ]
+        if default:
+            lines.append(f"Recommended default: {default}")
+        if bullets:
+            lines.append("Context:")
+            lines.extend(f"- {bullet}" for bullet in bullets[:3])
+        lines.append(f"Show: /kanban{board_part} show {task_id}")
+        lines.append(f"Unblock after resolving: /kanban{board_part} unblock {task_id}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _kanban_block_decision(block_kind: str, review_required: bool) -> str:
+        if review_required:
+            return "review the listed changes/tests and approve or request repair."
+        if block_kind == "needs_input":
+            return "answer the worker question in the reason above."
+        if block_kind == "capability":
+            return "remediate the missing tool/capability, then unblock."
+        if block_kind == "transient":
+            return "decide whether to retry now or wait for the transient failure to clear."
+        return "decide whether the blocker is resolved and the card can continue."
+
+    @staticmethod
+    def _kanban_recommended_default(reason: str, block_kind: str, review_required: bool) -> str:
+        if review_required:
+            return (
+                "approve if the comment's changed files and tests match the request; "
+                "otherwise comment a repair request."
+            )
+        if not reason:
+            return ""
+        match = re.search(
+            r"(?:recommended default|default)\s*[:=\-]\s*([^\n.]+(?:\.[^\n]*)?)",
+            reason,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return GatewayKanbanWatchersMixin._kanban_compact_line(match.group(1), 180)
+        if block_kind == "capability":
+            return "fix the capability gap before unblocking; do not retry unchanged."
+        return ""
+
+    @staticmethod
+    def _kanban_capability_remediation_hint(reason: str, assignee: Optional[str]) -> str:
+        text = reason or ""
+        profile = assignee or ""
+        profile_match = re.search(
+            r"\b([a-z][a-z0-9_-]{1,63})\s+profile\s+(?:lacks|lacked|missing|without)",
+            text,
+            flags=re.IGNORECASE,
+        ) or re.search(
+            r"\bprofile\s+([a-z][a-z0-9_-]{1,63})\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if profile_match:
+            profile = profile_match.group(1)
+
+        tool = ""
+        tool_match = re.search(
+            r"\b(?:lacks|lacked|missing|without)\s+(?:the\s+)?([a-z][a-z0-9_-]{1,63})(?:\s+tool(?:set)?|\b)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if tool_match:
+            tool = tool_match.group(1)
+        if not tool and "terminal" in text.lower():
+            tool = "terminal"
+
+        if profile and tool:
+            return f"Remediation: run `hermes -p {profile} tools enable {tool}` (or grant equivalent profile toolset)."
+        if tool:
+            return f"Remediation: enable the `{tool}` tool on the assigned profile or grant an equivalent toolset."
+        if profile:
+            return f"Remediation: inspect `{profile}` profile toolsets and enable the missing capability."
+        return "Remediation: enable the missing profile tool/capability, then unblock."
+
+    @staticmethod
+    def _kanban_compact_line(text: str, limit: int = 180) -> str:
+        compact = " ".join(str(text).strip().split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: max(0, limit - 1)].rstrip() + "…"
+
+    @staticmethod
+    def _kanban_parse_comment_sections(text: str) -> dict[str, list[str]]:
+        """Extract simple worker evidence sections from kanban comments.
+
+        Workers commonly write either inline values:
+        ``changed_files: a.py, b.py``
+        or section headers followed by bullets:
+        ``changed_files:\n- a.py\n- b.py``.
+        """
+        sections: dict[str, list[str]] = {"changed_files": [], "tests_run": []}
+        current: Optional[str] = None
+        aliases = {
+            "changed_files": "changed_files",
+            "changed files": "changed_files",
+            "tests_run": "tests_run",
+            "tests run": "tests_run",
+        }
+        for raw_line in (text or "").splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                current = None
+                continue
+            normal = stripped.rstrip(":").lower()
+            if normal in aliases:
+                current = aliases[normal]
+                continue
+            if ":" in stripped:
+                key, value = stripped.split(":", 1)
+                section = aliases.get(key.strip().lower())
+                if section:
+                    current = section
+                    value = value.strip()
+                    if value:
+                        sections[section].append(value)
+                    continue
+            if current:
+                value = stripped.lstrip("-•* ").strip()
+                if value:
+                    sections[current].append(value)
+        return {k: v for k, v in sections.items() if v}
+
+    @staticmethod
+    def _kanban_block_context_bullets(
+        conn: sqlite3.Connection,
+        task_id: str,
+        *,
+        review_required: bool,
+    ) -> list[str]:
+        from hermes_cli import kanban_db as _kb
+
+        bullets: list[str] = []
+        latest_comment = ""
+        comments = _kb.list_comments(conn, task_id)
+        if comments:
+            latest_comment = comments[-1].body or ""
+
+        latest = _kb.latest_run(conn, task_id)
+        metadata = latest.metadata if latest and isinstance(latest.metadata, dict) else {}
+        changed = metadata.get("changed_files") if isinstance(metadata, dict) else None
+        tests = metadata.get("tests_run") if isinstance(metadata, dict) else None
+        if changed:
+            if isinstance(changed, (list, tuple)):
+                joined = ", ".join(str(x) for x in changed[:4])
+                if len(changed) > 4:
+                    joined += f" (+{len(changed) - 4} more)"
+            else:
+                joined = str(changed)
+            bullets.append(
+                f"Changed files: {GatewayKanbanWatchersMixin._kanban_compact_line(joined, 180)}"
+            )
+        if tests:
+            if isinstance(tests, (list, tuple)):
+                joined = "; ".join(str(x) for x in tests[:3])
+            else:
+                joined = str(tests)
+            bullets.append(
+                f"Tests: {GatewayKanbanWatchersMixin._kanban_compact_line(joined, 180)}"
+            )
+
+        if latest_comment:
+            parsed_sections = GatewayKanbanWatchersMixin._kanban_parse_comment_sections(
+                latest_comment
+            )
+            if parsed_sections.get("changed_files") and not any(
+                b.startswith("Changed files:") for b in bullets
+            ):
+                bullets.append(
+                    "Changed files: "
+                    + GatewayKanbanWatchersMixin._kanban_compact_line(
+                        ", ".join(parsed_sections["changed_files"][:4]), 180
+                    )
+                )
+            if parsed_sections.get("tests_run") and not any(
+                b.startswith("Tests:") for b in bullets
+            ):
+                bullets.append(
+                    "Tests: "
+                    + GatewayKanbanWatchersMixin._kanban_compact_line(
+                        "; ".join(parsed_sections["tests_run"][:3]), 180
+                    )
+                )
+
+            for raw_line in latest_comment.splitlines():
+                line = raw_line.strip().lstrip("-•* ").strip()
+                if not line:
+                    continue
+                lower = line.lower()
+                if lower.startswith(
+                    ("changed_files", "changed files", "tests_run", "tests run")
+                ):
+                    continue
+                if len(bullets) < 3:
+                    bullets.append(
+                        "Latest comment: "
+                        + GatewayKanbanWatchersMixin._kanban_compact_line(line, 180)
+                    )
+                if len(bullets) >= 3:
+                    break
+
+        if latest and latest.summary and len(bullets) < 3:
+            summary = GatewayKanbanWatchersMixin._kanban_compact_line(latest.summary, 180)
+            if summary:
+                bullets.append(f"Latest run: {summary}")
+
+        if review_required and latest_comment and not bullets:
+            bullets.append("Review details are in the latest kanban comment.")
+        return bullets[:3]
+
+    def _kanban_workflow_completed_message(
+        self, task_id: str, board: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the aggregate workflow report for the final phase.
+
+        Return values are intentionally tri-state:
+        - None: not a workflow task; use ordinary task completion text.
+        - "": workflow phase completed, but not the final aggregate moment;
+          advance the cursor silently to avoid per-phase completion spam.
+        - non-empty string: send this single final workflow report.
+        """
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            row = conn.execute(
+                "SELECT workflow_template_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None or not row["workflow_template_id"]:
+                return None
+            workflow_id = str(row["workflow_template_id"])
+
+            child = conn.execute(
+                """
+                SELECT 1
+                  FROM task_links l
+                  JOIN tasks c ON c.id = l.child_id
+                 WHERE l.parent_id = ?
+                   AND c.workflow_template_id = ?
+                 LIMIT 1
+                """,
+                (task_id, workflow_id),
+            ).fetchone()
+            if child:
+                return ""
+
+            unfinished = conn.execute(
+                """
+                SELECT COUNT(*)
+                  FROM tasks
+                 WHERE workflow_template_id = ?
+                   AND status NOT IN ('done', 'archived')
+                """,
+                (workflow_id,),
+            ).fetchone()[0]
+            if int(unfinished or 0):
+                return ""
+
+            rows = conn.execute(
+                """
+                SELECT t.id, t.title, t.current_step_key, r.summary
+                  FROM tasks t
+             LEFT JOIN task_runs r
+                    ON r.id = (
+                        SELECT rr.id
+                          FROM task_runs rr
+                         WHERE rr.task_id = t.id
+                           AND rr.outcome = 'completed'
+                         ORDER BY rr.ended_at DESC, rr.id DESC
+                         LIMIT 1
+                    )
+                 WHERE t.workflow_template_id = ?
+                 ORDER BY t.created_at ASC, t.id ASC
+                """,
+                (workflow_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        lines = [f"✔ Workflow {workflow_id} complete ({len(rows)} phases)"]
+        for idx, phase in enumerate(rows, start=1):
+            key = phase["current_step_key"] or phase["title"] or phase["id"]
+            summary_lines = (phase["summary"] or "").strip().splitlines()
+            first_line = summary_lines[0][:220] if summary_lines else "completed"
+            lines.append(f"{idx}. {key} [{phase['id']}]: {first_line}")
+        return "\n".join(lines)
 
     async def _deliver_kanban_artifacts(
         self,

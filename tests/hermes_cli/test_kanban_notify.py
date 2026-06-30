@@ -490,6 +490,135 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
 
 
 @pytest.mark.asyncio
+async def test_gateway_unblock_without_task_id_lists_blocked_candidates(kanban_home, monkeypatch):
+    """Typed chat commands must not guess which blocked task to unblock.
+
+    A user may receive several Kanban notifications in the same Telegram DM.
+    `/kanban unblock` or `hermes kanban unblock` without an explicit task id
+    used to fall through to the generic CLI/agent path, where context could
+    pick the wrong recent card. The gateway should refuse the ambiguous
+    mutation and show exact commands.
+    """
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent
+    from gateway.session import SessionSource
+
+    conn = kb.connect()
+    try:
+        first = kb.create_task(conn, title="needs decision", assignee="pm")
+        second = kb.create_task(conn, title="needs review", assignee="reviewer")
+        kb.block_task(conn, first, reason="choose A or B", kind="needs_input")
+        kb.block_task(conn, second, reason="review diff", kind="needs_input")
+    finally:
+        conn.close()
+
+    def _forbid_run_slash(_text):  # pragma: no cover - should not be called
+        raise AssertionError("ambiguous unblock must not delegate to run_slash")
+
+    monkeypatch.setattr("hermes_cli.kanban.run_slash", _forbid_run_slash)
+
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat1", user_id="u1")
+    event = MessageEvent(text="hermes kanban unblock", source=source)
+
+    out = await GatewayRunner._handle_kanban_command(runner, event)
+
+    assert "which kanban task" in out.lower() or "welche" in out.lower()
+    assert first in out
+    assert second in out
+    assert f"/kanban unblock {first}" in out
+    assert f"/kanban unblock {second}" in out
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, first).status == "blocked"
+        assert kb.get_task(conn, second).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_gateway_direct_hermes_kanban_bypasses_agent_path():
+    """`hermes kanban ...` must be routed before agent chat/interrupt handling."""
+    import inspect
+    from gateway.run import GatewayRunner
+
+    src = inspect.getsource(GatewayRunner._handle_message)
+    direct_idx = src.find("_raw_text_for_direct_kanban")
+    active_guard_idx = src.find(
+        "if _quick_key in self._running_agents:\n            if event.get_command() == \"status\""
+    )
+    command_idx = src.find("# Check for commands")
+
+    assert direct_idx != -1
+    assert active_guard_idx != -1
+    assert command_idx != -1
+    assert direct_idx < active_guard_idx
+    assert direct_idx < command_idx
+    assert "hermes kanban" in src
+    assert "return await self._handle_kanban_command(event)" in src
+
+
+@pytest.mark.asyncio
+async def test_notifier_blocked_message_is_actionable(kanban_home):
+    """Blocked notifications should carry the decision/remediation context.
+
+    The user should not have to open `kanban show` just to know which exact
+    command is safe. The message must include the task id, reason, typed block
+    kind, and an explicit unblock command with the id.
+    """
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="review the patch", assignee="reviewer")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        kb.block_task(
+            conn,
+            tid,
+            reason="review-required: inspect core diff before marking done",
+            kind="needs_input",
+        )
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+
+    sent: list[str] = []
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        sent.append(msg)
+        runner._running = False
+
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    assert len(sent) == 1
+    msg = sent[0]
+    assert tid in msg
+    assert "needs_input" in msg
+    assert "review-required" in msg
+    assert f"/kanban unblock {tid}" in msg
+    assert "show" in msg.lower()
+
+
+@pytest.mark.asyncio
 async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, monkeypatch):
     """When a completed event carries ``artifacts`` in its payload, the
     notifier uploads each file to the subscribed chat as a native

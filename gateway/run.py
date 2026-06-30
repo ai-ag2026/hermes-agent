@@ -8896,6 +8896,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 self._release_running_agent_state(_quick_key)
 
+        # Typed CLI-style gateway command escape hatch. Telegram users often
+        # send `hermes kanban ...` exactly as printed in notifications. Without
+        # a leading slash this would normally be treated as agent chat (or as a
+        # mid-run interrupt), letting the LLM infer a task from stale context.
+        # Route it through the deterministic /kanban handler instead.
+        _raw_text_for_direct_kanban = (event.text or "").strip()
+        _direct_kanban_lower = _raw_text_for_direct_kanban.lower()
+        if (
+            _direct_kanban_lower == "hermes kanban"
+            or _direct_kanban_lower.startswith("hermes kanban ")
+        ):
+            event = dataclasses.replace(
+                event,
+                text=(
+                    "/kanban"
+                    + _raw_text_for_direct_kanban[len("hermes kanban"):]
+                ).strip(),
+            )
+            return await self._handle_kanban_command(event)
+
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
