@@ -1161,6 +1161,51 @@ def test_create_rejects_no_title(worker_env):
     assert json.loads(kt._handle_create({"title": "   ", "assignee": "x"})).get("error")
 
 
+def test_create_inherits_session_id_from_current_worker_task(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET session_id = ? WHERE id = ?",
+            ("parent-origin-session", worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = kt._handle_create({
+        "title": "inherits parent session",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task is not None
+        assert new_task.session_id == "parent-origin-session"
+    finally:
+        conn.close()
+
+
+def test_create_schema_exposes_optional_session_id():
+    from tools import kanban_tools as kt
+
+    assert kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]["session_id"] == {
+        "type": "string",
+        "description": (
+            "Optional origin/result session id to bind the created task to. "
+            "When omitted, kanban_create uses HERMES_SESSION_ID or the current "
+            "worker task's session_id when available."
+        ),
+    }
+
+
 def test_create_rejects_no_assignee(worker_env):
     from tools import kanban_tools as kt
     assert json.loads(kt._handle_create({"title": "t"})).get("error")
