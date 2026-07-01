@@ -61,6 +61,18 @@ MAX_MESSAGE_LENGTH = 4000
 DEFAULT_ROBOT_ID = "reachy"
 
 
+class _HandshakeNoiseFilter(logging.Filter):
+    """Drop websockets' noisy tracebacks when a non-ws client (e.g. a bare-TCP
+    health check) opens and closes the port without a handshake."""
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return "opening handshake failed" not in msg and "did not receive a valid HTTP request" not in msg
+
+
 def check_requirements() -> bool:
     """Dependencies present and a listen port configured."""
     if not WEBSOCKETS_AVAILABLE:
@@ -93,6 +105,10 @@ class ReachyAdapter(BasePlatformAdapter):
         if not WEBSOCKETS_AVAILABLE:
             logger.warning("[reachy] websockets not installed (pip install websockets)")
             return False
+        # keep the gateway journal clean of non-ws probe tracebacks
+        _ws_logger = logging.getLogger("websockets.server")
+        if not any(isinstance(f, _HandshakeNoiseFilter) for f in _ws_logger.filters):
+            _ws_logger.addFilter(_HandshakeNoiseFilter())
         try:
             self._server = await ws_serve(self._handle_conn, self._host, self._port)
         except Exception as e:  # pragma: no cover - bind failure path
@@ -225,7 +241,13 @@ class ReachyAdapter(BasePlatformAdapter):
         message_id = f"say_{robot_id}_{uuid.uuid4().hex[:10]}"
         ok = await self._push(
             robot_id,
-            {"type": "say", "message_id": message_id, "content": content, "final": True},
+            {
+                "type": "say",
+                "kind": "message",  # standalone (notice / tool-status / short reply)
+                "message_id": message_id,
+                "content": content,
+                "final": True,
+            },
         )
         if not ok:
             return SendResult(success=False, error=f"robot {robot_id} not connected")
@@ -241,7 +263,13 @@ class ReachyAdapter(BasePlatformAdapter):
     ) -> SendResult:
         ok = await self._push(
             chat_id,
-            {"type": "say", "message_id": message_id, "content": content, "final": bool(finalize)},
+            {
+                "type": "say",
+                "kind": "stream",  # progressive edit of a streamed reply
+                "message_id": message_id,
+                "content": content,
+                "final": bool(finalize),
+            },
         )
         if not ok:
             return SendResult(success=False, error=f"robot {chat_id} not connected")
@@ -249,6 +277,19 @@ class ReachyAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         await self._push(chat_id, {"type": "typing", "robot_id": chat_id})
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
+        """Emit an explicit turn boundary so the client knows a turn is fully
+        done (the gateway sends several 'say' messages per turn — notices,
+        tool-status, and the streamed answer — with no other end marker)."""
+        try:
+            chat_id = event.source.chat_id
+        except Exception:
+            return
+        await self._push(
+            chat_id,
+            {"type": "turn_end", "robot_id": chat_id, "outcome": getattr(outcome, "value", str(outcome))},
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {
