@@ -100,26 +100,37 @@ def test_transport_round_trip():
                 assert ev.source.platform.value == "reachy"
                 assert ev.source.chat_id == "reachy"
 
-                # outbound: send() -> a final "say" frame
+                # outbound: send() -> a standalone final "say" frame (kind=message)
                 res = await adapter.send("reachy", "Hallo Manfred.")
                 assert res.success is True
                 frame = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
                 assert frame["type"] == "say"
+                assert frame["kind"] == "message"
                 assert frame["content"] == "Hallo Manfred."
                 assert frame["final"] is True
 
-                # outbound: streamed edit_message deltas (growing accumulated text)
+                # outbound: streamed edit_message deltas (growing accumulated text, kind=stream)
                 mid = "m-stream-1"
                 r1 = await adapter.edit_message("reachy", mid, "Hallo", finalize=False)
                 assert r1.success is True
                 f1 = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
-                assert f1["message_id"] == mid and f1["content"] == "Hallo" and f1["final"] is False
+                assert f1["kind"] == "stream" and f1["message_id"] == mid
+                assert f1["content"] == "Hallo" and f1["final"] is False
 
                 r2 = await adapter.edit_message("reachy", mid, "Hallo Manfred, wie geht", finalize=True)
                 assert r2.success is True
                 f2 = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
-                assert f2["message_id"] == mid and f2["content"] == "Hallo Manfred, wie geht"
+                assert f2["kind"] == "stream" and f2["content"] == "Hallo Manfred, wie geht"
                 assert f2["final"] is True
+
+                # turn boundary: on_processing_complete -> turn_end frame
+                from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
+
+                src = adapter.build_source(chat_id="reachy", user_id="reachy")
+                ev = MessageEvent(text="x", message_type=MessageType.TEXT, source=src)
+                await adapter.on_processing_complete(ev, ProcessingOutcome.SUCCESS)
+                te = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
+                assert te["type"] == "turn_end" and te["outcome"] == "success"
         finally:
             await adapter.disconnect()
 
