@@ -223,3 +223,42 @@ def test_interrupt_frame_dispatches_like_stt():
             await adapter.disconnect()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.skipif(not WS_CLIENT, reason="websockets client unavailable")
+def test_pending_drain_frames_carry_latest_turn_id():
+    """Busy-mode interrupt: the drain task inherits the OLD turn's ContextVar, but frames must
+    be stamped with the robot's LATEST dispatched turn_id or the client drops the interrupt
+    turn's answer (review 2026-07-02 round 2, P1-7)."""
+
+    async def scenario():
+        port = _free_port()
+        adapter = _make_adapter(port)
+
+        calls = []
+
+        async def _fake_handle(event):
+            calls.append(event)
+            if len(calls) == 1:
+                # Turn 1 dispatched (ContextVar=t-old). Simulate the client interrupting:
+                # a second stt arrives and is dispatched (updates _turn_ids to t-new), then
+                # the gateway core drains the pending event FROM THE OLD TASK'S CONTEXT —
+                # emulated here by emitting the answer while ContextVar is still t-old.
+                await adapter._dispatch_text("reachy", "neue frage", turn_id="t-new")
+                # back in turn-1 context (ContextVar t-old): emit as the drain task would
+                await adapter.edit_message("reachy", "m-drain", "Antwort auf die neue Frage.", finalize=True)
+            # second (nested) dispatch: no emission — the answer above stands in for it
+
+        adapter.handle_message = _fake_handle  # type: ignore[assignment]
+
+        assert await adapter.connect() is True
+        try:
+            async with ws_connect(f"ws://127.0.0.1:{port}/robot/reachy") as client:
+                await client.send(json.dumps({"type": "stt", "text": "alte frage", "turn_id": "t-old"}))
+                say = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
+                # emitted from the OLD context AFTER t-new was dispatched -> must carry t-new
+                assert say["type"] == "say" and say["turn_id"] == "t-new" and say["origin"] == "turn"
+        finally:
+            await adapter.disconnect()
+
+    asyncio.run(scenario())
