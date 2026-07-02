@@ -576,7 +576,9 @@ def _resolve_api_key_provider_secret(
                 api_token, _base_url = get_copilot_api_token(token)
                 return api_token, source
         except ValueError as exc:
-            logger.warning("Copilot token validation failed: %s", exc)
+            # GW-M4: downgraded from warning — non-actionable when only a git PAT
+            # is present (the hourly catalog refresh probes copilot). Debug keeps it.
+            logger.debug("Copilot token validation failed: %s", exc)
         except Exception:
             pass
         return "", ""

@@ -84,8 +84,12 @@ def resolve_copilot_token() -> tuple[str, str]:
         if val:
             valid, msg = validate_copilot_token(val)
             if not valid:
-                logger.warning(
-                    "Token from %s is not supported: %s", env_var, msg
+                # GW-M4: non-actionable for users who have a general git PAT
+                # (GITHUB_TOKEN/GH_TOKEN) but no Copilot — the hourly model-catalog
+                # refresh probes copilot and would otherwise flood errors.log. The
+                # detail stays discoverable at debug level.
+                logger.debug(
+                    "Token from %s is not a Copilot token: %s", env_var, msg
                 )
                 continue
             return val, env_var
