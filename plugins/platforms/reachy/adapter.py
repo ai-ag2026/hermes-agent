@@ -72,6 +72,15 @@ _CURRENT_TURN_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar
     "reachy_current_turn_id", default=None
 )
 
+# The running adapter instance (set in connect/disconnect). The tars-reachy tool plugin uses
+# this to reach the robot from a tool handler — same process, no extra transport
+# (body-tool surface, gap-map Stufe 3, 2026-07-02).
+_ACTIVE_ADAPTER: Optional["Any"] = None
+
+
+def get_active_adapter() -> Optional["Any"]:
+    return _ACTIVE_ADAPTER
+
 
 class _HandshakeNoiseFilter(logging.Filter):
     """Drop websockets' noisy tracebacks when a non-ws client (e.g. a bare-TCP
@@ -113,6 +122,8 @@ class ReachyAdapter(BasePlatformAdapter):
         self._robots: Dict[str, Any] = {}
         # robot_id -> turn_id of the most recently dispatched client turn (see _current_turn_id)
         self._turn_ids: Dict[str, str] = {}
+        # tool_call_id -> Future awaiting the robot's tool_result (body-tool surface)
+        self._tool_futures: Dict[str, "asyncio.Future"] = {}
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -129,6 +140,11 @@ class ReachyAdapter(BasePlatformAdapter):
             logger.error("[reachy] failed to start ws server on %s:%s: %s", self._host, self._port, e)
             return False
         self._mark_connected()
+        global _ACTIVE_ADAPTER
+        _ACTIVE_ADAPTER = self
+        # The adapter's home loop: tool handlers may run in a DIFFERENT loop (the registry's
+        # async bridge) — call_robot_tool must execute here or its future never wakes.
+        self._loop = asyncio.get_running_loop()
         logger.info("[reachy] ws server listening on %s:%s", self._host, self._port)
         return True
 
@@ -147,6 +163,9 @@ class ReachyAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             self._server = None
+        global _ACTIVE_ADAPTER
+        if _ACTIVE_ADAPTER is self:
+            _ACTIVE_ADAPTER = None
         logger.info("[reachy] disconnected")
 
     # ── inbound transport ──────────────────────────────────────────────────
@@ -211,6 +230,11 @@ class ReachyAdapter(BasePlatformAdapter):
             if text:
                 turn_id = str(frame.get("turn_id") or "").strip() or None
                 await self._dispatch_text(robot_id, text, turn_id=turn_id)
+        elif ftype == "tool_result":
+            tcid = str(frame.get("tool_call_id") or "").strip()
+            fut = self._tool_futures.get(tcid)
+            if fut is not None and not fut.done():
+                fut.set_result(frame.get("result") if isinstance(frame.get("result"), dict) else {})
         else:
             logger.debug("[reachy] unhandled frame type %r from %s", ftype, robot_id)
         return robot_id
@@ -264,6 +288,30 @@ class ReachyAdapter(BasePlatformAdapter):
         obj["turn_id"] = turn_id
         obj["origin"] = "turn" if turn_id else "proactive"
         return obj
+
+    async def call_robot_tool(
+        self, robot_id: str, action: str, params: Optional[Dict[str, Any]] = None, *, timeout_s: float = 12.0
+    ) -> Dict[str, Any]:
+        """Body-tool surface (gap-map Stufe 3): push a tool_call frame to the robot app and
+        await its tool_result. The app executes through its MovementManager/tool registry with
+        a client-side allowlist; this side only correlates request and response."""
+        if robot_id not in self._robots:
+            return {"error": f"robot {robot_id} not connected"}
+        tcid = uuid.uuid4().hex
+        fut: "asyncio.Future" = asyncio.get_running_loop().create_future()
+        self._tool_futures[tcid] = fut
+        try:
+            ok = await self._push(
+                robot_id,
+                {"type": "tool_call", "tool_call_id": tcid, "action": action, "params": params or {}},
+            )
+            if not ok:
+                return {"error": f"robot {robot_id} not reachable"}
+            return await asyncio.wait_for(fut, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            return {"error": f"robot tool timed out after {timeout_s:.0f}s"}
+        finally:
+            self._tool_futures.pop(tcid, None)
 
     async def _push(self, robot_id: str, obj: Dict[str, Any]) -> bool:
         ws = self._robots.get(robot_id)
