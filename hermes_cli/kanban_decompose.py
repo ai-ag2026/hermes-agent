@@ -295,6 +295,19 @@ def decompose_task(
     default_assignee = _resolve_default_assignee(cfg)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
+
+    # Decompose guardrails (2026-07-02, landscape-research #3). Generous safety
+    # nets that only fire on genuine runaway; a value <= 0 (or non-int) disables
+    # that cap. See decompose_triage_task for enforcement semantics.
+    def _cap(key: str, default: int) -> Optional[int]:
+        try:
+            val = int(kanban_cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return val if val >= 1 else None
+
+    max_fanout = _cap("max_fanout", 12)
+    max_tasks_per_root = _cap("max_tasks_per_root", 60)
     roster, valid_names = _build_roster()
 
     try:
@@ -447,6 +460,8 @@ def decompose_task(
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
+                max_fanout=max_fanout,
+                max_tasks_per_root=max_tasks_per_root,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
