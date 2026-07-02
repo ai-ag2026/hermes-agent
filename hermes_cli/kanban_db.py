@@ -3460,19 +3460,32 @@ def recompute_ready(
 # ---------------------------------------------------------------------------
 
 def _resolve_worker_session(
-    conn: sqlite3.Connection, task_id: str, run_id: int
+    conn: sqlite3.Connection, task_id: str, run_id: int, *, allow_resume: bool = True
 ) -> tuple[Optional[str], bool]:
     """Decide the resumable worker session id for a freshly-created run (#2).
 
     Returns ``(session_id, is_resume)``:
       * ``(None, False)`` when resume-on-reclaim is OFF -> caller writes no
         session_id and the worker keeps its random session (unchanged behaviour).
-      * ``(<prev>, True)`` to RESUME: an earlier run of this task pinned a
-        session_id whose crash budget isn't spent -> reuse it so the re-claimed
+      * ``(<prev>, True)`` to RESUME: the MOST RECENT prior run of this task
+        pinned a session_id, ended abnormally (``crashed``/``timed_out``), and
+        that session's crash budget isn't spent -> reuse it so the re-claimed
         worker continues the same conversation from the last flushed message.
-      * ``(<new>, False)`` on first claim, or when the previous session is
-        poisoned (crashed/timed_out >= resume_max_attempts) -> a fresh, globally
-        unique id, so a bad context is thrown away rather than resumed forever.
+      * ``(<new>, False)`` otherwise: first claim, previous run ended any other
+        way (completed/blocked/reclaimed/...), goal_mode task, poisoned session,
+        or ``allow_resume=False`` -> a fresh, globally unique id.
+
+    Dev-chain-audit fixes (2026-07-02, DEVCHAIN-AUDIT F1/F5):
+      * OUTCOME GATE: resume ONLY when the newest prior run actually crashed or
+        timed out. Without it, review-lane claims resumed the WORKER's session
+        (reviewer independence destroyed), blocked->unblock re-claims resumed
+        silently, and TTL-stale reclaims (outcome='reclaimed') resumed a stuck
+        conversation forever WITHOUT ever burning the poison budget.
+      * ``allow_resume=False`` lets claim_review_task pin a fresh, traceable
+        session while structurally never resuming.
+      * goal_mode tasks never resume (interim, F5): a restored goal-loop history
+        plus a re-fired first turn duplicates the goal framing and resets the
+        turn budget per spawn — excluded until the goal loop is resume-aware.
 
     Must be called INSIDE claim_task's write_txn so the decision is atomic against
     parallel dispatchers (the ready->running CAS already serializes the claim).
@@ -3480,14 +3493,23 @@ def _resolve_worker_session(
     if not _resolve_resume_on_reclaim():
         return None, False
     max_attempts = _resolve_resume_max_attempts()
-    if max_attempts >= 1:
+    if allow_resume and max_attempts >= 1:
+        goal_row = conn.execute(
+            "SELECT goal_mode FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if goal_row and goal_row["goal_mode"]:
+            return f"kbwrk_{task_id}_{run_id}_{secrets.token_hex(3)}", False
         prev = conn.execute(
-            "SELECT session_id FROM task_runs "
+            "SELECT session_id, outcome FROM task_runs "
             "WHERE task_id = ? AND session_id IS NOT NULL AND id <> ? "
             "ORDER BY id DESC LIMIT 1",
             (task_id, run_id),
         ).fetchone()
-        if prev and prev["session_id"]:
+        if (
+            prev
+            and prev["session_id"]
+            and prev["outcome"] in ("crashed", "timed_out")
+        ):
             sess = prev["session_id"]
             crashes = conn.execute(
                 "SELECT COUNT(*) AS c FROM task_runs "
@@ -3713,9 +3735,13 @@ def claim_review_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
-        # Event-sourcing resume (#2), symmetric with claim_task so review agents
-        # also get a stable resumable session (and resume on re-claim).
-        worker_session, resume_requested = _resolve_worker_session(conn, task_id, run_id)
+        # Event-sourcing resume (#2): review agents get a stable, traceable
+        # session id but NEVER resume (DEVCHAIN-AUDIT F1) — resuming here would
+        # hand the reviewer the WORKER's conversation, destroying reviewer
+        # independence (the worker would effectively review its own work).
+        worker_session, resume_requested = _resolve_worker_session(
+            conn, task_id, run_id, allow_resume=False
+        )
         if worker_session:
             if resume_requested:
                 conn.execute(
@@ -4439,7 +4465,13 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
         if remote_refs.returncode != 0:
             return True
         if not remote_refs.stdout.strip():
-            return False
+            # No remote-tracking refs -> there is no push baseline at all.
+            # DEVCHAIN-AUDIT F4 (A2): unlike the interactive `hermes -w` variant
+            # in cli.py (where the user watches the cleanup), the kanban reaper
+            # runs unattended — "no remote" must mean "cannot prove pushed",
+            # NOT "nothing to protect". Otherwise committed work in a local-only
+            # repo would be deleted (worktree + branch -> commits dangling).
+            return True
         result = subprocess.run(
             ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
             capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
@@ -4508,16 +4540,35 @@ def _maybe_cleanup_worktree(conn: sqlite3.Connection, task_id: str, path: str) -
                 "changes): %s", task_id, wt,
             )
             return
-        for cmd in (
+        # Determine the REAL branch before removing the worktree (DEVCHAIN-AUDIT
+        # F4/B3): project-linked tasks use deterministic custom branch names, not
+        # the wt/<id> fallback — deleting the wrong name leaks the actual branch.
+        # Prefer the live checkout (ground truth), then the persisted task column,
+        # then the conventional fallback.
+        branch = None
+        try:
+            branch = _git_current_branch(wt)
+        except Exception:
+            branch = None
+        if not branch:
+            _brow = conn.execute(
+                "SELECT branch_name FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            branch = (_brow["branch_name"] if _brow else None) or f"wt/{task_id}"
+        cmds = [
             ["git", "-C", str(repo_root), "worktree", "unlock", str(wt)],
             ["git", "-C", str(repo_root), "worktree", "remove", str(wt), "--force"],
-            ["git", "-C", str(repo_root), "branch", "-D", f"wt/{task_id}"],
-        ):
+        ]
+        # Never delete a primary-sounding branch, even if a task somehow ended up
+        # checked out on it — the worktree removal alone is then enough.
+        if branch and branch not in ("main", "master"):
+            cmds.append(["git", "-C", str(repo_root), "branch", "-D", branch])
+        for cmd in cmds:
             try:
                 subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
             except Exception:
                 pass
-        _log.debug("Auto-cleaned worktree for task %s: %s", task_id, wt)
+        _log.debug("Auto-cleaned worktree for task %s (branch %s): %s", task_id, branch, wt)
     except Exception:
         pass  # best-effort — never block completion
 
@@ -6777,6 +6828,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+                if _was_resume:
+                    # Preserve the resume marker in the run history — _end_run
+                    # replaces task_runs.metadata with this payload, which would
+                    # otherwise erase {"resumed": true} (DEVCHAIN-AUDIT C4).
+                    event_payload["resumed"] = True
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
