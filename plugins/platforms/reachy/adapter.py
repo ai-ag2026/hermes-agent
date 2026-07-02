@@ -111,6 +111,8 @@ class ReachyAdapter(BasePlatformAdapter):
         self._server: Optional[Any] = None
         # robot_id -> active websocket connection
         self._robots: Dict[str, Any] = {}
+        # robot_id -> turn_id of the most recently dispatched client turn (see _current_turn_id)
+        self._turn_ids: Dict[str, str] = {}
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -232,6 +234,7 @@ class ReachyAdapter(BasePlatformAdapter):
         # contextvar so the turn's background task stamps every say/edit frame with this id.
         if turn_id:
             event.metadata["reachy_turn_id"] = turn_id
+            self._turn_ids[robot_id] = turn_id
         tok = _CURRENT_TURN_ID.set(turn_id)
         try:
             await self.handle_message(event)
@@ -240,6 +243,19 @@ class ReachyAdapter(BasePlatformAdapter):
             _CURRENT_TURN_ID.reset(tok)
 
     # ── outbound transport ─────────────────────────────────────────────────
+    def _current_turn_id(self, robot_id: str) -> Optional[str]:
+        """turn_id to stamp on an outbound frame for this robot.
+
+        None (no turn context) -> proactive. Inside a turn context, use the robot's LATEST
+        dispatched turn id rather than the inherited ContextVar value: the busy-mode pending
+        drain task is created from the OLD turn task's context, so its ContextVar still carries
+        the superseded id — frames stamped with it were dropped client-side and the interrupt
+        turn's answer went silent (review 2026-07-02 round 2, P1-7)."""
+        ctx = _CURRENT_TURN_ID.get()
+        if ctx is None:
+            return None
+        return self._turn_ids.get(robot_id, ctx)
+
     @staticmethod
     def _tag_turn(obj: Dict[str, Any], turn_id: Optional[str]) -> Dict[str, Any]:
         """Stamp an outbound frame so the client can route it: an interactive reply carries the
@@ -258,7 +274,10 @@ class ReachyAdapter(BasePlatformAdapter):
             return True
         except Exception as e:
             logger.warning("[reachy] push to %s failed: %s", robot_id, e)
-            self._robots.pop(robot_id, None)
+            # Only evict OUR socket: the client may have reconnected already; popping
+            # unconditionally removed the healthy new connection (review 2026-07-02, F5).
+            if self._robots.get(robot_id) is ws:
+                self._robots.pop(robot_id, None)
             return False
 
     async def send(
@@ -280,7 +299,7 @@ class ReachyAdapter(BasePlatformAdapter):
                     "content": content,
                     "final": True,
                 },
-                _CURRENT_TURN_ID.get(),
+                self._current_turn_id(robot_id),
             ),
         )
         if not ok:
@@ -305,7 +324,7 @@ class ReachyAdapter(BasePlatformAdapter):
                     "content": content,
                     "final": bool(finalize),
                 },
-                _CURRENT_TURN_ID.get(),
+                self._current_turn_id(chat_id),
             ),
         )
         if not ok:
@@ -329,7 +348,7 @@ class ReachyAdapter(BasePlatformAdapter):
             turn_id = (event.metadata or {}).get("reachy_turn_id")
         except Exception:
             turn_id = None
-        turn_id = turn_id or _CURRENT_TURN_ID.get()
+        turn_id = turn_id or self._current_turn_id(chat_id)
         await self._push(
             chat_id,
             self._tag_turn(
