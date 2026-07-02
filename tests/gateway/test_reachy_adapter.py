@@ -262,3 +262,29 @@ def test_pending_drain_frames_carry_latest_turn_id():
             await adapter.disconnect()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.skipif(not WS_CLIENT, reason="websockets client unavailable")
+def test_typing_frames_are_turn_tagged():
+    """Untagged typing fell back to the client's temporal rule and reset the active turn's
+    timeout even for foreign turns (review 2026-07-02 round 2, P2)."""
+
+    async def scenario():
+        port = _free_port()
+        adapter = _make_adapter(port)
+
+        async def _fake_handle(event):
+            await adapter.send_typing("reachy")
+
+        adapter.handle_message = _fake_handle  # type: ignore[assignment]
+
+        assert await adapter.connect() is True
+        try:
+            async with ws_connect(f"ws://127.0.0.1:{port}/robot/reachy") as client:
+                await client.send(json.dumps({"type": "stt", "text": "hi", "turn_id": "t-9"}))
+                ty = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
+                assert ty["type"] == "typing" and ty["turn_id"] == "t-9" and ty["origin"] == "turn"
+        finally:
+            await adapter.disconnect()
+
+    asyncio.run(scenario())
