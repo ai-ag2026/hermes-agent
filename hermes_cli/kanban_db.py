@@ -4989,6 +4989,8 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    max_fanout: Optional[int] = None,
+    max_tasks_per_root: Optional[int] = None,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -5018,6 +5020,13 @@ def decompose_triage_task(
     """
     if not children:
         return None
+    # Guardrail (2026-07-02, landscape-research #3): bound the fan-out WIDTH so a
+    # single decompose can never spawn an unbounded wave of sibling tasks. This is
+    # the primary Kanban-graph runaway guard; it always applies. ``None`` disables.
+    if max_fanout and len(children) > max_fanout:
+        raise ValueError(
+            f"decompose fanout {len(children)} exceeds kanban.max_fanout={max_fanout}"
+        )
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
 
@@ -5082,6 +5091,30 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
+        # Guardrail (2026-07-02, landscape-research #3): bound total graph SIZE.
+        # task_links are dependency edges and the root is linked as a *child* of
+        # every leaf (it waits for the whole graph), so a plain "descendants of
+        # root" walk is misleading. Instead measure the connected component the
+        # task belongs to (bidirectional walk) — robust regardless of edge
+        # direction. A fresh standalone triage task has no links -> component of
+        # 1, so this only bites tasks already embedded in a larger graph, as
+        # defense-in-depth against accumulation. ``None`` disables.
+        if max_tasks_per_root:
+            comp_size = conn.execute(
+                "WITH RECURSIVE comp(node) AS ("
+                "  SELECT ? "
+                "  UNION "
+                "  SELECT l.child_id FROM comp c JOIN task_links l ON l.parent_id = c.node "
+                "  UNION "
+                "  SELECT l.parent_id FROM comp c JOIN task_links l ON l.child_id = c.node"
+                ") SELECT COUNT(*) FROM comp",
+                (task_id,),
+            ).fetchone()[0]
+            if comp_size + len(children) > max_tasks_per_root:
+                raise ValueError(
+                    f"task graph size {comp_size + len(children)} exceeds "
+                    f"kanban.max_tasks_per_root={max_tasks_per_root}"
+                )
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
