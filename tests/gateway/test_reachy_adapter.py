@@ -153,6 +153,52 @@ def test_send_to_absent_robot_fails_cleanly():
 
 
 @pytest.mark.skipif(not WS_CLIENT, reason="websockets client unavailable")
+def test_turn_id_echoed_on_interactive_frames_and_null_for_proactive():
+    """Client-supplied turn_id round-trips onto say/turn_end during a turn; a send with no
+    active turn is tagged origin=proactive/turn_id=None (audit 2026-07-02, V5c correlation)."""
+
+    async def scenario():
+        port = _free_port()
+        adapter = _make_adapter(port)
+
+        # Emulate the turn machinery: handle_message stamps the contextvar-scoped turn (the real
+        # gateway inherits it via the detached task). Here we call the outbound methods INSIDE the
+        # _dispatch_text scope by patching handle_message to emit frames synchronously.
+        from plugins.platforms.reachy import adapter as adapter_mod
+
+        async def _fake_handle(event):
+            # runs while _CURRENT_TURN_ID is set to the client's id
+            await adapter.edit_message("reachy", "m1", "Ein schwarzes Loch,", finalize=False)
+            await adapter.on_processing_complete(event, _Outcome())
+            assert event.metadata.get("reachy_turn_id") == "t-123"
+
+        adapter.handle_message = _fake_handle  # type: ignore[assignment]
+
+        assert await adapter.connect() is True
+        try:
+            async with ws_connect(f"ws://127.0.0.1:{port}/robot/reachy") as client:
+                await client.send(json.dumps({"type": "stt", "text": "was ist ein schwarzes loch", "turn_id": "t-123"}))
+                say = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
+                assert say["type"] == "say" and say["turn_id"] == "t-123" and say["origin"] == "turn"
+                te = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
+                assert te["type"] == "turn_end" and te["turn_id"] == "t-123" and te["origin"] == "turn"
+
+                # proactive: a send OUTSIDE any turn scope -> turn_id None, origin proactive
+                res = await adapter.send("reachy", "Recherche fertig: Wellington.")
+                assert res.success is True
+                pro = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
+                assert pro["type"] == "say" and pro["turn_id"] is None and pro["origin"] == "proactive"
+        finally:
+            await adapter.disconnect()
+
+    asyncio.run(scenario())
+
+
+class _Outcome:
+    value = "success"
+
+
+@pytest.mark.skipif(not WS_CLIENT, reason="websockets client unavailable")
 def test_interrupt_frame_dispatches_like_stt():
     async def scenario():
         port = _free_port()
