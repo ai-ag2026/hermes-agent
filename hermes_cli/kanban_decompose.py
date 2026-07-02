@@ -297,8 +297,10 @@ def decompose_task(
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
 
     # Decompose guardrails (2026-07-02, landscape-research #3). Generous safety
-    # nets that only fire on genuine runaway; a value <= 0 (or non-int) disables
-    # that cap. See decompose_triage_task for enforcement semantics.
+    # nets that only fire on genuine runaway. A value <= 0 disables that cap;
+    # a NON-INT value falls back to the DEFAULT cap (fail toward protection,
+    # not toward open — DEVCHAIN-AUDIT C1). See decompose_triage_task for
+    # enforcement semantics.
     def _cap(key: str, default: int) -> Optional[int]:
         try:
             val = int(kanban_cfg.get(key, default))

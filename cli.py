@@ -3941,6 +3941,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self.session_id = _kb_worker_session
             if os.environ.get("HERMES_KANBAN_RESUME") == "1":
                 self._resumed = True
+                # If the pinned session was never flushed (worker crashed before
+                # the first tool step), degrade to a fresh start instead of
+                # aborting — see _init_agent fallback (DEVCHAIN-AUDIT F3).
+                self._kb_session_fallback = True
+            # Scrub both vars so child processes (nested `hermes chat -q ...`
+            # spawned via the terminal tool) get their own random session again
+            # instead of adopting — and polluting — this worker's session
+            # (DEVCHAIN-AUDIT F2).
+            os.environ.pop("HERMES_KANBAN_WORKER_SESSION", None)
+            os.environ.pop("HERMES_KANBAN_RESUME", None)
         else:
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
