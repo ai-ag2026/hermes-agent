@@ -275,6 +275,52 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
 
 
+def _resolve_resume_on_reclaim() -> bool:
+    """Whether a re-claimed (crashed/stale) task RESUMES its previous worker
+    session instead of starting fresh (event-sourcing resume, #2, opt-in default OFF).
+
+    Read from ``kanban.resume_on_reclaim`` in config, overridable via the
+    ``HERMES_KANBAN_RESUME_ON_RECLAIM`` env (``1``/``0``) for tests / dispatcher
+    export. Default OFF = the long-standing fresh-start-on-reclaim behaviour, so
+    no existing install changes behaviour until a board operator opts in.
+    """
+    raw = os.environ.get("HERMES_KANBAN_RESUME_ON_RECLAIM", "").strip()
+    if raw:
+        return raw not in ("0", "false", "no", "off", "")
+    try:
+        from hermes_cli.config import load_config
+
+        return bool((load_config().get("kanban") or {}).get("resume_on_reclaim", False))
+    except Exception:
+        return False
+
+
+def _resolve_resume_max_attempts() -> int:
+    """Number of resume attempts allowed per worker session before a re-claim
+    throws the (potentially poisoned) session away and starts fresh (#2). Default 1
+    = resume once after the first crash; a second crash of that session goes fresh.
+
+    Read from ``kanban.resume_max_attempts`` (env override
+    ``HERMES_KANBAN_RESUME_MAX_ATTEMPTS``). Kept strictly below the
+    ``consecutive_failures`` breaker so a task can never resume-loop forever: once
+    the breaker trips the task blocks (needs_input) and is no longer dispatched.
+    A value < 1 disables resume entirely (always fresh).
+    """
+    raw = os.environ.get("HERMES_KANBAN_RESUME_MAX_ATTEMPTS", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            return 1
+    try:
+        from hermes_cli.config import load_config
+
+        val = (load_config().get("kanban") or {}).get("resume_max_attempts", 1)
+        return int(val)
+    except Exception:
+        return 1
+
+
 # Worker-context caps so build_worker_context() stays bounded on
 # pathological boards (retry-heavy tasks, comment storms, giant
 # summaries). Values chosen to fit a typical 100k-char LLM prompt with
@@ -914,6 +960,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Event-sourcing resume (#2), in-memory only — NOT persisted columns and NOT
+    # read by from_row. Populated by claim_task/claim_review_task so the spawn
+    # path knows which resumable session id to pin for this run and whether this
+    # claim should resume the previous run's conversation (re-claim after crash).
+    worker_session_id: Optional[str] = None
+    resume_requested: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -2014,6 +2066,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+
+    # task_runs gained a session_id column (event-sourcing resume, #2). It pins
+    # the worker's resumable session id for the run so a re-claim after a crash
+    # can continue the same agent conversation instead of starting fresh. NULL on
+    # legacy runs and whenever kanban.resume_on_reclaim is off. Additive only —
+    # mirrors the tasks.session_id migration above; an older binary ignores it.
+    runs_table_present = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if runs_table_present:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if "session_id" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "session_id", "session_id TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_session ON task_runs(session_id)"
+        )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -3369,6 +3437,52 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _resolve_worker_session(
+    conn: sqlite3.Connection, task_id: str, run_id: int
+) -> tuple[Optional[str], bool]:
+    """Decide the resumable worker session id for a freshly-created run (#2).
+
+    Returns ``(session_id, is_resume)``:
+      * ``(None, False)`` when resume-on-reclaim is OFF -> caller writes no
+        session_id and the worker keeps its random session (unchanged behaviour).
+      * ``(<prev>, True)`` to RESUME: an earlier run of this task pinned a
+        session_id whose crash budget isn't spent -> reuse it so the re-claimed
+        worker continues the same conversation from the last flushed message.
+      * ``(<new>, False)`` on first claim, or when the previous session is
+        poisoned (crashed/timed_out >= resume_max_attempts) -> a fresh, globally
+        unique id, so a bad context is thrown away rather than resumed forever.
+
+    Must be called INSIDE claim_task's write_txn so the decision is atomic against
+    parallel dispatchers (the ready->running CAS already serializes the claim).
+    """
+    if not _resolve_resume_on_reclaim():
+        return None, False
+    max_attempts = _resolve_resume_max_attempts()
+    if max_attempts >= 1:
+        prev = conn.execute(
+            "SELECT session_id FROM task_runs "
+            "WHERE task_id = ? AND session_id IS NOT NULL AND id <> ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, run_id),
+        ).fetchone()
+        if prev and prev["session_id"]:
+            sess = prev["session_id"]
+            crashes = conn.execute(
+                "SELECT COUNT(*) AS c FROM task_runs "
+                "WHERE task_id = ? AND session_id = ? "
+                "AND outcome IN ('crashed', 'timed_out')",
+                (task_id, sess),
+            ).fetchone()["c"]
+            # ``crashes`` past failures of THIS session == the resume attempt we
+            # are about to make. Allow up to ``max_attempts`` resumes, then treat
+            # the session as poisoned. (max_attempts=1 -> resume once after the
+            # first crash; the second crash falls through to a fresh session.)
+            if crashes <= max_attempts:
+                return sess, True
+            # Poisoned session (crash budget spent) -> fall through to a fresh id.
+    return f"kbwrk_{task_id}_{run_id}_{secrets.token_hex(3)}", False
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3475,12 +3589,32 @@ def claim_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
+        # Event-sourcing resume (#2): pin this run's resumable worker session id.
+        # On a re-claim of a crashed task the same id is reused and a ``resumed``
+        # marker is written to the run metadata so detect_crashed_workers can tell
+        # a resumed clean-exit apart from a genuine protocol violation. The run row
+        # was just inserted with NULL metadata, so writing it here is race-free.
+        worker_session, resume_requested = _resolve_worker_session(conn, task_id, run_id)
+        if worker_session:
+            if resume_requested:
+                conn.execute(
+                    "UPDATE task_runs SET session_id = ?, metadata = ? WHERE id = ?",
+                    (worker_session, '{"resumed": true}', run_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE task_runs SET session_id = ? WHERE id = ?",
+                    (worker_session, run_id),
+                )
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
+        if claimed is not None:
+            claimed.worker_session_id = worker_session
+            claimed.resume_requested = resume_requested
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -3557,13 +3691,31 @@ def claim_review_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
+        # Event-sourcing resume (#2), symmetric with claim_task so review agents
+        # also get a stable resumable session (and resume on re-claim).
+        worker_session, resume_requested = _resolve_worker_session(conn, task_id, run_id)
+        if worker_session:
+            if resume_requested:
+                conn.execute(
+                    "UPDATE task_runs SET session_id = ?, metadata = ? WHERE id = ?",
+                    (worker_session, '{"resumed": true}', run_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE task_runs SET session_id = ? WHERE id = ?",
+                    (worker_session, run_id),
+                )
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
              "source_status": "review"},
             run_id=run_id,
         )
-        return get_task(conn, task_id)
+        claimed = get_task(conn, task_id)
+        if claimed is not None:
+            claimed.worker_session_id = worker_session
+            claimed.resume_requested = resume_requested
+        return claimed
 
 
 def heartbeat_claim(
@@ -6408,14 +6560,36 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Retrying won't
-                # help.
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation"
+                # ``kanban_complete`` / ``kanban_block``. Normally a protocol
+                # violation (retrying won't help) -> trip the breaker at once.
+                # BUT if this run was a RESUME (#2), a clean-exit can be the
+                # resumed context wrongly concluding "done" — a poisoned-context
+                # symptom, not a deterministic task defect. Downgrade to a normal
+                # +1 failure so the resume budget burns down and the NEXT claim
+                # starts fresh, instead of an immediate block.
+                _run_meta_row = conn.execute(
+                    "SELECT r.metadata FROM task_runs r "
+                    "JOIN tasks t ON t.current_run_id = r.id WHERE t.id = ?",
+                    (row["id"],),
+                ).fetchone()
+                _was_resume = bool(
+                    _run_meta_row and _run_meta_row["metadata"]
+                    and '"resumed": true' in _run_meta_row["metadata"]
                 )
-                event_kind = "protocol_violation"
+                protocol_violation = not _was_resume
+                if _was_resume:
+                    error_text = (
+                        "resumed worker exited cleanly (rc=0) without calling "
+                        "kanban_complete/kanban_block — counted as one failure "
+                        "(resume budget); next claim starts fresh"
+                    )
+                    event_kind = "protocol_violation_after_resume"
+                else:
+                    error_text = (
+                        "worker exited cleanly (rc=0) without calling "
+                        "kanban_complete or kanban_block — protocol violation"
+                    )
+                    event_kind = "protocol_violation"
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
@@ -7728,6 +7902,15 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    # Event-sourcing resume (#2): hand the worker its pinned resumable session id
+    # (None when resume-on-reclaim is off) and, on a re-claim of a crashed task,
+    # tell it to resume the prior conversation. HERMES_SESSION_ID is deliberately
+    # NOT reused for this — it carries the *originating* session and gets
+    # overwritten by agent_init with the worker's own id anyway.
+    if getattr(task, "worker_session_id", None):
+        env["HERMES_KANBAN_WORKER_SESSION"] = task.worker_session_id
+        if getattr(task, "resume_requested", False):
+            env["HERMES_KANBAN_RESUME"] = "1"
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the
