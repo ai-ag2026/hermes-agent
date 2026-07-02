@@ -31,6 +31,7 @@ Zero core changes: ``Platform("reachy")`` resolves via the enum's ``_missing_`` 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -59,6 +60,17 @@ logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 4000
 DEFAULT_ROBOT_ID = "reachy"
+
+# Correlates outbound frames to the turn that produced them. Set around handle_message()
+# in _dispatch_text; asyncio.create_task copies the current context, so the turn's detached
+# background task (and its edit_message/send/on_processing_complete calls) inherit this
+# client-supplied turn_id. A proactive send (async-delegation watcher / cron / send_message)
+# runs in a SEPARATE task that never entered _dispatch_text, so the var is unset (None) and
+# the frame is tagged origin="proactive" — this is how the client tells an interactive reply
+# apart from an unsolicited delivery arriving mid-turn (audit 2026-07-02, V5c).
+_CURRENT_TURN_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "reachy_current_turn_id", default=None
+)
 
 
 class _HandshakeNoiseFilter(logging.Filter):
@@ -195,12 +207,13 @@ class ReachyAdapter(BasePlatformAdapter):
         if ftype in ("stt", "interrupt", "text"):
             text = str(frame.get("text") or "").strip()
             if text:
-                await self._dispatch_text(robot_id, text)
+                turn_id = str(frame.get("turn_id") or "").strip() or None
+                await self._dispatch_text(robot_id, text, turn_id=turn_id)
         else:
             logger.debug("[reachy] unhandled frame type %r from %s", ftype, robot_id)
         return robot_id
 
-    async def _dispatch_text(self, robot_id: str, text: str) -> None:
+    async def _dispatch_text(self, robot_id: str, text: str, *, turn_id: Optional[str] = None) -> None:
         source = self.build_source(
             chat_id=robot_id,
             chat_name=f"Reachy {robot_id}",
@@ -215,9 +228,27 @@ class ReachyAdapter(BasePlatformAdapter):
             message_id=f"stt_{robot_id}_{int(time.time() * 1000)}",
             timestamp=datetime.now(),
         )
-        await self.handle_message(event)
+        # Stash on the event for on_processing_complete (which receives the event) and set the
+        # contextvar so the turn's background task stamps every say/edit frame with this id.
+        if turn_id:
+            event.metadata["reachy_turn_id"] = turn_id
+        tok = _CURRENT_TURN_ID.set(turn_id)
+        try:
+            await self.handle_message(event)
+        finally:
+            # Reset only THIS task's view; the turn's detached task already captured its own copy.
+            _CURRENT_TURN_ID.reset(tok)
 
     # ── outbound transport ─────────────────────────────────────────────────
+    @staticmethod
+    def _tag_turn(obj: Dict[str, Any], turn_id: Optional[str]) -> Dict[str, Any]:
+        """Stamp an outbound frame so the client can route it: an interactive reply carries the
+        client's ``turn_id`` (origin=turn); anything emitted outside a turn is a proactive
+        delivery (turn_id=None, origin=proactive)."""
+        obj["turn_id"] = turn_id
+        obj["origin"] = "turn" if turn_id else "proactive"
+        return obj
+
     async def _push(self, robot_id: str, obj: Dict[str, Any]) -> bool:
         ws = self._robots.get(robot_id)
         if ws is None:
@@ -241,13 +272,16 @@ class ReachyAdapter(BasePlatformAdapter):
         message_id = f"say_{robot_id}_{uuid.uuid4().hex[:10]}"
         ok = await self._push(
             robot_id,
-            {
-                "type": "say",
-                "kind": "message",  # standalone (notice / tool-status / short reply)
-                "message_id": message_id,
-                "content": content,
-                "final": True,
-            },
+            self._tag_turn(
+                {
+                    "type": "say",
+                    "kind": "message",  # standalone (notice / tool-status / short reply / proactive)
+                    "message_id": message_id,
+                    "content": content,
+                    "final": True,
+                },
+                _CURRENT_TURN_ID.get(),
+            ),
         )
         if not ok:
             return SendResult(success=False, error=f"robot {robot_id} not connected")
@@ -263,13 +297,16 @@ class ReachyAdapter(BasePlatformAdapter):
     ) -> SendResult:
         ok = await self._push(
             chat_id,
-            {
-                "type": "say",
-                "kind": "stream",  # progressive edit of a streamed reply
-                "message_id": message_id,
-                "content": content,
-                "final": bool(finalize),
-            },
+            self._tag_turn(
+                {
+                    "type": "say",
+                    "kind": "stream",  # progressive edit of a streamed reply
+                    "message_id": message_id,
+                    "content": content,
+                    "final": bool(finalize),
+                },
+                _CURRENT_TURN_ID.get(),
+            ),
         )
         if not ok:
             return SendResult(success=False, error=f"robot {chat_id} not connected")
@@ -286,9 +323,19 @@ class ReachyAdapter(BasePlatformAdapter):
             chat_id = event.source.chat_id
         except Exception:
             return
+        # Prefer the id stashed on the event (most reliable here); fall back to the contextvar.
+        turn_id = None
+        try:
+            turn_id = (event.metadata or {}).get("reachy_turn_id")
+        except Exception:
+            turn_id = None
+        turn_id = turn_id or _CURRENT_TURN_ID.get()
         await self._push(
             chat_id,
-            {"type": "turn_end", "robot_id": chat_id, "outcome": getattr(outcome, "value", str(outcome))},
+            self._tag_turn(
+                {"type": "turn_end", "robot_id": chat_id, "outcome": getattr(outcome, "value", str(outcome))},
+                turn_id,
+            ),
         )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
