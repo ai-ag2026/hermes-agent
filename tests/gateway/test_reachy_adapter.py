@@ -288,3 +288,43 @@ def test_typing_frames_are_turn_tagged():
             await adapter.disconnect()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.skipif(not WS_CLIENT, reason="websockets client unavailable")
+def test_call_robot_tool_roundtrip_and_timeout():
+    """Body-tool surface (gap-map Stufe 3): call_robot_tool pushes a tool_call frame and
+    resolves on the matching tool_result; an unanswered call times out cleanly."""
+
+    async def scenario():
+        port = _free_port()
+        adapter = _make_adapter(port)
+        assert await adapter.connect() is True
+        try:
+            async with ws_connect(f"ws://127.0.0.1:{port}/robot/reachy") as client:
+                await client.send(json.dumps({"type": "hello", "robot_id": "reachy"}))
+                await asyncio.sleep(0.1)
+
+                async def robot_side():
+                    frame = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
+                    assert frame["type"] == "tool_call" and frame["action"] == "emote"
+                    await client.send(json.dumps({
+                        "type": "tool_result", "tool_call_id": frame["tool_call_id"],
+                        "result": {"status": "queued", "emotion": frame["params"]["emotion"]},
+                        "robot_id": "reachy",
+                    }))
+
+                robot_task = asyncio.create_task(robot_side())
+                result = await adapter.call_robot_tool("reachy", "emote", {"emotion": "happy"})
+                await robot_task
+                assert result == {"status": "queued", "emotion": "happy"}
+
+                # timeout path: nobody answers
+                t0 = asyncio.get_event_loop().time()
+                result2 = await adapter.call_robot_tool("reachy", "dance", {}, timeout_s=0.3)
+                assert "timed out" in result2.get("error", "")
+                assert asyncio.get_event_loop().time() - t0 < 2.0
+                assert not adapter._tool_futures  # no leaked futures
+        finally:
+            await adapter.disconnect()
+
+    asyncio.run(scenario())
