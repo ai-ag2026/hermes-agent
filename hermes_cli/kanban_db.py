@@ -275,6 +275,28 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
 
 
+def _resolve_worktree_auto_cleanup() -> bool:
+    """Whether to auto-reap a task's git worktree on completion (opt-in, default OFF).
+
+    Landscape-research #4 (per-task ephemeral worktree + auto-cleanup, à la Vibe
+    Kanban). Read from ``kanban.worktree_auto_cleanup`` in config, overridable via
+    the ``HERMES_KANBAN_WORKTREE_AUTO_CLEANUP`` env (``1``/``0``) for tests. Runs in
+    the worker process (via complete_task), so config is read directly rather than
+    relying on dispatcher env exports. Default OFF keeps behaviour identical to the
+    long-standing "worktrees are intentionally preserved" contract until a board
+    operator opts in. Safety-gating still applies even when enabled.
+    """
+    raw = os.environ.get("HERMES_KANBAN_WORKTREE_AUTO_CLEANUP", "").strip()
+    if raw:
+        return raw not in ("0", "false", "no", "off", "")
+    try:
+        from hermes_cli.config import load_config
+
+        return bool((load_config().get("kanban") or {}).get("worktree_auto_cleanup", False))
+    except Exception:
+        return False
+
+
 # Worker-context caps so build_worker_context() stays bounded on
 # pathological boards (retry-heavy tasks, comment storms, giant
 # summaries). Values chosen to fit a typical 100k-char LLM prompt with
@@ -4249,13 +4271,113 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return False
 
 
+def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> bool:
+    """Whether a worktree has commits not reachable from any remote branch.
+
+    Replicated from ``cli.py`` (kept self-contained to avoid a cli<->kanban_db
+    circular import). Fails SAFE: on any error returns True so we never remove a
+    worktree whose push-state we cannot determine. A repo with no remote-tracking
+    refs has no baseline -> treat as no unpushed commits (nothing to protect).
+    """
+    try:
+        remote_refs = subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname)", "refs/remotes"],
+            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+        )
+        if remote_refs.returncode != 0:
+            return True
+        if not remote_refs.stdout.strip():
+            return False
+        result = subprocess.run(
+            ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
+            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+        )
+        if result.returncode != 0:
+            return True
+        return bool(result.stdout.strip())
+    except Exception:
+        return True
+
+
+def _worktree_is_dirty(worktree_path: str, timeout: int = 10) -> bool:
+    """Whether a worktree has uncommitted changes (staged/unstaged/untracked).
+
+    Replicated from ``cli.py``. Fails SAFE: on any error returns True.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+        )
+        if result.returncode != 0:
+            return True
+        return bool(result.stdout.strip())
+    except Exception:
+        return True
+
+
+def _maybe_cleanup_worktree(conn: sqlite3.Connection, task_id: str, path: str) -> None:
+    """Best-effort teardown of a completed task's git worktree (landscape-research #4).
+
+    Opt-in via :func:`_resolve_worktree_auto_cleanup` (default OFF). Conservative
+    safety gates: reap ONLY a linked worktree that is clean AND fully pushed —
+    unpushed commits OR uncommitted changes keep it (the cron repo-hygiene reaper
+    remains the backstop for stale leftovers). Deferred while child tasks may still
+    read the tree. Removes the worktree and its conventional ``wt/<task-id>`` branch.
+    """
+    try:
+        if not _resolve_worktree_auto_cleanup():
+            return
+        # Defer while any child task may still need the shared tree.
+        active = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks t ON t.id = l.child_id "
+            "WHERE l.parent_id = ? AND t.status NOT IN "
+            "('done', 'archived', 'failed', 'cancelled') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if active:
+            return
+        wt = Path(path)
+        if not wt.is_dir():
+            return
+        # The anchor repo (where `git worktree remove` must run) is the parent of
+        # the shared git common-dir, NOT the worktree's own toplevel (which is the
+        # worktree itself for a linked worktree). Deriving it via the common-dir
+        # avoids self-referential removal and finds the real main checkout.
+        common = _git_common_dir(wt)
+        if common is None:
+            return  # not a git worktree we can reason about — leave it
+        repo_root = common.parent  # <main>/.git -> <main>
+        if repo_root.resolve() == wt.resolve():
+            return  # path is the main checkout, not a linked worktree — leave it
+        if _worktree_has_unpushed_commits(str(wt)) or _worktree_is_dirty(str(wt)):
+            _log.info(
+                "Keeping worktree for task %s (unpushed commits or uncommitted "
+                "changes): %s", task_id, wt,
+            )
+            return
+        for cmd in (
+            ["git", "-C", str(repo_root), "worktree", "unlock", str(wt)],
+            ["git", "-C", str(repo_root), "worktree", "remove", str(wt), "--force"],
+            ["git", "-C", str(repo_root), "branch", "-D", f"wt/{task_id}"],
+        ):
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+            except Exception:
+                pass
+        _log.debug("Auto-cleaned worktree for task %s: %s", task_id, wt)
+    except Exception:
+        pass  # best-effort — never block completion
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
-    Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
-    are intentionally preserved.
+    Only ``scratch`` workspaces are removed unconditionally; ``worktree`` cleanup
+    is opt-in + safety-gated (see :func:`_maybe_cleanup_worktree`); ``dir``
+    workspaces are always preserved.
     """
     try:
         row = conn.execute(
@@ -4266,6 +4388,11 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        if kind == "worktree" and path:
+            # Opt-in, safety-gated worktree teardown (landscape-research #4).
+            _maybe_cleanup_worktree(conn, task_id, path)
+            _try_cleanup_parent_workspaces(conn, task_id)
+            return
         if kind != "scratch" or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
