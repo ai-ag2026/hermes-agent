@@ -4000,10 +4000,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Deferred title: stored in memory until the session is created in the DB
         self._pending_title: Optional[str] = None
         
-        # Session ID: reuse existing one when resuming, otherwise generate fresh
+        # Session ID: reuse existing one when resuming, otherwise generate fresh.
+        # For a kanban worker the dispatcher pins a stable, resumable session id
+        # (HERMES_KANBAN_WORKER_SESSION) so a re-claim after a crash can continue
+        # the same conversation (event-sourcing resume, #2). HERMES_KANBAN_RESUME=1
+        # means this claim IS a re-claim -> flag _resumed so _init_agent restores
+        # the flushed history in quiet mode. Interactive `--resume` still wins; the
+        # env vars are only ever set by the kanban spawn path, never interactively.
+        _kb_worker_session = os.environ.get("HERMES_KANBAN_WORKER_SESSION", "").strip()
         if resume:
             self.session_id = resume
             self._resumed = True
+        elif _kb_worker_session:
+            self.session_id = _kb_worker_session
+            if os.environ.get("HERMES_KANBAN_RESUME") == "1":
+                self._resumed = True
         else:
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
