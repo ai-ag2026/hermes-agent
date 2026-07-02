@@ -4455,7 +4455,7 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
     Replicated from ``cli.py`` (kept self-contained to avoid a cli<->kanban_db
     circular import). Fails SAFE: on any error returns True so we never remove a
     worktree whose push-state we cannot determine. A repo with no remote-tracking
-    refs has no baseline -> treat as no unpushed commits (nothing to protect).
+    refs has no push baseline -> treat as unpushed/unknown and keep the worktree.
     """
     try:
         remote_refs = subprocess.run(
