@@ -332,7 +332,14 @@ class ReachyAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=message_id)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        await self._push(chat_id, {"type": "typing", "robot_id": chat_id})
+        # Tagged like every outbound frame: untagged typing fell back to the client's temporal
+        # rule and reset the ACTIVE turn's per-frame timeout even when it belonged to another
+        # (e.g. proactive) turn (review 2026-07-02 round 2, P2). Tagged, it routes/drops cleanly
+        # and doubles as the liveness signal for the client's stall watchdog.
+        await self._push(
+            chat_id,
+            self._tag_turn({"type": "typing", "robot_id": chat_id}, self._current_turn_id(chat_id)),
+        )
 
     async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
         """Emit an explicit turn boundary so the client knows a turn is fully
