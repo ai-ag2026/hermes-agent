@@ -138,6 +138,28 @@ def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str,
     env = dict(base_env if base_env is not None else os.environ)
     if _cua_telemetry_disabled():
         env[_CUA_TELEMETRY_ENV_VAR] = "0"
+    # local(tars): headless Linux wiring — gateway/worker processes have no
+    # DISPLAY, so allow config to pin the X target for cua-driver children
+    # only (never the whole agent process; a global DISPLAY would flip other
+    # tools, e.g. browser engines, into headed mode). XAUTHORITY is optional:
+    # cua-driver auto-discovers the Xwayland cookie from /proc when unset
+    # (verified 2026-07-04 on GNOME/Xwayland).
+    try:
+        from hermes_cli.config import load_config
+
+        cu = (load_config() or {}).get("computer_use") or {}
+        display = str(cu.get("display") or "").strip()
+        if display and not env.get("DISPLAY"):
+            env["DISPLAY"] = display
+        xauth = str(cu.get("xauthority") or "").strip()
+        if xauth and not env.get("XAUTHORITY"):
+            import glob as _glob
+
+            matches = sorted(_glob.glob(os.path.expanduser(xauth)))
+            if matches:
+                env["XAUTHORITY"] = matches[-1]
+    except Exception:
+        pass  # config unreadable — behave exactly as before
     return env
 
 
