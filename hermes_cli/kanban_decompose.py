@@ -45,6 +45,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
+from hermes_cli.schema_contract import validate_decompose_graph
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +311,14 @@ def decompose_task(
 
     max_fanout = _cap("max_fanout", 12)
     max_tasks_per_root = _cap("max_tasks_per_root", 60)
+    # CC-PARITY-A2: bounded retry when the aux LLM returns a schema-invalid
+    # graph. Default 1 == a single attempt == byte-for-byte the previous
+    # behaviour (opt-in feature; clamped to a sane ceiling to avoid runaway).
+    try:
+        decompose_max_attempts = int(kanban_cfg.get("decompose_max_attempts", 1))
+    except (TypeError, ValueError):
+        decompose_max_attempts = 1
+    decompose_max_attempts = max(1, min(decompose_max_attempts, 4))
     roster, valid_names = _build_roster()
 
     try:
@@ -338,32 +347,73 @@ def decompose_task(
         default_assignee=default_assignee,
     )
 
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+    extra_body = get_auxiliary_extra_body() or None
+
+    parsed: Optional[dict] = None
+    last_reason = "LLM returned malformed JSON"
+    for attempt in range(decompose_max_attempts):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=4000,
+                timeout=timeout or 180,
+                extra_body=extra_body,
+            )
+        except Exception as exc:
+            logger.info("decompose: API call failed for %s (%s)", task_id, exc)
+            # An API error is not a schema problem — don't burn retries on it.
+            return DecomposeOutcome(task_id, False, f"LLM error: {type(exc).__name__}")
+
+        try:
+            raw = resp.choices[0].message.content or ""
+        except Exception:
+            raw = ""
+
+        candidate = _extract_json_blob(raw)
+
+        if decompose_max_attempts == 1:
+            # Neutral path: no shape pre-validation; defer to the existing
+            # downstream normalization exactly as before.
+            parsed = candidate
+            if parsed is None:
+                return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
+            break
+
+        # Retry-enabled path (opt-in): validate the graph shape and, on
+        # failure, feed the errors back to the aux LLM for a corrected attempt.
+        if candidate is None:
+            last_reason = "LLM returned malformed JSON"
+        else:
+            errors = validate_decompose_graph(candidate)
+            if not errors:
+                parsed = candidate
+                break
+            last_reason = "; ".join(errors[:5])
+
+        if attempt + 1 < decompose_max_attempts:
+            logger.info(
+                "decompose: task %s attempt %d/%d invalid (%s) — retrying",
+                task_id, attempt + 1, decompose_max_attempts, last_reason,
+            )
+            messages = [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
-            ],
-            temperature=0.3,
-            max_tokens=4000,
-            timeout=timeout or 180,
-            extra_body=get_auxiliary_extra_body() or None,
-        )
-    except Exception as exc:
-        logger.info(
-            "decompose: API call failed for %s (%s)", task_id, exc,
-        )
-        return DecomposeOutcome(task_id, False, f"LLM error: {type(exc).__name__}")
+                {"role": "assistant", "content": raw or "(empty response)"},
+                {"role": "user", "content": (
+                    "Your previous response was invalid: " + last_reason
+                    + ". Return ONLY the corrected JSON object matching the "
+                    "exact required shape — no prose, no code fences."
+                )},
+            ]
 
-    try:
-        raw = resp.choices[0].message.content or ""
-    except Exception:
-        raw = ""
-
-    parsed = _extract_json_blob(raw)
     if parsed is None:
-        return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
+        return DecomposeOutcome(task_id, False, last_reason)
 
     fanout = bool(parsed.get("fanout"))
     audit_author = author or _profile_author()
