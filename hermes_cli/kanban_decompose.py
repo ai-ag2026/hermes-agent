@@ -311,6 +311,28 @@ def decompose_task(
 
     max_fanout = _cap("max_fanout", 12)
     max_tasks_per_root = _cap("max_tasks_per_root", 60)
+
+    # CC-PARITY-A4: optional budget-aware fan-out. When
+    # kanban.orchestration_budget is configured, scale max_fanout down as actual
+    # spend (from model telemetry) approaches the target. Default (unset) leaves
+    # max_fanout untouched. floor=1 keeps decompose able to make minimal progress
+    # rather than hard-blocking a triage task.
+    try:
+        from hermes_cli import orchestration_budget as _budget
+        _b = _budget.resolve_budget(cfg)
+        if _b is not None and max_fanout:
+            import time as _time
+            _since = (_time.time() - _b.window_seconds) if _b.window_seconds else None
+            _spent = _budget.spent(metric=_b.metric, since=_since)
+            _scaled = _b.scale(max_fanout, _spent, floor=1)
+            if _scaled < max_fanout:
+                logger.info(
+                    "decompose: budget(%s) scaled max_fanout %s -> %s (spent %.0f / %.0f)",
+                    _b.metric, max_fanout, _scaled, _spent, _b.total,
+                )
+            max_fanout = _scaled
+    except Exception:
+        logger.debug("decompose: budget scaling skipped", exc_info=True)
     # CC-PARITY-A2: bounded retry when the aux LLM returns a schema-invalid
     # graph. Default 1 == a single attempt == byte-for-byte the previous
     # behaviour (opt-in feature; clamped to a sane ceiling to avoid runaway).
