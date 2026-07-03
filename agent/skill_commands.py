@@ -356,7 +356,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     _skill_commands = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files, skill_invocation_mode
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
 
@@ -385,6 +385,10 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                         continue
                     # Respect user's disabled skills config
                     if name in disabled:
+                        continue
+                    # invocation: "disabled" also drops from the /command list;
+                    # "user-only" stays listed (explicit invocation is the point).
+                    if skill_invocation_mode(frontmatter) == "disabled":
                         continue
                     description = frontmatter.get('description', '')
                     if not description:

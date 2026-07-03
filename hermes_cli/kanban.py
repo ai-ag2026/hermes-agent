@@ -382,6 +382,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Parallel worker card (repeatable)",
     )
     p_swarm.add_argument("--verifier", required=True, help="Verifier profile")
+    p_swarm.add_argument(
+        "--verifier-lens",
+        action="append",
+        default=None,
+        metavar="LENS",
+        help="Adversarial verifier lens (repeatable, e.g. correctness/security/"
+        "reproducibility). >=2 lenses form a majority-refute panel; omit or pass "
+        "one for the classic single verifier (default).",
+    )
     p_swarm.add_argument("--synthesizer", required=True, help="Synthesizer/writer profile")
     p_swarm.add_argument("--tenant", default=None, help="Tenant namespace")
     p_swarm.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
@@ -1384,6 +1393,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             workers=workers,
             verifier_assignee=args.verifier,
             synthesizer_assignee=args.synthesizer,
+            verifier_lenses=getattr(args, "verifier_lens", None),
             tenant=args.tenant,
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
@@ -1394,7 +1404,11 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     else:
         print(f"Swarm root: {created.root_id}")
         print("Workers: " + ", ".join(created.worker_ids))
-        print(f"Verifier: {created.verifier_id}")
+        _vids = created.verifier_ids or [created.verifier_id]
+        if len(_vids) > 1:
+            print("Verifiers: " + ", ".join(_vids))
+        else:
+            print(f"Verifier: {created.verifier_id}")
         print(f"Synthesizer: {created.synthesizer_id}")
     return 0
 

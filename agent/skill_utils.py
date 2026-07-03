@@ -555,6 +555,39 @@ def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
     }
 
 
+# ── Invocation mode ───────────────────────────────────────────────────────
+
+VALID_INVOCATION_MODES = ("auto", "user-only", "disabled")
+
+
+def skill_invocation_mode(frontmatter: Dict[str, Any]) -> str:
+    """Return the skill's invocation mode from ``metadata.hermes.invocation``.
+
+    Modes:
+      * ``auto`` (default)  — model may auto-invoke; also user-invocable.
+      * ``user-only``       — hidden from the auto-offer surface (system-prompt
+                              skill index / skills_hub routing); still callable
+                              explicitly via ``/command`` or ``skill_view``.
+      * ``disabled``        — hidden from the auto-offer surface AND from the
+                              ``/command`` list; only ``skill_view`` by path.
+
+    Unknown / malformed values fall back to ``auto`` so a typo never silently
+    hides a skill.
+    """
+    metadata = frontmatter.get("metadata")
+    if not isinstance(metadata, dict):
+        return "auto"
+    hermes = metadata.get("hermes")
+    if not isinstance(hermes, dict):
+        return "auto"
+    mode = hermes.get("invocation")
+    if isinstance(mode, str):
+        mode = mode.strip().lower()
+        if mode in VALID_INVOCATION_MODES:
+            return mode
+    return "auto"
+
+
 # ── Skill config extraction ───────────────────────────────────────────────
 
 
