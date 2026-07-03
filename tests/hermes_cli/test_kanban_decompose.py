@@ -345,3 +345,70 @@ def test_decompose_no_aux_client_configured(kanban_home):
 
     assert outcome.ok is False
     assert "no auxiliary client" in outcome.reason
+
+
+# ── CC-PARITY-A2: bounded retry on schema-invalid aux output ───────────────
+
+def _mock_client_sequence(contents: list[str]):
+    client = MagicMock()
+    client.chat.completions.create = MagicMock(
+        side_effect=[_fake_aux_response(c) for c in contents]
+    )
+    return client
+
+
+def _patch_aux_client_obj(client, *, model: str = "test-model"):
+    return patch(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        return_value=(client, model),
+    )
+
+
+def test_decompose_retries_on_invalid_then_succeeds(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough idea", body="do it", triage=True)
+
+    monkeypatch.setattr(
+        decomp, "_load_config", lambda: {"kanban": {"decompose_max_attempts": 2}}
+    )
+    client = _mock_client_sequence([
+        "here is my plan, not json at all {oops",
+        jsonlib.dumps({"fanout": False, "title": "Tightened title", "body": "spec"}),
+    ])
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client_obj(client), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert client.chat.completions.create.call_count == 2  # retried once
+
+
+def test_decompose_default_attempts_one_does_not_retry(kanban_home, monkeypatch):
+    """Neutrality: default (1 attempt) == single call == original reason string."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough idea", body="do it", triage=True)
+
+    monkeypatch.setattr(decomp, "_load_config", lambda: {})
+    client = _mock_client_sequence([
+        "still not json {",
+        jsonlib.dumps({"fanout": False, "title": "unused"}),
+    ])
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client_obj(client), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert outcome.reason == "LLM returned malformed JSON"
+    assert client.chat.completions.create.call_count == 1  # no retry

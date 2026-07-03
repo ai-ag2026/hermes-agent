@@ -11,8 +11,33 @@ from agent.skill_utils import (
     is_skill_support_path,
     iter_skill_index_files,
     resolve_skill_config_values,
+    skill_invocation_mode,
     skill_matches_platform,
 )
+
+
+class TestSkillInvocationMode:
+    """CC-PARITY-C1: metadata.hermes.invocation gate."""
+
+    def test_default_is_auto_when_absent(self):
+        assert skill_invocation_mode({}) == "auto"
+        assert skill_invocation_mode({"metadata": {"hermes": {}}}) == "auto"
+
+    def test_valid_modes_parsed(self):
+        assert skill_invocation_mode(
+            {"metadata": {"hermes": {"invocation": "user-only"}}}
+        ) == "user-only"
+        assert skill_invocation_mode(
+            {"metadata": {"hermes": {"invocation": "DISABLED"}}}
+        ) == "disabled"
+
+    def test_unknown_or_malformed_falls_back_to_auto(self):
+        # A typo must never silently hide a skill.
+        assert skill_invocation_mode(
+            {"metadata": {"hermes": {"invocation": "bogus"}}}
+        ) == "auto"
+        assert skill_invocation_mode({"metadata": "not-a-dict"}) == "auto"
+        assert skill_invocation_mode({"metadata": {"hermes": "not-a-dict"}}) == "auto"
 
 
 def test_metadata_as_dict_with_hermes():
