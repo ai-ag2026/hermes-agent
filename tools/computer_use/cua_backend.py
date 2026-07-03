@@ -1031,8 +1031,11 @@ class CuaDriverBackend(ComputerUseBackend):
         windows = [
             {
                 "app_name": w.get("app_name", ""),
-                "pid": int(w["pid"]),
-                "window_id": int(w["window_id"]),
+                # Linux/Xwayland windows can report pid/window_id as null
+                # (no _NET_WM_PID); coerce defensively instead of crashing
+                # the whole capture.
+                "pid": int(w["pid"]) if w.get("pid") is not None else 0,
+                "window_id": int(w["window_id"]) if w.get("window_id") is not None else 0,
                 "off_screen": not w.get("is_on_screen", True),
                 "title": w.get("title", ""),
                 "z_index": w.get("z_index", 0),
