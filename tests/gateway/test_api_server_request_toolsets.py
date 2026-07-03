@@ -132,6 +132,7 @@ class FakeRequest:
 def _minimal_adapter(monkeypatch):
     monkeypatch.setattr(api_server, "web", FakeWeb)
     adapter = object.__new__(api_server.APIServerAdapter)
+    adapter._model_routes = {}
     adapter._api_key = ""
     adapter._model_name = "test-model"
     adapter._background_tasks = set()
@@ -283,6 +284,7 @@ def test_create_agent_uses_request_local_toolset_override(monkeypatch):
     _install_fake_gateway_run(monkeypatch)
 
     adapter = object.__new__(api_server.APIServerAdapter)
+    adapter._model_routes = {}
     adapter._ensure_session_db = lambda: None
     adapter._get_platform_enabled_toolsets = lambda: ["web", "terminal"]
 
@@ -302,6 +304,7 @@ def test_create_agent_defaults_to_platform_toolsets_when_no_override(monkeypatch
     _install_fake_gateway_run(monkeypatch)
 
     adapter = object.__new__(api_server.APIServerAdapter)
+    adapter._model_routes = {}
     adapter._ensure_session_db = lambda: None
     adapter._get_platform_enabled_toolsets = lambda: ["web", "terminal"]
 
