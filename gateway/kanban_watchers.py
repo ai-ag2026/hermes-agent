@@ -26,6 +26,43 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _budget_scaled_max_spawn(kanban_cfg: Any, max_spawn: "Optional[int]") -> "Optional[int]":
+    """CC-PARITY-A4: scale the dispatcher's live concurrency cap by actual spend.
+
+    When ``kanban.orchestration_budget`` is configured, read current spend from
+    the model-telemetry DB and scale ``max_spawn`` toward the target — hard-stop
+    (0 = spawn nothing this tick) once exhausted. Throttles the WHOLE fleet,
+    including swarm workers (they dispatch through this same loop). Unset budget
+    (or any error) returns ``max_spawn`` unchanged — fail-open, never blocks the
+    dispatcher on a telemetry hiccup. Pure enough to unit-test."""
+    try:
+        from hermes_cli import orchestration_budget as budget
+        b = budget.resolve_budget({"kanban": kanban_cfg})
+        if b is None:
+            return max_spawn
+        since = (time.time() - b.window_seconds) if b.window_seconds else None
+        spent = budget.spent(metric=b.metric, since=since)
+        # Scale the configured cap; when unbounded (None/<=0), scale a sane base
+        # so a budget can bound an otherwise-unlimited dispatcher.
+        if isinstance(max_spawn, int) and max_spawn > 0:
+            base = max_spawn
+        else:
+            try:
+                base = int(kanban_cfg.get("budget_base_spawn", 8))
+            except (TypeError, ValueError):
+                base = 8
+        scaled = b.scale(base, spent, floor=0)  # hard-stop at 0 when exhausted
+        if scaled != base:
+            logger.info(
+                "kanban dispatcher: budget(%s) scaled max_spawn %s -> %s (spent %.0f / %.0f)",
+                b.metric, base, scaled, spent, b.total,
+            )
+        return scaled
+    except Exception:
+        logger.debug("kanban dispatcher: budget scaling skipped", exc_info=True)
+        return max_spawn
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -1398,10 +1435,13 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                # CC-PARITY-A4: recompute the budget-scaled cap each tick (spend
+                # changes live). No budget configured => returns max_spawn as-is.
+                effective_max_spawn = _budget_scaled_max_spawn(kanban_cfg, max_spawn)
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
-                    max_spawn=max_spawn,
+                    max_spawn=effective_max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,
