@@ -896,6 +896,13 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    effort = args.get("effort")
+    if effort is not None:
+        effort = str(effort).strip().lower() or None
+    if effort is not None and effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+        return tool_error(
+            "effort must be one of none, minimal, low, medium, high, xhigh"
+        )
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -943,6 +950,8 @@ def _handle_create(args: dict, **kw) -> str:
                     if max_runtime_seconds is not None else None
                 ),
                 skills=skills,
+                max_retries=None,
+                effort=effort,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -1528,6 +1537,16 @@ KANBAN_CREATE_SCHEMA = {
                     "require immediate human ops (R3 gate) to skip the "
                     "brief running-to-blocked transition. Defaults to "
                     "'running', which preserves the usual dispatch path."
+                ),
+            },
+            "effort": {
+                "type": "string",
+                "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
+                "description": (
+                    "Optional per-task reasoning-effort override for the "
+                    "dispatched worker. When set, the dispatcher exports "
+                    "HERMES_REASONING_EFFORT so that worker uses this effort "
+                    "instead of the profile/global default."
                 ),
             },
             "skills": {

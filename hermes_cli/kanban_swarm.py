@@ -325,8 +325,18 @@ def post_blackboard_update(
     _require_text(root_id, "root_id")
     author = _require_text(author, "author")
     key = _require_text(key, "key")
-    if require_value_keys:
-        spec = {k: {"non_empty": True} for k in require_value_keys}
+    required_keys = list(require_value_keys or [])
+    verdict_spec = None
+    if key.startswith("verdict:"):
+        verdict_spec = {
+            "refuted": {"type": list},
+            "upheld": {"type": list},
+            "notes": {"type": str, "non_empty": True},
+        }
+    if required_keys or verdict_spec:
+        spec = {k: {"non_empty": True} for k in required_keys}
+        if verdict_spec:
+            spec.update(verdict_spec)
         errors = validate_fields(value, spec)
         if errors:
             raise ValueError(

@@ -1009,6 +1009,46 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_persists_reasoning_effort(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({
+        "title": "high effort child",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "effort": "high",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child is not None
+        assert child.effort == "high"
+    finally:
+        conn.close()
+
+
+def test_create_rejects_unknown_reasoning_effort(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({
+        "title": "bad effort",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "effort": "turbo",
+    })
+    assert json.loads(out).get("error")
+
+
+def test_create_schema_exposes_reasoning_effort():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+
+    effort = KANBAN_CREATE_SCHEMA["parameters"]["properties"]["effort"]
+    assert "high" in effort["enum"]
+
+
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     """A worker scoped to a dir: task that spawns a child without a
     workspace arg inherits the dir, not scratch (so follow-up code-gen
