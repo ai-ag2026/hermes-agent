@@ -6496,7 +6496,39 @@ def load_config() -> Dict[str, Any]:
     defensive deepcopy — that path matters in agent-loop hot spots like
     ``get_provider_request_timeout`` which is called once per API turn.
     """
-    return _load_config_impl(want_deepcopy=True)
+    return _apply_reasoning_effort_override(
+        _load_config_impl(want_deepcopy=True), already_owned=True
+    )
+
+
+# CC-PARITY-A3: a kanban worker can carry a per-task reasoning-effort override,
+# exported by the dispatcher as HERMES_REASONING_EFFORT. Honour it at config-load
+# so every `cfg_get(config, "agent", "reasoning_effort")` consumer sees it, with
+# no change to the (many) call sites. Opt-in: absent env => untouched.
+_VALID_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh"}
+)
+
+
+def _apply_reasoning_effort_override(config: Dict[str, Any], *, already_owned: bool) -> Dict[str, Any]:
+    """Fold HERMES_REASONING_EFFORT into agent.reasoning_effort when set+valid.
+
+    ``already_owned`` is True when the caller passed a private deepcopy
+    (load_config); we may mutate it in place. When False (load_config_readonly
+    returns the shared cache object) we deepcopy first so the cache is never
+    poisoned — that extra copy is paid ONLY when the override env is active.
+    """
+    eff = os.environ.get("HERMES_REASONING_EFFORT", "").strip().lower()
+    if not eff or eff not in _VALID_REASONING_EFFORTS:
+        return config
+    if not already_owned:
+        config = copy.deepcopy(config)
+    agent = config.get("agent")
+    if not isinstance(agent, dict):
+        agent = {}
+        config["agent"] = agent
+    agent["reasoning_effort"] = eff
+    return config
 
 
 def load_config_readonly() -> Dict[str, Any]:
@@ -6519,7 +6551,9 @@ def load_config_readonly() -> Dict[str, Any]:
     existing ``isinstance(x, dict)`` guards downstream keep working. The
     safety guarantee is purely documented, not enforced — be careful.
     """
-    return _load_config_impl(want_deepcopy=False)
+    return _apply_reasoning_effort_override(
+        _load_config_impl(want_deepcopy=False), already_owned=False
+    )
 
 
 def write_platform_config_field(

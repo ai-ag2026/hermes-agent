@@ -948,6 +948,11 @@ class Task:
     # the defaults; empty list = explicitly no extra skills.
     skills: Optional[list] = None
     model_override: Optional[str] = None
+    # Per-task reasoning-effort override (CC-PARITY-A3). When set, the dispatcher
+    # exports HERMES_REASONING_EFFORT to the worker so this task runs at that
+    # effort (e.g. a cheap triage phase on "low", a hard verify phase on "high").
+    # NULL = use the profile default.
+    effort: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1052,6 +1057,7 @@ class Task:
             ),
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
+            effort=row["effort"] if "effort" in keys and row["effort"] else None,
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
@@ -1215,6 +1221,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
     model_override       TEXT,
+    -- Per-task reasoning-effort override (CC-PARITY-A3). When set, the
+    -- dispatcher exports HERMES_REASONING_EFFORT to the worker. NULL = use
+    -- the profile default.
+    effort               TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2020,6 +2030,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
+
+    if "effort" not in cols:
+        # CC-PARITY-A3: per-task reasoning-effort override.
+        conn.execute("ALTER TABLE tasks ADD COLUMN effort TEXT")
 
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
@@ -8148,6 +8162,10 @@ def _default_spawn(
         pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
+    if task.effort:
+        # CC-PARITY-A3: per-task reasoning-effort override, honoured by the
+        # worker's config loader (HERMES_REASONING_EFFORT).
+        env["HERMES_REASONING_EFFORT"] = str(task.effort)
     if task.session_id:
         env["HERMES_SESSION_ID"] = task.session_id
     env["HERMES_KANBAN_TASK"] = task.id
