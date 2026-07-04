@@ -222,6 +222,23 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+def test_create_task_persists_reasoning_effort(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="think harder", assignee="alice", effort=" HIGH ")
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert task is not None
+    assert events
+    assert task.effort == "high"
+    assert events[0].payload["effort"] == "high"
+
+
+def test_create_task_rejects_unknown_reasoning_effort(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="effort"):
+        kb.create_task(conn, title="bad effort", effort="maximum-overdrive")
+
+
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")

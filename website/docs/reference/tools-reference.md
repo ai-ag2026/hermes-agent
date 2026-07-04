@@ -128,7 +128,7 @@ Registered when the agent is either (a) spawned by the kanban dispatcher (`HERME
 | `kanban_block` | Block the current task on a question for the user — the dispatcher pauses, surfaces the question, and resumes once a human replies. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_heartbeat` | Send a progress heartbeat during a long-running operation so the dispatcher knows the worker is still alive. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_comment` | Add a comment to the task thread without changing its state — useful for surfacing intermediate findings. | `HERMES_KANBAN_TASK` or `kanban` toolset |
-| `kanban_create` | Fan out child tasks from the current task. Used by orchestrators and follow-up-spawning workers. | `HERMES_KANBAN_TASK` or `kanban` toolset |
+| `kanban_create` | Fan out child tasks from the current task. Used by orchestrators and follow-up-spawning workers. Accepts optional per-task controls such as `parents`, `skills`, `goal_mode`, and `effort` (reasoning-effort override). | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_link` | Link tasks with a parent → child dependency edge. | `HERMES_KANBAN_TASK` or `kanban` toolset |
 | `kanban_unblock` | Return a blocked task to `ready`. Orchestrator-only; hidden from dispatcher-spawned task workers. | profile with `kanban` toolset |
 

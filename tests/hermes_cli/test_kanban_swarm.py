@@ -231,3 +231,36 @@ def test_blackboard_contract_rejects_missing_key(tmp_path):
         assert latest_blackboard(conn, created.root_id)["result"]["findings"] == ["x"]
     finally:
         conn.close()
+
+
+def test_verdict_blackboard_contract_is_enforced_automatically(tmp_path):
+    """Verifier lens verdicts must carry the fields the synthesizer depends on."""
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        created = create_swarm(
+            conn,
+            goal="panel contract",
+            workers=[SwarmWorkerSpec(profile="w", title="t", body="b")],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+            verifier_lenses=["security", "correctness"],
+        )
+        with pytest.raises(ValueError, match="upheld"):
+            post_blackboard_update(
+                conn,
+                created.root_id,
+                author="reviewer",
+                key="verdict:security",
+                value={"refuted": [], "notes": "missing upheld list"},
+            )
+
+        post_blackboard_update(
+            conn,
+            created.root_id,
+            author="reviewer",
+            key="verdict:security",
+            value={"refuted": [], "upheld": [], "notes": "no claims survived"},
+        )
+        assert latest_blackboard(conn, created.root_id)["verdict:security"]["upheld"] == []
+    finally:
+        conn.close()
