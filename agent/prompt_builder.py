@@ -23,6 +23,7 @@ from agent.skill_utils import (
     get_disabled_skill_names,
     iter_skill_index_files,
     parse_frontmatter,
+    skill_invocation_mode,
     skill_matches_environment,
     skill_matches_platform,
 )
@@ -1255,7 +1256,7 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 1
+_SKILLS_SNAPSHOT_VERSION = 2  # v2: snapshot entries carry `invocation` (CC-PARITY-C1)
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1350,6 +1351,7 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "invocation": skill_invocation_mode(frontmatter),
     }
 
 
@@ -1489,6 +1491,11 @@ def build_skills_system_prompt(
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
+            # invocation: hide non-auto skills from the auto-offer surface
+            # (they stay callable explicitly). Default "auto" keeps old snapshots
+            # (which lack the field) behaving exactly as before.
+            if entry.get("invocation", "auto") != "auto":
+                continue
             if not _skill_should_show(
                 entry.get("conditions") or {},
                 available_tools,
@@ -1513,6 +1520,9 @@ def build_skills_system_prompt(
                 continue
             skill_name = entry["skill_name"]
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
+                continue
+            # invocation: hide non-auto skills from the auto-offer surface.
+            if entry.get("invocation", "auto") != "auto":
                 continue
             if not _skill_should_show(
                 extract_skill_conditions(frontmatter),
@@ -1568,6 +1578,8 @@ def build_skills_system_prompt(
                 if frontmatter_name in seen_skill_names:
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
+                    continue
+                if entry.get("invocation", "auto") != "auto":
                     continue
                 if not _skill_should_show(
                     extract_skill_conditions(frontmatter),
