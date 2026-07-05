@@ -1,0 +1,36 @@
+name: reachy-platform
+label: Reachy
+kind: platform
+version: 0.1.0
+description: >
+  Reachy robot platform adapter for Hermes Agent. Runs a WebSocket server that
+  the robot's voice app connects to as a client. Inbound STT-text frames become
+  MessageEvents (the app owns mic/STT/VAD); outbound agent text — streamed via
+  edit_message — is pushed as "say" frames the app renders through its own TTS /
+  PCM pipeline. Because a platform adapter holds a persistent outbound channel,
+  supports_async_delivery is True, so delegate_task(background), cron delivery and
+  send_message reach Reachy natively (unlike the stateless HTTP api_server path).
+  See reachy-tars-app/docs/plans/2026-07-01_reachy-as-hermes-platform.md.
+author: TARS/Manfred
+requires_env:
+  - name: REACHY_WS_PORT
+    description: "WebSocket server listen port (the robot voice app connects here)"
+    prompt: "Reachy WebSocket listen port (e.g. 8770)"
+    password: false
+optional_env:
+  - name: REACHY_WS_HOST
+    description: "Bind address for the WebSocket server (default 0.0.0.0)"
+    prompt: "Bind host (default 0.0.0.0)"
+    password: false
+  - name: REACHY_ALLOWED_ROBOTS
+    description: "Comma-separated robot ids allowed to connect (allowlist)"
+    prompt: "Allowed robot ids (comma-separated, or empty)"
+    password: false
+  - name: REACHY_ALLOW_ALL_ROBOTS
+    description: "Allow any robot id to talk to the bot (dev only — disables allowlist)"
+    prompt: "Allow all robots? (true/false)"
+    password: false
+  - name: REACHY_HOME_CHANNEL
+    description: "Default robot id for cron / notification (send_message, proactive) delivery"
+    prompt: "Home robot id (or empty)"
+    password: false
