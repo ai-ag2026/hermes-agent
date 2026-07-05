@@ -543,6 +543,26 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     if sys.platform == "win32" and getattr(config.option, "timeout_method", None) == "signal":
         config.option.timeout_method = "thread"
 
+    # GW-H2 (audit 2026-06-29): if pytest is (mis)run *inside* a process that
+    # already called ``hermes_logging.setup_logging()`` — e.g. an in-process
+    # ``pytest.main()`` in the RUNNING gateway — the root logger still carries
+    # RotatingFileHandlers bound to the LIVE ``~/.hermes/logs/*.log``. Per-test
+    # HERMES_HOME redirection cannot rebind an already-open handler, so every
+    # test WARNING+/ERROR (e.g. the 724 ``response_delivery_dropped`` records
+    # from test_tool_response_drop_recovery) floods the production errors.log.
+    # Detach any root file handler whose target lives OUTSIDE the OS temp dir so
+    # tests can never write to a live log sink. Normal isolated subprocess runs
+    # have no such handler → this is a no-op there.
+    import logging
+    import tempfile
+
+    _tmp_real = os.path.realpath(tempfile.gettempdir())
+    _root_logger = logging.getLogger()
+    for _handler in list(_root_logger.handlers):
+        _base = getattr(_handler, "baseFilename", None)
+        if _base and not os.path.realpath(_base).startswith(_tmp_real):
+            _root_logger.removeHandler(_handler)
+
 
 @pytest.fixture(autouse=True)
 def _live_system_guard(request, monkeypatch):

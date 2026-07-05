@@ -275,6 +275,74 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
 
 
+def _resolve_worktree_auto_cleanup() -> bool:
+    """Whether to auto-reap a task's git worktree on completion (opt-in, default OFF).
+
+    Landscape-research #4 (per-task ephemeral worktree + auto-cleanup, à la Vibe
+    Kanban). Read from ``kanban.worktree_auto_cleanup`` in config, overridable via
+    the ``HERMES_KANBAN_WORKTREE_AUTO_CLEANUP`` env (``1``/``0``) for tests. Runs in
+    the worker process (via complete_task), so config is read directly rather than
+    relying on dispatcher env exports. Default OFF keeps behaviour identical to the
+    long-standing "worktrees are intentionally preserved" contract until a board
+    operator opts in. Safety-gating still applies even when enabled.
+    """
+    raw = os.environ.get("HERMES_KANBAN_WORKTREE_AUTO_CLEANUP", "").strip()
+    if raw:
+        return raw not in ("0", "false", "no", "off", "")
+    try:
+        from hermes_cli.config import load_config
+
+        return bool((load_config().get("kanban") or {}).get("worktree_auto_cleanup", False))
+    except Exception:
+        return False
+
+
+def _resolve_resume_on_reclaim() -> bool:
+    """Whether a re-claimed (crashed/stale) task RESUMES its previous worker
+    session instead of starting fresh (event-sourcing resume, #2, opt-in default OFF).
+
+    Read from ``kanban.resume_on_reclaim`` in config, overridable via the
+    ``HERMES_KANBAN_RESUME_ON_RECLAIM`` env (``1``/``0``) for tests / dispatcher
+    export. Default OFF = the long-standing fresh-start-on-reclaim behaviour, so
+    no existing install changes behaviour until a board operator opts in.
+    """
+    raw = os.environ.get("HERMES_KANBAN_RESUME_ON_RECLAIM", "").strip()
+    if raw:
+        return raw not in ("0", "false", "no", "off", "")
+    try:
+        from hermes_cli.config import load_config
+
+        return bool((load_config().get("kanban") or {}).get("resume_on_reclaim", False))
+    except Exception:
+        return False
+
+
+def _resolve_resume_max_attempts() -> int:
+    """Number of resume attempts allowed per worker session before a re-claim
+    throws the (potentially poisoned) session away and starts fresh (#2). Default 1
+    = resume once after the first crash; a second crash of that session goes fresh.
+
+    Read from ``kanban.resume_max_attempts`` (env override
+    ``HERMES_KANBAN_RESUME_MAX_ATTEMPTS``). Kept strictly below the
+    ``consecutive_failures`` breaker so a task can never resume-loop forever: once
+    the breaker trips the task blocks (needs_input) and is no longer dispatched.
+    A value < 1 disables resume entirely (always fresh).
+    """
+    raw = os.environ.get("HERMES_KANBAN_RESUME_MAX_ATTEMPTS", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            return 1
+    try:
+        from hermes_cli.config import load_config
+
+        val = (load_config().get("kanban") or {}).get("resume_max_attempts", 1)
+        return int(val)
+    except Exception:
+        return 1
+
+
 # Worker-context caps so build_worker_context() stays bounded on
 # pathological boards (retry-heavy tasks, comment storms, giant
 # summaries). Values chosen to fit a typical 100k-char LLM prompt with
@@ -880,6 +948,11 @@ class Task:
     # the defaults; empty list = explicitly no extra skills.
     skills: Optional[list] = None
     model_override: Optional[str] = None
+    # Per-task reasoning-effort override (CC-PARITY-A3). When set, the dispatcher
+    # exports HERMES_REASONING_EFFORT to the worker so this task runs at that
+    # effort (e.g. a cheap triage phase on "low", a hard verify phase on "high").
+    # NULL = use the profile default.
+    effort: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -914,6 +987,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Event-sourcing resume (#2), in-memory only — NOT persisted columns and NOT
+    # read by from_row. Populated by claim_task/claim_review_task so the spawn
+    # path knows which resumable session id to pin for this run and whether this
+    # claim should resume the previous run's conversation (re-claim after crash).
+    worker_session_id: Optional[str] = None
+    resume_requested: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -978,6 +1057,7 @@ class Task:
             ),
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
+            effort=row["effort"] if "effort" in keys and row["effort"] else None,
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
@@ -1141,6 +1221,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
     model_override       TEXT,
+    -- Per-task reasoning-effort override (CC-PARITY-A3). When set, the
+    -- dispatcher exports HERMES_REASONING_EFFORT to the worker. NULL = use
+    -- the profile default.
+    effort               TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -1947,6 +2031,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
+    if "effort" not in cols:
+        # CC-PARITY-A3: per-task reasoning-effort override.
+        conn.execute("ALTER TABLE tasks ADD COLUMN effort TEXT")
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -2014,6 +2102,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+
+    # task_runs gained a session_id column (event-sourcing resume, #2). It pins
+    # the worker's resumable session id for the run so a re-claim after a crash
+    # can continue the same agent conversation instead of starting fresh. NULL on
+    # legacy runs and whenever kanban.resume_on_reclaim is off. Additive only —
+    # mirrors the tasks.session_id migration above; an older binary ignores it.
+    runs_table_present = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if runs_table_present:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if "session_id" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "session_id", "session_id TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_session ON task_runs(session_id)"
+        )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -2401,6 +2505,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
+    effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -2447,6 +2552,12 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if effort is not None:
+        effort = str(effort).strip().lower() or None
+    if effort is not None and effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+        raise ValueError(
+            "effort must be one of none, minimal, low, medium, high, xhigh"
+        )
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2635,8 +2746,8 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, effort, goal_mode, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2656,6 +2767,7 @@ def create_task(
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
+                        effort,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
@@ -2677,6 +2789,7 @@ def create_task(
                         "tenant": tenant,
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
+                        "effort": effort,
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
@@ -3369,6 +3482,74 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _resolve_worker_session(
+    conn: sqlite3.Connection, task_id: str, run_id: int, *, allow_resume: bool = True
+) -> tuple[Optional[str], bool]:
+    """Decide the resumable worker session id for a freshly-created run (#2).
+
+    Returns ``(session_id, is_resume)``:
+      * ``(None, False)`` when resume-on-reclaim is OFF -> caller writes no
+        session_id and the worker keeps its random session (unchanged behaviour).
+      * ``(<prev>, True)`` to RESUME: the MOST RECENT prior run of this task
+        pinned a session_id, ended abnormally (``crashed``/``timed_out``), and
+        that session's crash budget isn't spent -> reuse it so the re-claimed
+        worker continues the same conversation from the last flushed message.
+      * ``(<new>, False)`` otherwise: first claim, previous run ended any other
+        way (completed/blocked/reclaimed/...), goal_mode task, poisoned session,
+        or ``allow_resume=False`` -> a fresh, globally unique id.
+
+    Dev-chain-audit fixes (2026-07-02, DEVCHAIN-AUDIT F1/F5):
+      * OUTCOME GATE: resume ONLY when the newest prior run actually crashed or
+        timed out. Without it, review-lane claims resumed the WORKER's session
+        (reviewer independence destroyed), blocked->unblock re-claims resumed
+        silently, and TTL-stale reclaims (outcome='reclaimed') resumed a stuck
+        conversation forever WITHOUT ever burning the poison budget.
+      * ``allow_resume=False`` lets claim_review_task pin a fresh, traceable
+        session while structurally never resuming.
+      * goal_mode tasks never resume (interim, F5): a restored goal-loop history
+        plus a re-fired first turn duplicates the goal framing and resets the
+        turn budget per spawn — excluded until the goal loop is resume-aware.
+
+    Must be called INSIDE claim_task's write_txn so the decision is atomic against
+    parallel dispatchers (the ready->running CAS already serializes the claim).
+    """
+    if not _resolve_resume_on_reclaim():
+        return None, False
+    max_attempts = _resolve_resume_max_attempts()
+    if allow_resume and max_attempts >= 1:
+        goal_row = conn.execute(
+            "SELECT goal_mode FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if goal_row and goal_row["goal_mode"]:
+            return f"kbwrk_{task_id}_{run_id}_{secrets.token_hex(3)}", False
+        prev = conn.execute(
+            "SELECT session_id, outcome FROM task_runs "
+            "WHERE task_id = ? AND session_id IS NOT NULL AND id <> ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, run_id),
+        ).fetchone()
+        if (
+            prev
+            and prev["session_id"]
+            and prev["outcome"] in ("crashed", "timed_out")
+        ):
+            sess = prev["session_id"]
+            crashes = conn.execute(
+                "SELECT COUNT(*) AS c FROM task_runs "
+                "WHERE task_id = ? AND session_id = ? "
+                "AND outcome IN ('crashed', 'timed_out')",
+                (task_id, sess),
+            ).fetchone()["c"]
+            # ``crashes`` past failures of THIS session == the resume attempt we
+            # are about to make. Allow up to ``max_attempts`` resumes, then treat
+            # the session as poisoned. (max_attempts=1 -> resume once after the
+            # first crash; the second crash falls through to a fresh session.)
+            if crashes <= max_attempts:
+                return sess, True
+            # Poisoned session (crash budget spent) -> fall through to a fresh id.
+    return f"kbwrk_{task_id}_{run_id}_{secrets.token_hex(3)}", False
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3475,12 +3656,32 @@ def claim_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
+        # Event-sourcing resume (#2): pin this run's resumable worker session id.
+        # On a re-claim of a crashed task the same id is reused and a ``resumed``
+        # marker is written to the run metadata so detect_crashed_workers can tell
+        # a resumed clean-exit apart from a genuine protocol violation. The run row
+        # was just inserted with NULL metadata, so writing it here is race-free.
+        worker_session, resume_requested = _resolve_worker_session(conn, task_id, run_id)
+        if worker_session:
+            if resume_requested:
+                conn.execute(
+                    "UPDATE task_runs SET session_id = ?, metadata = ? WHERE id = ?",
+                    (worker_session, '{"resumed": true}', run_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE task_runs SET session_id = ? WHERE id = ?",
+                    (worker_session, run_id),
+                )
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
+        if claimed is not None:
+            claimed.worker_session_id = worker_session
+            claimed.resume_requested = resume_requested
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -3557,13 +3758,35 @@ def claim_review_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
+        # Event-sourcing resume (#2): review agents get a stable, traceable
+        # session id but NEVER resume (DEVCHAIN-AUDIT F1) — resuming here would
+        # hand the reviewer the WORKER's conversation, destroying reviewer
+        # independence (the worker would effectively review its own work).
+        worker_session, resume_requested = _resolve_worker_session(
+            conn, task_id, run_id, allow_resume=False
+        )
+        if worker_session:
+            if resume_requested:
+                conn.execute(
+                    "UPDATE task_runs SET session_id = ?, metadata = ? WHERE id = ?",
+                    (worker_session, '{"resumed": true}', run_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE task_runs SET session_id = ? WHERE id = ?",
+                    (worker_session, run_id),
+                )
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
              "source_status": "review"},
             run_id=run_id,
         )
-        return get_task(conn, task_id)
+        claimed = get_task(conn, task_id)
+        if claimed is not None:
+            claimed.worker_session_id = worker_session
+            claimed.resume_requested = resume_requested
+        return claimed
 
 
 def heartbeat_claim(
@@ -4249,13 +4472,138 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return False
 
 
+def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> bool:
+    """Whether a worktree has commits not reachable from any remote branch.
+
+    Replicated from ``cli.py`` (kept self-contained to avoid a cli<->kanban_db
+    circular import). Fails SAFE: on any error returns True so we never remove a
+    worktree whose push-state we cannot determine. A repo with no remote-tracking
+    refs has no push baseline -> treat as unpushed/unknown and keep the worktree.
+    """
+    try:
+        remote_refs = subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname)", "refs/remotes"],
+            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+        )
+        if remote_refs.returncode != 0:
+            return True
+        if not remote_refs.stdout.strip():
+            # No remote-tracking refs -> there is no push baseline at all.
+            # DEVCHAIN-AUDIT F4 (A2): unlike the interactive `hermes -w` variant
+            # in cli.py (where the user watches the cleanup), the kanban reaper
+            # runs unattended — "no remote" must mean "cannot prove pushed",
+            # NOT "nothing to protect". Otherwise committed work in a local-only
+            # repo would be deleted (worktree + branch -> commits dangling).
+            return True
+        result = subprocess.run(
+            ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
+            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+        )
+        if result.returncode != 0:
+            return True
+        return bool(result.stdout.strip())
+    except Exception:
+        return True
+
+
+def _worktree_is_dirty(worktree_path: str, timeout: int = 10) -> bool:
+    """Whether a worktree has uncommitted changes (staged/unstaged/untracked).
+
+    Replicated from ``cli.py``. Fails SAFE: on any error returns True.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+        )
+        if result.returncode != 0:
+            return True
+        return bool(result.stdout.strip())
+    except Exception:
+        return True
+
+
+def _maybe_cleanup_worktree(conn: sqlite3.Connection, task_id: str, path: str) -> None:
+    """Best-effort teardown of a completed task's git worktree (landscape-research #4).
+
+    Opt-in via :func:`_resolve_worktree_auto_cleanup` (default OFF). Conservative
+    safety gates: reap ONLY a linked worktree that is clean AND fully pushed —
+    unpushed commits OR uncommitted changes keep it (the cron repo-hygiene reaper
+    remains the backstop for stale leftovers). Deferred while child tasks may still
+    read the tree. Removes the worktree and its conventional ``wt/<task-id>`` branch.
+    """
+    try:
+        if not _resolve_worktree_auto_cleanup():
+            return
+        # Defer while any child task may still need the shared tree.
+        active = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks t ON t.id = l.child_id "
+            "WHERE l.parent_id = ? AND t.status NOT IN "
+            "('done', 'archived', 'failed', 'cancelled') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if active:
+            return
+        wt = Path(path)
+        if not wt.is_dir():
+            return
+        # The anchor repo (where `git worktree remove` must run) is the parent of
+        # the shared git common-dir, NOT the worktree's own toplevel (which is the
+        # worktree itself for a linked worktree). Deriving it via the common-dir
+        # avoids self-referential removal and finds the real main checkout.
+        common = _git_common_dir(wt)
+        if common is None:
+            return  # not a git worktree we can reason about — leave it
+        repo_root = common.parent  # <main>/.git -> <main>
+        if repo_root.resolve() == wt.resolve():
+            return  # path is the main checkout, not a linked worktree — leave it
+        if _worktree_has_unpushed_commits(str(wt)) or _worktree_is_dirty(str(wt)):
+            _log.info(
+                "Keeping worktree for task %s (unpushed commits or uncommitted "
+                "changes): %s", task_id, wt,
+            )
+            return
+        # Determine the REAL branch before removing the worktree (DEVCHAIN-AUDIT
+        # F4/B3): project-linked tasks use deterministic custom branch names, not
+        # the wt/<id> fallback — deleting the wrong name leaks the actual branch.
+        # Prefer the live checkout (ground truth), then the persisted task column,
+        # then the conventional fallback.
+        branch = None
+        try:
+            branch = _git_current_branch(wt)
+        except Exception:
+            branch = None
+        if not branch:
+            _brow = conn.execute(
+                "SELECT branch_name FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            branch = (_brow["branch_name"] if _brow else None) or f"wt/{task_id}"
+        cmds = [
+            ["git", "-C", str(repo_root), "worktree", "unlock", str(wt)],
+            ["git", "-C", str(repo_root), "worktree", "remove", str(wt), "--force"],
+        ]
+        # Never delete a primary-sounding branch, even if a task somehow ended up
+        # checked out on it — the worktree removal alone is then enough.
+        if branch and branch not in ("main", "master"):
+            cmds.append(["git", "-C", str(repo_root), "branch", "-D", branch])
+        for cmd in cmds:
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+            except Exception:
+                pass
+        _log.debug("Auto-cleaned worktree for task %s (branch %s): %s", task_id, branch, wt)
+    except Exception:
+        pass  # best-effort — never block completion
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
-    Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
-    are intentionally preserved.
+    Only ``scratch`` workspaces are removed unconditionally; ``worktree`` cleanup
+    is opt-in + safety-gated (see :func:`_maybe_cleanup_worktree`); ``dir``
+    workspaces are always preserved.
     """
     try:
         row = conn.execute(
@@ -4266,6 +4614,11 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        if kind == "worktree" and path:
+            # Opt-in, safety-gated worktree teardown (landscape-research #4).
+            _maybe_cleanup_worktree(conn, task_id, path)
+            _try_cleanup_parent_workspaces(conn, task_id)
+            return
         if kind != "scratch" or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
@@ -4989,6 +5342,8 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    max_fanout: Optional[int] = None,
+    max_tasks_per_root: Optional[int] = None,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -5018,6 +5373,13 @@ def decompose_triage_task(
     """
     if not children:
         return None
+    # Guardrail (2026-07-02, landscape-research #3): bound the fan-out WIDTH so a
+    # single decompose can never spawn an unbounded wave of sibling tasks. This is
+    # the primary Kanban-graph runaway guard; it always applies. ``None`` disables.
+    if max_fanout and len(children) > max_fanout:
+        raise ValueError(
+            f"decompose fanout {len(children)} exceeds kanban.max_fanout={max_fanout}"
+        )
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
 
@@ -5082,6 +5444,30 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
+        # Guardrail (2026-07-02, landscape-research #3): bound total graph SIZE.
+        # task_links are dependency edges and the root is linked as a *child* of
+        # every leaf (it waits for the whole graph), so a plain "descendants of
+        # root" walk is misleading. Instead measure the connected component the
+        # task belongs to (bidirectional walk) — robust regardless of edge
+        # direction. A fresh standalone triage task has no links -> component of
+        # 1, so this only bites tasks already embedded in a larger graph, as
+        # defense-in-depth against accumulation. ``None`` disables.
+        if max_tasks_per_root:
+            comp_size = conn.execute(
+                "WITH RECURSIVE comp(node) AS ("
+                "  SELECT ? "
+                "  UNION "
+                "  SELECT l.child_id FROM comp c JOIN task_links l ON l.parent_id = c.node "
+                "  UNION "
+                "  SELECT l.parent_id FROM comp c JOIN task_links l ON l.child_id = c.node"
+                ") SELECT COUNT(*) FROM comp",
+                (task_id,),
+            ).fetchone()[0]
+            if comp_size + len(children) > max_tasks_per_root:
+                raise ValueError(
+                    f"task graph size {comp_size + len(children)} exceeds "
+                    f"kanban.max_tasks_per_root={max_tasks_per_root}"
+                )
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
@@ -5221,6 +5607,28 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             conn, task_id,
             outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
+        )
+        # Defensive invariant repair: older/racy code paths could leak an
+        # active task_runs row that was no longer referenced by
+        # tasks.current_run_id. _end_run() intentionally closes only the
+        # current run, so archive must sweep *all* remaining open attempts for
+        # this task. Otherwise an archived board can still report a running
+        # attempt forever.
+        now = int(time.time())
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'reclaimed',
+                   outcome = 'reclaimed',
+                   summary = COALESCE(summary, 'task archived with orphaned active run'),
+                   ended_at = ?,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE task_id = ?
+               AND ended_at IS NULL
+            """,
+            (now, task_id),
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # ``archived`` parents no longer block children, same as ``done``.
@@ -6408,19 +6816,46 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Retrying won't
-                # help.
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation"
+                # ``kanban_complete`` / ``kanban_block``. Normally a protocol
+                # violation (retrying won't help) -> trip the breaker at once.
+                # BUT if this run was a RESUME (#2), a clean-exit can be the
+                # resumed context wrongly concluding "done" — a poisoned-context
+                # symptom, not a deterministic task defect. Downgrade to a normal
+                # +1 failure so the resume budget burns down and the NEXT claim
+                # starts fresh, instead of an immediate block.
+                _run_meta_row = conn.execute(
+                    "SELECT r.metadata FROM task_runs r "
+                    "JOIN tasks t ON t.current_run_id = r.id WHERE t.id = ?",
+                    (row["id"],),
+                ).fetchone()
+                _was_resume = bool(
+                    _run_meta_row and _run_meta_row["metadata"]
+                    and '"resumed": true' in _run_meta_row["metadata"]
                 )
-                event_kind = "protocol_violation"
+                protocol_violation = not _was_resume
+                if _was_resume:
+                    error_text = (
+                        "resumed worker exited cleanly (rc=0) without calling "
+                        "kanban_complete/kanban_block — counted as one failure "
+                        "(resume budget); next claim starts fresh"
+                    )
+                    event_kind = "protocol_violation_after_resume"
+                else:
+                    error_text = (
+                        "worker exited cleanly (rc=0) without calling "
+                        "kanban_complete or kanban_block — protocol violation"
+                    )
+                    event_kind = "protocol_violation"
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+                if _was_resume:
+                    # Preserve the resume marker in the run history — _end_run
+                    # replaces task_runs.metadata with this payload, which would
+                    # otherwise erase {"resumed": true} (DEVCHAIN-AUDIT C4).
+                    event_payload["resumed"] = True
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
@@ -7659,6 +8094,34 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _resolve_board_bank(board: Optional[str]) -> Optional[str]:
+    """TARS carry (P6 Option 2, dispatcher path): map a kanban board to a Hindsight
+    memory bank, so the shared background dispatcher (which runs in ONE context) never
+    lands professional cards in the private bank or vice versa.
+
+    Reads ``<hermes-root>/ops/kanban-board-banks.json``:
+        {"<board-slug>": "<bank>", "_default": "<bank>"}
+    Returns the bank to force, or None (no override → the worker keeps the bank it
+    inherited from the dispatcher's env). ``_default`` (optional) covers unmapped
+    boards — set it to a quarantine bank for strict no-mix. Read per spawn (edit the
+    map without restarting). Fail-soft: any error → None (never break dispatch)."""
+    try:
+        path = kanban_home() / "ops" / "kanban-board-banks.json"
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        # Underscore-prefixed keys are meta (_README, _default) — never board slugs.
+        bank = (data.get(board) if (board and not board.startswith("_")) else None) or data.get("_default")
+        bank = str(bank).strip() if bank else ""
+        if bank and re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", bank):
+            return bank
+        return None
+    except Exception:
+        return None
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -7708,6 +8171,12 @@ def _default_spawn(
         pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
+    if task.effort:
+        # CC-PARITY-A3: per-task reasoning-effort override, honoured by the
+        # worker's config loader (HERMES_REASONING_EFFORT).
+        env["HERMES_REASONING_EFFORT"] = str(task.effort)
+    if task.session_id:
+        env["HERMES_SESSION_ID"] = task.session_id
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
@@ -7728,6 +8197,15 @@ def _default_spawn(
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    # Event-sourcing resume (#2): hand the worker its pinned resumable session id
+    # (None when resume-on-reclaim is off) and, on a re-claim of a crashed task,
+    # tell it to resume the prior conversation. HERMES_SESSION_ID is deliberately
+    # NOT reused for this — it carries the *originating* session and gets
+    # overwritten by agent_init with the worker's own id anyway.
+    if getattr(task, "worker_session_id", None):
+        env["HERMES_KANBAN_WORKER_SESSION"] = task.worker_session_id
+        if getattr(task, "resume_requested", False):
+            env["HERMES_KANBAN_RESUME"] = "1"
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
     # Goal-loop mode: the worker reads these and wraps its run in the
@@ -7767,6 +8245,16 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+
+    # TARS carry (P6 Option 2, dispatcher path): force the worker's memory bank by
+    # board context. The shared dispatcher runs in ONE context (private/default), so
+    # without this every dispatched worker would inherit the private bank — mixing
+    # professional cards into private memory (or vice versa). Set explicitly so it
+    # survives the worker's own profile .env (load_hermes_dotenv override=True).
+    # Unmapped board → no override (worker keeps the inherited bank). Fail-soft.
+    _board_bank = _resolve_board_bank(resolved_board)
+    if _board_bank:
+        env["HINDSIGHT_BANK_ID"] = _board_bank
 
     cmd = [
         *_resolve_hermes_argv(),

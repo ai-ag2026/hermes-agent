@@ -306,11 +306,14 @@ kanban_create(
     assignee="writer",
     parents=["t_r1", "t_r2"],                     # promotes to ready when both complete
     body="one-pager, 300 words, neutral tone",
+    effort="high",                                # optional per-task reasoning effort
 )
 kanban_complete(summary="decomposed into 2 research tasks + 1 writer; linked dependencies")
 ```
 
 The "(Orchestrators)" tools — `kanban_list`, `kanban_create`, `kanban_link`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are available through the same toolset; the convention (encoded in the auto-injected kanban guidance) is that worker profiles don't fan out or route unrelated work, and orchestrator profiles don't execute implementation work. Dispatcher-spawned workers are still task-scoped for destructive lifecycle operations and cannot mutate unrelated tasks.
+
+`kanban_create(effort=...)` optionally overrides the spawned worker's reasoning effort for that single task. Accepted values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; when set, the dispatcher exports `HERMES_REASONING_EFFORT` for the worker instead of using the profile/global default. This is useful for routing cheap rote tasks to low effort while forcing review, synthesis, or architecture cards to run hotter.
 
 ### Why tools instead of shelling to `hermes kanban`
 
@@ -506,6 +509,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 |---|---|---|
 | `auto_decompose` | `true` | Dispatcher auto-runs the decomposer every tick. |
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
+| `decompose_max_attempts` | `1` | Number of schema-validation attempts for decomposer JSON. Set to `2` to allow one corrective retry when the auxiliary model returns malformed or incomplete task graphs. Values below 1 are treated as 1; high values are capped by the implementation. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
@@ -621,7 +625,7 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--branch <name>]
                                 [--priority N] [--triage] [--idempotency-key KEY]
                                 [--max-runtime 30m|2h|1d|<seconds>]
-                                [--max-retries N]
+                                [--max-retries N] [--effort none|minimal|low|medium|high|xhigh]
                                 [--goal] [--goal-max-turns N]
                                 [--skill <name>]...
                                 [--json]
@@ -676,6 +680,8 @@ All commands are also available as a slash command in the interactive CLI and in
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
+`--effort` is a per-task reasoning-effort override. The dispatcher passes it to the worker via `HERMES_REASONING_EFFORT`, so the card can use a different effort level than the profile/global default without changing the assignee profile.
+
 ### Concurrency, scheduling, and child promotion config
 
 | Config key | Default | What it does |
@@ -728,11 +734,17 @@ All of these are gated by the same dashboard plugin auth as the rest of the kanb
 
 ```bash
 hermes kanban swarm "Design a multi-region failover plan" \
-  --workers researcher,architect,sre \
-  --verifier reviewer --synthesizer writer
+  --worker researcher:Research \
+  --worker architect:Architecture \
+  --worker sre:Operations \
+  --verifier reviewer \
+  --verifier-lens correctness \
+  --verifier-lens security \
+  --verifier-lens operability \
+  --synthesizer writer
 ```
 
-The resulting graph dispatches normally — workers run in parallel, the verifier wakes after they all finish, the synthesizer wakes after the verifier marks the work clean.
+The resulting graph dispatches normally — workers run in parallel, verifier cards wake after they all finish, and the synthesizer wakes after the verifier panel completes. Each `--verifier-lens` creates an adversarial verifier card. Verifier verdicts posted to the swarm blackboard under `verdict:<lens>` must be JSON objects with `refuted`, `upheld`, and `notes`; the blackboard helper rejects malformed verdicts before the synthesizer can depend on them.
 
 ## `/kanban` slash command {#kanban-slash-command}
 

@@ -394,6 +394,9 @@ class GatewaySlashCommandsMixin:
         # Strip the leading "/kanban" (with or without slash), leaving args.
         if text.startswith("/"):
             text = text.lstrip("/")
+        lowered_text = text.lower()
+        if lowered_text == "hermes kanban" or lowered_text.startswith("hermes kanban "):
+            text = text[len("hermes kanban"):].lstrip()
         if text.startswith("kanban"):
             text = text[len("kanban"):].lstrip()
 
@@ -417,6 +420,62 @@ class GatewaySlashCommandsMixin:
             break
 
         is_create = action == "create"
+
+        if action == "unblock":
+            # Human chat surfaces are contextual and noisy: several Kanban
+            # notifications can land in the same Telegram/Discord thread, and
+            # a bare `/kanban unblock` must not let either the CLI parser or an
+            # LLM guess which task the user meant. Require an explicit task id
+            # and show exact safe commands for the current blocked candidates.
+            positional_task_ids: list[str] = []
+            j = i + 1
+            while j < len(tokens):
+                tok = tokens[j]
+                if tok == "--reason":
+                    j += 2
+                    continue
+                if tok.startswith("--reason="):
+                    j += 1
+                    continue
+                if tok.startswith("-"):
+                    j += 1
+                    continue
+                if re.fullmatch(r"t_[0-9a-f]+", tok):
+                    positional_task_ids.append(tok)
+                j += 1
+            if not positional_task_ids:
+                def _blocked_candidates() -> list[tuple[str, str, str]]:
+                    from hermes_cli import kanban_db as _kb
+                    conn = _kb.connect(board=requested_board)
+                    try:
+                        rows = _kb.list_tasks(conn, status="blocked", limit=10)
+                        rows += _kb.list_tasks(conn, status="scheduled", limit=10)
+                    finally:
+                        conn.close()
+                    return [
+                        (
+                            task.id,
+                            task.status,
+                            (task.title or "")[:120],
+                        )
+                        for task in rows[:10]
+                    ]
+
+                candidates = await asyncio.to_thread(_blocked_candidates)
+                board_flag = f"--board {requested_board} " if requested_board else ""
+                lines = [
+                    "Which Kanban task should I unblock? Please include the task id.",
+                ]
+                if candidates:
+                    lines.append("")
+                    lines.append("Blocked/scheduled candidates:")
+                    for tid, status, title in candidates:
+                        title_part = f" — {title}" if title else ""
+                        lines.append(f"- {tid} ({status}){title_part}")
+                        lines.append(f"  /kanban {board_flag}unblock {tid}".rstrip())
+                else:
+                    lines.append("No blocked or scheduled tasks found on this board.")
+                return "\n".join(lines)
 
         try:
             output = await asyncio.to_thread(run_slash, text)

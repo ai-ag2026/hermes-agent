@@ -22,6 +22,7 @@ import sqlite3
 from typing import Any, Iterable, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.schema_contract import validate_fields
 
 BLACKBOARD_PREFIX = "[swarm:blackboard] "
 
@@ -38,6 +39,12 @@ class SwarmWorkerSpec:
     max_runtime_seconds: Optional[int] = None
 
 
+# CC-PARITY-B1: default lenses for a perspective-diverse adversarial verifier
+# panel. Each lens is an independent skeptic told to REFUTE from its angle;
+# the synthesizer drops any finding a majority of lenses refute.
+DEFAULT_VERIFIER_LENSES = ("correctness", "security", "reproducibility")
+
+
 @dataclass(frozen=True)
 class SwarmCreated:
     """IDs produced by :func:`create_swarm`."""
@@ -46,12 +53,16 @@ class SwarmCreated:
     worker_ids: list[str]
     verifier_id: str
     synthesizer_id: str
+    # CC-PARITY-B1: full verifier panel (>=1). ``verifier_id`` stays the primary
+    # (first) verifier for backward compatibility; ``verifier_ids`` lists all.
+    verifier_ids: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "root_id": self.root_id,
             "worker_ids": list(self.worker_ids),
             "verifier_id": self.verifier_id,
+            "verifier_ids": list(self.verifier_ids) or [self.verifier_id],
             "synthesizer_id": self.synthesizer_id,
         }
 
@@ -74,6 +85,35 @@ def _swarm_context(root_id: str, goal: str) -> str:
     )
 
 
+def _normalise_lenses(verifier_lenses: "Optional[Iterable[str]]") -> list[str]:
+    """Return a de-duped list of non-empty lens names (order preserved)."""
+    if not verifier_lenses:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in verifier_lenses:
+        lens = (raw or "").strip()
+        if lens and lens.lower() not in seen:
+            seen.add(lens.lower())
+            out.append(lens)
+    return out
+
+
+def _verifier_lens_body(lens: str, context_suffix: str) -> str:
+    """Adversarial verifier card body for one lens (CC-PARITY-B1)."""
+    return (
+        f"You are an ADVERSARIAL verifier on the `{lens}` lens. Your job is to "
+        f"REFUTE the workers' claims from a {lens} standpoint, not to agree. For "
+        "each claim, actively try to break it; when you cannot decide, default to "
+        "refuted=true. Post one structured verdict comment to the swarm root "
+        f"under key `verdict:{lens}` with fields "
+        "{\"refuted\": [<claim>...], \"upheld\": [<claim>...], \"notes\": \"...\"}. "
+        "Complete with metadata {\"gate\": \"pass\"} only if nothing critical is "
+        "refuted from your lens; otherwise block with the exact refutation."
+        + context_suffix
+    )
+
+
 def create_swarm(
     conn: sqlite3.Connection,
     *,
@@ -84,6 +124,7 @@ def create_swarm(
     root_title: Optional[str] = None,
     verifier_title: str = "Verify swarm outputs",
     synthesizer_title: str = "Synthesize swarm outputs",
+    verifier_lenses: "Optional[Iterable[str]]" = None,
     tenant: Optional[str] = None,
     created_by: str = "swarm-orchestrator",
     workspace_kind: str = "scratch",
@@ -133,6 +174,7 @@ def create_swarm(
     if isinstance(existing, dict):
         worker_ids = [str(x) for x in existing.get("worker_ids", []) if x]
         verifier_id = existing.get("verifier_id")
+        verifier_ids = [str(x) for x in (existing.get("verifier_ids") or []) if x]
         synthesizer_id = existing.get("synthesizer_id")
         if worker_ids and verifier_id and synthesizer_id:
             return SwarmCreated(
@@ -140,6 +182,7 @@ def create_swarm(
                 worker_ids=worker_ids,
                 verifier_id=str(verifier_id),
                 synthesizer_id=str(synthesizer_id),
+                verifier_ids=verifier_ids or [str(verifier_id)],
             )
 
     kb.complete_task(
@@ -172,38 +215,75 @@ def create_swarm(
         )
         worker_ids.append(worker_id)
 
-    verifier_body = (
-        "Review every worker handoff and blackboard update. Gate the swarm: "
-        "complete only with metadata {\"gate\": \"pass\"} when evidence is "
-        "sufficient; otherwise block with exact missing work."
-        + context_suffix
-    )
-    verifier = kb.create_task(
-        conn,
-        title=verifier_title,
-        body=verifier_body,
-        assignee=verifier_assignee,
-        created_by=created_by,
-        parents=worker_ids,
-        tenant=tenant,
-        priority=priority,
-        workspace_kind=workspace_kind,
-        workspace_path=workspace_path,
-        skills=["requesting-code-review"],
-    )
+    lenses = _normalise_lenses(verifier_lenses)
+    verifier_ids: list[str] = []
+    if len(lenses) <= 1:
+        # Neutral path: a single verifier gate, byte-identical to before.
+        verifier_body = (
+            "Review every worker handoff and blackboard update. Gate the swarm: "
+            "complete only with metadata {\"gate\": \"pass\"} when evidence is "
+            "sufficient; otherwise block with exact missing work."
+            + context_suffix
+        )
+        verifier = kb.create_task(
+            conn,
+            title=verifier_title,
+            body=verifier_body,
+            assignee=verifier_assignee,
+            created_by=created_by,
+            parents=worker_ids,
+            tenant=tenant,
+            priority=priority,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            skills=["requesting-code-review"],
+        )
+        verifier_ids.append(verifier)
+    else:
+        # CC-PARITY-B1: N independent perspective-diverse adversarial verifiers,
+        # one per lens. Each refutes from its angle; majority-refute kills a claim
+        # (enforced by the synthesizer reading the per-lens verdicts).
+        for lens in lenses:
+            vid = kb.create_task(
+                conn,
+                title=f"{verifier_title} ({lens})",
+                body=_verifier_lens_body(lens, context_suffix),
+                assignee=verifier_assignee,
+                created_by=created_by,
+                parents=worker_ids,
+                tenant=tenant,
+                priority=priority,
+                workspace_kind=workspace_kind,
+                workspace_path=workspace_path,
+                skills=["requesting-code-review"],
+            )
+            verifier_ids.append(vid)
 
-    synthesizer_body = (
-        "Synthesize the verified worker outputs into the final deliverable. "
-        "Do not start until the verifier has passed the gate."
-        + context_suffix
-    )
+    primary_verifier = verifier_ids[0]
+
+    if len(verifier_ids) > 1:
+        synthesizer_body = (
+            "Synthesize the verified worker outputs into the final deliverable. "
+            f"A panel of {len(verifier_ids)} adversarial verifiers "
+            f"({', '.join(lenses)}) posted verdicts to the swarm root under "
+            "`verdict:<lens>` keys. DROP any claim a MAJORITY of the panel "
+            "refuted; keep only claims that survive. Do not start until every "
+            "verifier has gated."
+            + context_suffix
+        )
+    else:
+        synthesizer_body = (
+            "Synthesize the verified worker outputs into the final deliverable. "
+            "Do not start until the verifier has passed the gate."
+            + context_suffix
+        )
     synthesizer = kb.create_task(
         conn,
         title=synthesizer_title,
         body=synthesizer_body,
         assignee=synthesizer_assignee,
         created_by=created_by,
-        parents=[verifier],
+        parents=list(verifier_ids),
         tenant=tenant,
         priority=priority,
         workspace_kind=workspace_kind,
@@ -211,7 +291,9 @@ def create_swarm(
         skills=["humanizer"],
     )
 
-    created = SwarmCreated(root, worker_ids, verifier, synthesizer)
+    created = SwarmCreated(
+        root, worker_ids, primary_verifier, synthesizer, verifier_ids=verifier_ids
+    )
     post_blackboard_update(
         conn,
         root,
@@ -229,12 +311,37 @@ def post_blackboard_update(
     author: str,
     key: str,
     value: Any,
+    require_value_keys: Optional[Iterable[str]] = None,
 ) -> int:
-    """Append one structured update to the swarm root blackboard."""
+    """Append one structured update to the swarm root blackboard.
+
+    CC-PARITY-A2: when ``require_value_keys`` is given, ``value`` must be a dict
+    containing every listed key (non-empty). On mismatch a ``ValueError`` is
+    raised with the concrete errors, so a worker-facing tool can hand the failure
+    back to the model for a bounded retry instead of silently writing a
+    half-formed result. Default ``None`` == no contract == previous behaviour.
+    """
 
     _require_text(root_id, "root_id")
     author = _require_text(author, "author")
     key = _require_text(key, "key")
+    required_keys = list(require_value_keys or [])
+    verdict_spec = None
+    if key.startswith("verdict:"):
+        verdict_spec = {
+            "refuted": {"type": list},
+            "upheld": {"type": list},
+            "notes": {"type": str, "non_empty": True},
+        }
+    if required_keys or verdict_spec:
+        spec = {k: {"non_empty": True} for k in required_keys}
+        if verdict_spec:
+            spec.update(verdict_spec)
+        errors = validate_fields(value, spec)
+        if errors:
+            raise ValueError(
+                f"blackboard update '{key}' violates contract: " + "; ".join(errors)
+            )
     payload = json.dumps({"key": key, "value": value}, ensure_ascii=False, sort_keys=True)
     return kb.add_comment(conn, root_id, author=author, body=BLACKBOARD_PREFIX + payload)
 

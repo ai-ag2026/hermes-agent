@@ -246,6 +246,29 @@ class CLIAgentSetupMixin:
             except Exception as e:
                 logger.warning("SQLite session store not available — session will NOT be indexed: %s", e)
         
+        # Kanban worker resume fallback (DEVCHAIN-AUDIT F3): a dispatcher-pinned
+        # resume can point at a session that was never flushed (the previous
+        # worker crashed before its first tool step). Interactive `--resume`
+        # should still error loudly below, but an autonomous worker must degrade
+        # to a fresh start instead of aborting (return False = wasted spawn that
+        # burns the failure breaker for no reason).
+        if (
+            self._resumed
+            and self._session_db
+            and not self.conversation_history
+            and getattr(self, "_kb_session_fallback", False)
+        ):
+            try:
+                if not self._session_db.get_session(self.session_id):
+                    print(
+                        f"Resume session {self.session_id} not found; "
+                        "starting fresh (kanban worker fallback)",
+                        file=sys.stderr,
+                    )
+                    self._resumed = False
+            except Exception:
+                self._resumed = False
+
         # If resuming, validate the session exists and load its history.
         # _preload_resumed_session() may have already loaded it (called from
         # run() for immediate display).  In that case, conversation_history

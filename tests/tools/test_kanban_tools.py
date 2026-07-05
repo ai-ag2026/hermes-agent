@@ -142,6 +142,36 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_kanban_tools_visible_with_platform_toolset_config(monkeypatch, tmp_path):
+    """Orchestrator profiles with platform_toolsets.cli: [kanban] see kanban tools."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - web\n"
+        "    - kanban\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    kanban = {n for n in names if n and n.startswith("kanban_")}
+    expected = {
+        "kanban_list",
+        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_unblock",
+    }
+    assert kanban == expected, f"expected {expected}, got {kanban}"
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------
@@ -979,6 +1009,46 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_persists_reasoning_effort(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({
+        "title": "high effort child",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "effort": "high",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child is not None
+        assert child.effort == "high"
+    finally:
+        conn.close()
+
+
+def test_create_rejects_unknown_reasoning_effort(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({
+        "title": "bad effort",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "effort": "turbo",
+    })
+    assert json.loads(out).get("error")
+
+
+def test_create_schema_exposes_reasoning_effort():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+
+    effort = KANBAN_CREATE_SCHEMA["parameters"]["properties"]["effort"]
+    assert "high" in effort["enum"]
+
+
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     """A worker scoped to a dir: task that spawns a child without a
     workspace arg inherits the dir, not scratch (so follow-up code-gen
@@ -1129,6 +1199,51 @@ def test_create_rejects_no_title(worker_env):
     from tools import kanban_tools as kt
     assert json.loads(kt._handle_create({"assignee": "x"})).get("error")
     assert json.loads(kt._handle_create({"title": "   ", "assignee": "x"})).get("error")
+
+
+def test_create_inherits_session_id_from_current_worker_task(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET session_id = ? WHERE id = ?",
+            ("parent-origin-session", worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = kt._handle_create({
+        "title": "inherits parent session",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task is not None
+        assert new_task.session_id == "parent-origin-session"
+    finally:
+        conn.close()
+
+
+def test_create_schema_exposes_optional_session_id():
+    from tools import kanban_tools as kt
+
+    assert kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]["session_id"] == {
+        "type": "string",
+        "description": (
+            "Optional origin/result session id to bind the created task to. "
+            "When omitted, kanban_create uses HERMES_SESSION_ID or the current "
+            "worker task's session_id when available."
+        ),
+    }
 
 
 def test_create_rejects_no_assignee(worker_env):

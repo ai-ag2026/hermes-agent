@@ -56,8 +56,18 @@ def _profile_has_kanban_toolset() -> bool:
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
-        toolsets = cfg.get("toolsets", [])
-        return "kanban" in toolsets
+        # Historical configs used top-level ``toolsets``. Current profile
+        # tooling stores per-surface selections under ``platform_toolsets``
+        # (e.g. ``platform_toolsets.cli``). Accept both so orchestrator
+        # profiles like pm/reviewer can expose kanban tools without a duplicate
+        # legacy key.
+        configured = set(cfg.get("toolsets") or [])
+        platform_toolsets = cfg.get("platform_toolsets") or {}
+        if isinstance(platform_toolsets, dict):
+            for values in platform_toolsets.values():
+                if isinstance(values, (list, tuple, set)):
+                    configured.update(str(v) for v in values)
+        return "kanban" in configured
     except Exception:
         return False
 
@@ -849,9 +859,10 @@ def _handle_create(args: dict, **kw) -> str:
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
-    # Stamp the originating session id when the agent loop runs under
-    # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
-    # CLI / dashboard paths and on legacy hosts that don't set the env.
+    # Stamp the originating/result session id when the agent loop runs under
+    # ACP or a dispatcher-spawned workflow phase (both set HERMES_SESSION_ID
+    # before invoking tools). NULL on CLI / dashboard paths and on legacy hosts
+    # that don't set the env.
     session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
     priority = args.get("priority")
     # Resolve workspace. If the caller passed one explicitly, honor it.
@@ -885,6 +896,13 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    effort = args.get("effort")
+    if effort is not None:
+        effort = str(effort).strip().lower() or None
+    if effort is not None and effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+        return tool_error(
+            "effort must be one of none, minimal, low, medium, high, xhigh"
+        )
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -895,6 +913,12 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            if not session_id:
+                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
+                if _self_tid:
+                    _self_task = kb.get_task(conn, _self_tid)
+                    if _self_task is not None and _self_task.session_id:
+                        session_id = _self_task.session_id
             # Inherit the spawning worker's own task workspace when the
             # caller didn't specify one (see resolution note above).
             if _inherit_workspace:
@@ -926,6 +950,8 @@ def _handle_create(args: dict, **kw) -> str:
                     if max_runtime_seconds is not None else None
                 ),
                 skills=skills,
+                max_retries=None,
+                effort=effort,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -1439,6 +1465,14 @@ KANBAN_CREATE_SCHEMA = {
                     "Defaults to HERMES_TENANT env if set."
                 ),
             },
+            "session_id": {
+                "type": "string",
+                "description": (
+                    "Optional origin/result session id to bind the created task to. "
+                    "When omitted, kanban_create uses HERMES_SESSION_ID or the current "
+                    "worker task's session_id when available."
+                ),
+            },
             "priority": {
                 "type": "integer",
                 "description": (
@@ -1503,6 +1537,16 @@ KANBAN_CREATE_SCHEMA = {
                     "require immediate human ops (R3 gate) to skip the "
                     "brief running-to-blocked transition. Defaults to "
                     "'running', which preserves the usual dispatch path."
+                ),
+            },
+            "effort": {
+                "type": "string",
+                "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
+                "description": (
+                    "Optional per-task reasoning-effort override for the "
+                    "dispatched worker. When set, the dispatcher exports "
+                    "HERMES_REASONING_EFFORT so that worker uses this effort "
+                    "instead of the profile/global default."
                 ),
             },
             "skills": {

@@ -45,6 +45,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
+from hermes_cli.schema_contract import validate_decompose_graph
 
 logger = logging.getLogger(__name__)
 
@@ -295,6 +296,51 @@ def decompose_task(
     default_assignee = _resolve_default_assignee(cfg)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
+
+    # Decompose guardrails (2026-07-02, landscape-research #3). Generous safety
+    # nets that only fire on genuine runaway. A value <= 0 disables that cap;
+    # a NON-INT value falls back to the DEFAULT cap (fail toward protection,
+    # not toward open — DEVCHAIN-AUDIT C1). See decompose_triage_task for
+    # enforcement semantics.
+    def _cap(key: str, default: int) -> Optional[int]:
+        try:
+            val = int(kanban_cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return val if val >= 1 else None
+
+    max_fanout = _cap("max_fanout", 12)
+    max_tasks_per_root = _cap("max_tasks_per_root", 60)
+
+    # CC-PARITY-A4: optional budget-aware fan-out. When
+    # kanban.orchestration_budget is configured, scale max_fanout down as actual
+    # spend (from model telemetry) approaches the target. Default (unset) leaves
+    # max_fanout untouched. floor=1 keeps decompose able to make minimal progress
+    # rather than hard-blocking a triage task.
+    try:
+        from hermes_cli import orchestration_budget as _budget
+        _b = _budget.resolve_budget(cfg)
+        if _b is not None and max_fanout:
+            import time as _time
+            _since = (_time.time() - _b.window_seconds) if _b.window_seconds else None
+            _spent = _budget.spent(metric=_b.metric, since=_since)
+            _scaled = _b.scale(max_fanout, _spent, floor=1)
+            if _scaled < max_fanout:
+                logger.info(
+                    "decompose: budget(%s) scaled max_fanout %s -> %s (spent %.0f / %.0f)",
+                    _b.metric, max_fanout, _scaled, _spent, _b.total,
+                )
+            max_fanout = _scaled
+    except Exception:
+        logger.debug("decompose: budget scaling skipped", exc_info=True)
+    # CC-PARITY-A2: bounded retry when the aux LLM returns a schema-invalid
+    # graph. Default 1 == a single attempt == byte-for-byte the previous
+    # behaviour (opt-in feature; clamped to a sane ceiling to avoid runaway).
+    try:
+        decompose_max_attempts = int(kanban_cfg.get("decompose_max_attempts", 1))
+    except (TypeError, ValueError):
+        decompose_max_attempts = 1
+    decompose_max_attempts = max(1, min(decompose_max_attempts, 4))
     roster, valid_names = _build_roster()
 
     try:
@@ -323,32 +369,73 @@ def decompose_task(
         default_assignee=default_assignee,
     )
 
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+    extra_body = get_auxiliary_extra_body() or None
+
+    parsed: Optional[dict] = None
+    last_reason = "LLM returned malformed JSON"
+    for attempt in range(decompose_max_attempts):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=4000,
+                timeout=timeout or 180,
+                extra_body=extra_body,
+            )
+        except Exception as exc:
+            logger.info("decompose: API call failed for %s (%s)", task_id, exc)
+            # An API error is not a schema problem — don't burn retries on it.
+            return DecomposeOutcome(task_id, False, f"LLM error: {type(exc).__name__}")
+
+        try:
+            raw = resp.choices[0].message.content or ""
+        except Exception:
+            raw = ""
+
+        candidate = _extract_json_blob(raw)
+
+        if decompose_max_attempts == 1:
+            # Neutral path: no shape pre-validation; defer to the existing
+            # downstream normalization exactly as before.
+            parsed = candidate
+            if parsed is None:
+                return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
+            break
+
+        # Retry-enabled path (opt-in): validate the graph shape and, on
+        # failure, feed the errors back to the aux LLM for a corrected attempt.
+        if candidate is None:
+            last_reason = "LLM returned malformed JSON"
+        else:
+            errors = validate_decompose_graph(candidate)
+            if not errors:
+                parsed = candidate
+                break
+            last_reason = "; ".join(errors[:5])
+
+        if attempt + 1 < decompose_max_attempts:
+            logger.info(
+                "decompose: task %s attempt %d/%d invalid (%s) — retrying",
+                task_id, attempt + 1, decompose_max_attempts, last_reason,
+            )
+            messages = [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
-            ],
-            temperature=0.3,
-            max_tokens=4000,
-            timeout=timeout or 180,
-            extra_body=get_auxiliary_extra_body() or None,
-        )
-    except Exception as exc:
-        logger.info(
-            "decompose: API call failed for %s (%s)", task_id, exc,
-        )
-        return DecomposeOutcome(task_id, False, f"LLM error: {type(exc).__name__}")
+                {"role": "assistant", "content": raw or "(empty response)"},
+                {"role": "user", "content": (
+                    "Your previous response was invalid: " + last_reason
+                    + ". Return ONLY the corrected JSON object matching the "
+                    "exact required shape — no prose, no code fences."
+                )},
+            ]
 
-    try:
-        raw = resp.choices[0].message.content or ""
-    except Exception:
-        raw = ""
-
-    parsed = _extract_json_blob(raw)
     if parsed is None:
-        return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
+        return DecomposeOutcome(task_id, False, last_reason)
 
     fanout = bool(parsed.get("fanout"))
     audit_author = author or _profile_author()
@@ -447,6 +534,8 @@ def decompose_task(
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
+                max_fanout=max_fanout,
+                max_tasks_per_root=max_tasks_per_root,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")

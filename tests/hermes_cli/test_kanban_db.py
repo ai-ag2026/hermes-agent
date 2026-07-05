@@ -222,6 +222,23 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+def test_create_task_persists_reasoning_effort(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="think harder", assignee="alice", effort=" HIGH ")
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert task is not None
+    assert events
+    assert task.effort == "high"
+    assert events[0].payload["effort"] == "high"
+
+
+def test_create_task_rejects_unknown_reasoning_effort(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="effort"):
+        kb.create_task(conn, title="bad effort", effort="maximum-overdrive")
+
+
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")
@@ -1497,6 +1514,44 @@ def test_archive_hides_from_default_list(kanban_home):
         assert kb.archive_task(conn, t)
         assert len(kb.list_tasks(conn)) == 0
         assert len(kb.list_tasks(conn, include_archived=True)) == 1
+
+
+def test_archive_task_closes_orphaned_active_runs(kanban_home):
+    """Archive must close active runs even when current_run_id lost track of them."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="orphaned run", assignee="worker")
+        kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        current = task.current_run_id
+        assert current is not None
+        conn.execute(
+            """
+            INSERT INTO task_runs (task_id, profile, status, started_at)
+            VALUES (?, 'worker', 'running', ?)
+            """,
+            (tid, int(time.time())),
+        )
+        orphan_run = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.execute(
+            "UPDATE tasks SET status='done', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        assert kb.archive_task(conn, tid)
+
+        rows = conn.execute(
+            "SELECT id, status, outcome, ended_at, summary FROM task_runs WHERE task_id=? ORDER BY id",
+            (tid,),
+        ).fetchall()
+
+    assert {row["id"] for row in rows} == {current, orphan_run}
+    assert all(row["ended_at"] is not None for row in rows)
+    assert all(row["status"] == "reclaimed" for row in rows)
+    assert all(row["outcome"] == "reclaimed" for row in rows)
+    assert any(row["summary"] == "task archived with orphaned active run" for row in rows)
 
 
 def test_delete_archived_task_removes_related_rows(kanban_home):
@@ -2952,6 +3007,44 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
 
+    def test_dispatcher_spawn_propagates_task_session_id(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_bound_session",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            session_id="origin-session-1",
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        assert captured["env"]["HERMES_SESSION_ID"] == "origin-session-1"
+
 
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
@@ -3700,6 +3793,186 @@ def test_claim_review_task_fails_when_already_claimed(kanban_home):
         assert first is not None
         second = kb.claim_review_task(conn, t)
     assert second is None
+
+
+def _enable_resume_for_test(monkeypatch) -> None:
+    monkeypatch.setattr(kb, "_resolve_resume_on_reclaim", lambda: True)
+    monkeypatch.setattr(kb, "_resolve_resume_max_attempts", lambda: 1)
+
+
+def _finish_current_run_and_requeue(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    outcome: str,
+    status: str = "ready",
+) -> None:
+    kb._end_run(conn, task_id, outcome=outcome, status=outcome)
+    conn.execute(
+        """
+        UPDATE tasks
+           SET status = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+         WHERE id = ?
+        """,
+        (status, task_id),
+    )
+
+
+def test_resume_reuses_session_after_crashed_run(kanban_home, monkeypatch):
+    _enable_resume_for_test(monkeypatch)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="resume me", assignee="alice")
+        first = kb.claim_task(conn, task_id)
+        assert first is not None
+        original_session = first.worker_session_id
+
+        _finish_current_run_and_requeue(conn, task_id, outcome="crashed")
+        second = kb.claim_task(conn, task_id)
+
+        assert second is not None
+        assert second.worker_session_id == original_session
+        assert second.resume_requested is True
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (second.current_run_id,)
+        ).fetchone()
+        assert row["metadata"] == '{"resumed": true}'
+
+
+def test_resume_does_not_reuse_after_reclaimed_run(kanban_home, monkeypatch):
+    """TTL stale reclaims must not resume a stuck conversation forever."""
+    _enable_resume_for_test(monkeypatch)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="stale", assignee="alice")
+        first = kb.claim_task(conn, task_id)
+        assert first is not None
+        original_session = first.worker_session_id
+
+        _finish_current_run_and_requeue(conn, task_id, outcome="reclaimed")
+        second = kb.claim_task(conn, task_id)
+
+        assert second is not None
+        assert second.worker_session_id != original_session
+        assert second.resume_requested is False
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (second.current_run_id,)
+        ).fetchone()
+        assert row["metadata"] is None
+
+
+def test_review_claim_never_resumes_worker_session(kanban_home, monkeypatch):
+    _enable_resume_for_test(monkeypatch)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review isolation", assignee="alice")
+        first = kb.claim_task(conn, task_id)
+        assert first is not None
+        worker_session = first.worker_session_id
+
+        _finish_current_run_and_requeue(conn, task_id, outcome="crashed", status="review")
+        review = kb.claim_review_task(conn, task_id)
+
+        assert review is not None
+        assert review.worker_session_id != worker_session
+        assert review.resume_requested is False
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (review.current_run_id,)
+        ).fetchone()
+        assert row["metadata"] is None
+
+
+def test_goal_mode_claim_never_resumes_until_goal_loop_is_resume_aware(
+    kanban_home, monkeypatch,
+):
+    _enable_resume_for_test(monkeypatch)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="goal task", assignee="alice", goal_mode=True,
+        )
+        first = kb.claim_task(conn, task_id)
+        assert first is not None
+        worker_session = first.worker_session_id
+
+        _finish_current_run_and_requeue(conn, task_id, outcome="crashed")
+        second = kb.claim_task(conn, task_id)
+
+        assert second is not None
+        assert second.worker_session_id != worker_session
+        assert second.resume_requested is False
+
+
+def test_worktree_no_remote_is_treated_as_unpushed(tmp_path):
+    repo = tmp_path / "local-only"
+    _init_git_repo(repo)
+
+    assert kb._worktree_has_unpushed_commits(str(repo)) is True
+
+
+def test_worktree_cleanup_deletes_persisted_custom_branch_name(
+    kanban_home, tmp_path, monkeypatch,
+):
+    repo = tmp_path / "repo"
+    wt = tmp_path / "repo" / ".worktrees" / "task"
+    (repo / ".git").mkdir(parents=True)
+    wt.mkdir(parents=True)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(kb, "_resolve_worktree_auto_cleanup", lambda: True)
+    monkeypatch.setattr(kb, "_worktree_has_unpushed_commits", lambda *_a, **_k: False)
+    monkeypatch.setattr(kb, "_worktree_is_dirty", lambda *_a, **_k: False)
+    monkeypatch.setattr(kb, "_git_common_dir", lambda _path: repo / ".git")
+    monkeypatch.setattr(kb, "_git_current_branch", lambda _path: None)
+    monkeypatch.setattr(kb.subprocess, "run", fake_run)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="cleanup custom branch",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(wt),
+            branch_name="feature/custom-task",
+        )
+        kb._maybe_cleanup_worktree(conn, task_id, str(wt))
+
+    assert ["git", "-C", str(repo), "branch", "-D", "feature/custom-task"] in calls
+    assert ["git", "-C", str(repo), "branch", "-D", f"wt/{task_id}"] not in calls
+
+
+def test_worktree_cleanup_never_deletes_main_or_master_branch(
+    kanban_home, tmp_path, monkeypatch,
+):
+    repo = tmp_path / "repo"
+    wt = tmp_path / "repo" / ".worktrees" / "task"
+    (repo / ".git").mkdir(parents=True)
+    wt.mkdir(parents=True)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(kb, "_resolve_worktree_auto_cleanup", lambda: True)
+    monkeypatch.setattr(kb, "_worktree_has_unpushed_commits", lambda *_a, **_k: False)
+    monkeypatch.setattr(kb, "_worktree_is_dirty", lambda *_a, **_k: False)
+    monkeypatch.setattr(kb, "_git_common_dir", lambda _path: repo / ".git")
+    monkeypatch.setattr(kb, "_git_current_branch", lambda _path: "main")
+    monkeypatch.setattr(kb.subprocess, "run", fake_run)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="cleanup main branch guard",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(wt),
+            branch_name="main",
+        )
+        kb._maybe_cleanup_worktree(conn, task_id, str(wt))
+
+    assert not any(cmd[:5] == ["git", "-C", str(repo), "branch", "-D"] for cmd in calls)
 
 
 def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):

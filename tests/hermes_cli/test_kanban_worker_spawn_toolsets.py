@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 
 
-def _make_task(kb, *, assignee: str):
+def _make_task(kb, *, assignee: str, session_id: str | None = None):
     return kb.Task(
         id="t_spawn_tools",
         title="spawn tools",
@@ -20,6 +20,7 @@ def _make_task(kb, *, assignee: str):
         claim_lock="lock",
         claim_expires=None,
         tenant=None,
+        session_id=session_id,
         current_run_id=7,
     )
 
@@ -116,3 +117,36 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_default_spawn_propagates_task_session_id(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("toolsets:\n  - hermes-cli\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda _home: None)
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = _make_task(kb, assignee="elias", session_id="webui-origin-session")
+
+    pid = kb._default_spawn(task, str(workspace))
+
+    assert pid == 4243
+    assert captured["env"]["HERMES_SESSION_ID"] == "webui-origin-session"

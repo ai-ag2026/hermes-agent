@@ -345,3 +345,129 @@ def test_decompose_no_aux_client_configured(kanban_home):
 
     assert outcome.ok is False
     assert "no auxiliary client" in outcome.reason
+
+
+# ── CC-PARITY-A2: bounded retry on schema-invalid aux output ───────────────
+
+def _mock_client_sequence(contents: list[str]):
+    client = MagicMock()
+    client.chat.completions.create = MagicMock(
+        side_effect=[_fake_aux_response(c) for c in contents]
+    )
+    return client
+
+
+def _patch_aux_client_obj(client, *, model: str = "test-model"):
+    return patch(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        return_value=(client, model),
+    )
+
+
+def test_decompose_retries_on_invalid_then_succeeds(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough idea", body="do it", triage=True)
+
+    monkeypatch.setattr(
+        decomp, "_load_config", lambda: {"kanban": {"decompose_max_attempts": 2}}
+    )
+    client = _mock_client_sequence([
+        "here is my plan, not json at all {oops",
+        jsonlib.dumps({"fanout": False, "title": "Tightened title", "body": "spec"}),
+    ])
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client_obj(client), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert client.chat.completions.create.call_count == 2  # retried once
+
+
+def test_decompose_default_attempts_one_does_not_retry(kanban_home, monkeypatch):
+    """Neutrality: default (1 attempt) == single call == original reason string."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough idea", body="do it", triage=True)
+
+    monkeypatch.setattr(decomp, "_load_config", lambda: {})
+    client = _mock_client_sequence([
+        "still not json {",
+        jsonlib.dumps({"fanout": False, "title": "unused"}),
+    ])
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client_obj(client), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert outcome.reason == "LLM returned malformed JSON"
+    assert client.chat.completions.create.call_count == 1  # no retry
+
+
+# ── CC-PARITY-A4: budget-aware fan-out cap ─────────────────────────────────
+
+def _six_task_payload():
+    return jsonlib.dumps({
+        "fanout": True,
+        "rationale": "wide",
+        "tasks": [
+            {"title": f"t{i}", "body": "b", "assignee": None, "parents": []}
+            for i in range(6)
+        ],
+    })
+
+
+def test_decompose_budget_caps_fanout_when_exhausted(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="big idea", body="lots", triage=True)
+
+    monkeypatch.setattr(
+        decomp, "_load_config",
+        lambda: {"kanban": {"orchestration_budget": {"tokens": 1000}}},
+    )
+    # spend far over the target -> max_fanout floors to 1 -> 6 children rejected
+    monkeypatch.setattr(
+        "hermes_cli.orchestration_budget.spent", lambda **kw: 999999.0
+    )
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(_six_task_payload()), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "exceeds" in outcome.reason and "max_fanout=1" in outcome.reason
+
+
+def test_decompose_no_budget_is_neutral(kanban_home, monkeypatch):
+    """Without orchestration_budget, a wide fan-out is untouched."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="big idea", body="lots", triage=True)
+
+    monkeypatch.setattr(decomp, "_load_config", lambda: {})
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(_six_task_payload()), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 6
