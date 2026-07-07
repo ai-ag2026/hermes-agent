@@ -2021,6 +2021,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
+    if "effort" not in cols:
+        # Per-task reasoning-effort override written by the tars-workflow plugin
+        # (chained goal_mode cards). The plugin issues UPDATE tasks SET effort=?;
+        # existing boards happened to carry the column, but a freshly `kb init`'d
+        # board lacked it → create_chain with an effort override raised
+        # OperationalError: no such column: effort. NULL = engine default.
+        _add_column_if_missing(conn, "tasks", "effort", "effort TEXT")
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -4454,8 +4462,11 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
 
     Replicated from ``cli.py`` (kept self-contained to avoid a cli<->kanban_db
     circular import). Fails SAFE: on any error returns True so we never remove a
-    worktree whose push-state we cannot determine. A repo with no remote-tracking
-    refs has no baseline -> treat as no unpushed commits (nothing to protect).
+    worktree whose push-state we cannot determine. A repo with NO remote-tracking
+    refs has no baseline to prove the commits are pushed anywhere -> we CANNOT show
+    the work is safe, so treat it as unpushed (return True = keep). Returning False
+    here (the earlier behaviour) let the reaper force-delete committed-but-unpushed
+    local-only work in a remote-less repo — a data-loss vector (re-audit 2026-07-07).
     """
     try:
         remote_refs = subprocess.run(
@@ -4465,7 +4476,8 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
         if remote_refs.returncode != 0:
             return True
         if not remote_refs.stdout.strip():
-            return False
+            # No remotes at all -> unverifiable -> fail SAFE (keep the worktree).
+            return True
         result = subprocess.run(
             ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
             capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
@@ -4498,10 +4510,11 @@ def _maybe_cleanup_worktree(conn: sqlite3.Connection, task_id: str, path: str) -
     """Best-effort teardown of a completed task's git worktree (landscape-research #4).
 
     Opt-in via :func:`_resolve_worktree_auto_cleanup` (default OFF). Conservative
-    safety gates: reap ONLY a linked worktree that is clean AND fully pushed —
-    unpushed commits OR uncommitted changes keep it (the cron repo-hygiene reaper
-    remains the backstop for stale leftovers). Deferred while child tasks may still
-    read the tree. Removes the worktree and its conventional ``wt/<task-id>`` branch.
+    safety gates: reap ONLY a linked worktree that is clean AND provably fully
+    pushed — unpushed/unverifiable commits OR uncommitted changes keep it (the cron
+    repo-hygiene reaper remains the backstop for stale leftovers). Deferred while
+    child tasks may still read the tree. Removes the worktree and its actual branch
+    (``tasks.branch_name`` if set, else the worker-skill default ``wt/<task-id>``).
     """
     try:
         if not _resolve_worktree_auto_cleanup():
@@ -4534,16 +4547,44 @@ def _maybe_cleanup_worktree(conn: sqlite3.Connection, task_id: str, path: str) -
                 "changes): %s", task_id, wt,
             )
             return
-        for cmd in (
-            ["git", "-C", str(repo_root), "worktree", "unlock", str(wt)],
-            ["git", "-C", str(repo_root), "worktree", "remove", str(wt), "--force"],
-            ["git", "-C", str(repo_root), "branch", "-D", f"wt/{task_id}"],
+        # Reap the task's ACTUAL branch. A project-linked / custom worktree uses
+        # ``tasks.branch_name``; only the worker-skill default is ``wt/<task-id>``.
+        # Deleting the hardcoded ``wt/<task-id>`` for a custom-branch worktree left
+        # the real branch orphaned (re-audit 2026-07-07). Safe to delete: we only
+        # reach here once the worktree is clean AND its commits are on a remote.
+        branch = None
+        try:
+            row = conn.execute(
+                "SELECT branch_name FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is not None:
+                branch = (row["branch_name"] if "branch_name" in row.keys() else None)
+        except Exception:
+            branch = None
+        branch = (branch or f"wt/{task_id}").strip() or f"wt/{task_id}"
+        # unlock (harmless if not locked); remove is the critical step; branch -D
+        # is harmless if the branch is already gone.
+        for label, cmd in (
+            ("unlock", ["git", "-C", str(repo_root), "worktree", "unlock", str(wt)]),
+            ("remove", ["git", "-C", str(repo_root), "worktree", "remove", str(wt), "--force"]),
+            ("branch", ["git", "-C", str(repo_root), "branch", "-D", branch]),
         ):
             try:
-                subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
-            except Exception:
-                pass
-        _log.debug("Auto-cleaned worktree for task %s: %s", task_id, wt)
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+                if res.returncode != 0 and label == "remove":
+                    # A failed removal leaves a stale worktree the cron reaper must
+                    # mop up — surface it instead of silently swallowing (re-audit).
+                    _log.warning(
+                        "worktree cleanup: 'git worktree remove' failed for task %s "
+                        "(%s): %s", task_id, wt, (res.stderr or res.stdout or "").strip()[:200],
+                    )
+            except Exception as exc:
+                if label == "remove":
+                    _log.warning(
+                        "worktree cleanup: 'git worktree remove' errored for task %s "
+                        "(%s): %s", task_id, wt, exc,
+                    )
+        _log.debug("Auto-cleaned worktree for task %s (branch %s): %s", task_id, branch, wt)
     except Exception:
         pass  # best-effort — never block completion
 
