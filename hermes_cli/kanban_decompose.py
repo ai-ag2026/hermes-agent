@@ -319,8 +319,27 @@ def decompose_task(
         logger.debug("decompose: auxiliary client import failed: %s", exc)
         return DecomposeOutcome(task_id, False, "auxiliary client unavailable")
 
+    # Class-specific planner routing (convention-based, no new config schema):
+    # a task tagged ``task_class=X`` uses the auxiliary role
+    # ``kanban_decomposer_<x>`` IFF that role is configured; otherwise it
+    # falls back to the default ``kanban_decomposer``. The existence check is
+    # essential — passing an unconfigured role name to the aux resolver would
+    # route to "auto" (main model), not to the default decomposer. This lets
+    # e.g. the hardest epics plan on Fable via ``auxiliary.kanban_decomposer_hard``
+    # while everything else keeps its current (cheaper) decomposer untouched.
+    decomposer_role = "kanban_decomposer"
+    if task.task_class:
+        candidate = "kanban_decomposer_" + task.task_class.strip().lower()
+        aux_cfg = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
+        if isinstance(aux_cfg, dict) and isinstance(aux_cfg.get(candidate), dict):
+            decomposer_role = candidate
+            logger.debug(
+                "decompose: task %s class=%r -> planner role %r",
+                task.id, task.task_class, decomposer_role,
+            )
+
     try:
-        client, model = get_text_auxiliary_client("kanban_decomposer")
+        client, model = get_text_auxiliary_client(decomposer_role)
     except Exception as exc:
         logger.debug("decompose: get_text_auxiliary_client failed: %s", exc)
         return DecomposeOutcome(task_id, False, "auxiliary client unavailable")

@@ -76,6 +76,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "completed_at": t.completed_at,
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
+        "task_class": t.task_class,
         "max_retries": t.max_retries,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
@@ -338,6 +339,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(repeatable). The kanban lifecycle is already "
                                "injected automatically. Example: "
                                "--skill translation --skill github-code-review")
+    p_create.add_argument("--class", default=None, dest="task_class",
+                          metavar="CLASS",
+                          help="Optional quality class / task grade, e.g. "
+                               "--class hard. A triage card tagged this way is "
+                               "decomposed by the class-specific planner role "
+                               "auxiliary.kanban_decomposer_<class> if configured "
+                               "(otherwise the default decomposer). Omit for "
+                               "normal cards.")
     p_create.add_argument("--max-retries", type=int, default=None,
                           metavar="N",
                           help="Per-task override for the consecutive-failure "
@@ -444,6 +453,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
+
+    p_reclassify = sub.add_parser(
+        "reclassify", help="Set or clear a task's quality class (see create --class)"
+    )
+    p_reclassify.add_argument("task_id")
+    p_reclassify.add_argument(
+        "task_class",
+        help="Quality class, e.g. 'hard' (or 'none'/'-' to clear)",
+    )
 
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
@@ -943,6 +961,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "ls":       _cmd_list,
             "show":     _cmd_show,
             "assign":   _cmd_assign,
+            "reclassify": _cmd_reclassify,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1343,6 +1362,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
+            task_class=getattr(args, "task_class", None),
             max_retries=max_retries,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
@@ -1519,6 +1539,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:
         print(f"  model:     {task.model_override}")
+    if task.task_class:
+        print(f"  class:     {task.task_class}")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see
@@ -1623,6 +1645,21 @@ def _cmd_assign(args: argparse.Namespace) -> int:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
     print(f"Assigned {args.task_id} to {profile or '(unassigned)'}")
+    return 0
+
+
+def _cmd_reclassify(args: argparse.Namespace) -> int:
+    cls = (
+        None
+        if str(args.task_class).lower() in {"none", "-", "null", ""}
+        else args.task_class
+    )
+    with kb.connect_closing() as conn:
+        ok = kb.set_task_class(conn, args.task_id, cls)
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    print(f"Reclassified {args.task_id} -> {cls or '(unclassified)'}")
     return 0
 
 

@@ -948,6 +948,13 @@ class Task:
     # the defaults; empty list = explicitly no extra skills.
     skills: Optional[list] = None
     model_override: Optional[str] = None
+    # Optional quality class / task grade (e.g. "hard"). Free-form label
+    # set manually (``--class`` on ``kanban create``/``edit``) or by a
+    # plugin. Consumed by the decomposer to pick a class-specific planner
+    # auxiliary role (see kanban_decompose.py). ``None`` = unclassified =
+    # today's behaviour. Deliberately fully wired through ``from_row``
+    # below — unlike the dormant ``effort`` column which is never read.
+    task_class: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1052,6 +1059,7 @@ class Task:
             ),
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
+            task_class=row["task_class"] if "task_class" in keys and row["task_class"] else None,
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
@@ -1215,6 +1223,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
     model_override       TEXT,
+    -- Optional quality class / task grade (e.g. "hard"). Free-form label;
+    -- the decomposer maps it to a class-specific planner auxiliary role.
+    -- NULL = unclassified = default behaviour.
+    task_class           TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2029,6 +2041,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # OperationalError: no such column: effort. NULL = engine default.
         _add_column_if_missing(conn, "tasks", "effort", "effort TEXT")
 
+    if "task_class" not in cols:
+        # Optional quality class / task grade (e.g. "hard"). Set manually via
+        # ``--class`` or by a plugin; read by the decomposer to pick a
+        # class-specific planner auxiliary role. NULL for existing rows =
+        # unclassified = today's behaviour.
+        _add_column_if_missing(conn, "tasks", "task_class", "task_class TEXT")
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -2498,6 +2517,7 @@ def create_task(
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
+    task_class: Optional[str] = None,
     max_retries: Optional[int] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
@@ -2528,8 +2548,15 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``task_class`` is an optional free-form quality-class label (e.g.
+    ``"hard"``). It is read by the decomposer to select a class-specific
+    planner auxiliary role; ``None`` (the common case) preserves today's
+    behaviour.
     """
     assignee = _canonical_assignee(assignee)
+    if task_class is not None:
+        task_class = str(task_class).strip() or None
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2733,8 +2760,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        task_class
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2757,6 +2785,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        task_class,
                     ),
                 )
                 for pid in parents:
@@ -2776,6 +2805,7 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "task_class": task_class,
                     },
                 )
             return task_id
@@ -2901,6 +2931,29 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         _append_event(conn, task_id, "assigned", {"assignee": profile})
+        return True
+
+
+def set_task_class(
+    conn: sqlite3.Connection, task_id: str, task_class: Optional[str]
+) -> bool:
+    """Set or clear a task's quality class. Returns True on success.
+
+    ``task_class=None`` (or an empty/whitespace string) clears the class,
+    reverting the task to unclassified/default routing.
+    """
+    if task_class is not None:
+        task_class = str(task_class).strip() or None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute(
+            "UPDATE tasks SET task_class = ? WHERE id = ?", (task_class, task_id)
+        )
+        _append_event(conn, task_id, "reclassified", {"task_class": task_class})
         return True
 
 
