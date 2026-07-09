@@ -4143,6 +4143,28 @@ def test_file_length_invariant_still_protects_rollback_journal(tmp_path, monkeyp
         conn.close()
 
 
+def test_file_length_invariant_uses_read_snapshot_in_rollback_mode(tmp_path, monkeypatch):
+    """Rollback-mode checks hold a transaction across logical/physical reads."""
+    db_path = tmp_path / "delete-mode-snapshot.db"
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        observed = []
+        real_getsize = os.path.getsize
+
+        def checking_getsize(path):
+            observed.append(conn.in_transaction)
+            return real_getsize(path)
+
+        monkeypatch.setattr(kb.os.path, "getsize", checking_getsize)
+        kb._check_file_length_invariant(conn)
+        assert observed == [True]
+        assert conn.in_transaction is False
+    finally:
+        conn.close()
+
+
 def test_wal_multiprocess_writes_preserve_parallelism_without_false_corruption(tmp_path):
     """Real worker processes should not need a global write sidecar lock.
 
@@ -4618,6 +4640,19 @@ def test_connect_sets_default_wal_autocheckpoint_1000(tmp_path):
     val = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
     assert val == 1000
     conn.close()
+
+
+def test_fast_path_keeps_default_wal_autocheckpoint_1000(tmp_path):
+    """A cached-path reconnect must not revert first-open settings to 100."""
+    db = tmp_path / "test-fast-path.db"
+    first = kb.connect(db_path=db)
+    first.close()
+    assert str(db.resolve()) in kb._INITIALIZED_PATHS
+    second = kb.connect(db_path=db)
+    try:
+        assert second.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 1000
+    finally:
+        second.close()
 
 
 def test_write_txn_check_reads_correct_header_fields(tmp_path):

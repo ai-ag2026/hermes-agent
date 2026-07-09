@@ -1824,7 +1824,10 @@ def connect(
                 from hermes_state import apply_wal_with_fallback
                 apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
                 conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
+                # Keep the steady-state path identical to first initialization.
+                # Reapplying the old 100-page value here silently undid the safer
+                # default on every subsequent connection in long-lived processes.
+                conn.execute("PRAGMA wal_autocheckpoint=1000")
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA secure_delete=ON")
                 conn.execute("PRAGMA cell_size_check=ON")
@@ -2367,48 +2370,60 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
-    """Read the SQLite header page_count and compare against actual file size.
+    """Compare logical page count against file size in rollback-journal mode.
 
-    Raises sqlite3.DatabaseError if the file is shorter than the header claims
-    (torn-extend corruption).  This invariant is only meaningful for rollback
-    journal modes.  In WAL mode the main DB file may legitimately lag while
-    committed frames still live in ``-wal``; comparing only the main file there
-    races normal checkpoints and false-positives under parallel kanban workers.
+    Raises sqlite3.DatabaseError if the file is shorter than SQLite's logical
+    snapshot. This invariant is only meaningful for rollback journal modes. In
+    WAL mode the main DB file may legitimately lag while committed frames still
+    live in ``-wal``; comparing only the main file there races normal checkpoints
+    and false-positives under parallel kanban workers.
+
+    For rollback journals, hold a SQLite read transaction while observing both
+    ``page_count`` and the main-file size. The previous implementation read the
+    header and ``stat()`` independently after COMMIT, so another process could
+    commit between those reads and manufacture a false mismatch even without
+    WAL. A read snapshot keeps valid SQLite writers out until the check ends.
     """
+    started_read_txn = False
     try:
         journal_mode_row = conn.execute("PRAGMA journal_mode").fetchone()
         if journal_mode_row and str(journal_mode_row[0]).lower() == "wal":
             return
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+            started_read_txn = True
+        # BEGIN DEFERRED alone does not acquire a shared read lock.
+        conn.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
         row = conn.execute("PRAGMA database_list").fetchone()
         if row is None:
             return
         path_str = row[2]  # column 2 is the file path; empty for in-memory DBs
         if not path_str:
             return  # in-memory or unnamed DB; skip
-        path = path_str
         page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-        file_size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(28)
-            header_bytes = f.read(4)
-        if len(header_bytes) < 4:
-            return  # can't read header; skip
-        header_page_count = int.from_bytes(header_bytes, "big")
-        if header_page_count == 0:
+        logical_pages = conn.execute("PRAGMA page_count").fetchone()[0]
+        file_size = os.path.getsize(path_str)
+        if logical_pages == 0:
             return  # new/empty DB; skip
         actual_pages = file_size // page_size
-        if actual_pages < header_page_count:
+        if file_size % page_size != 0 or actual_pages < logical_pages:
             raise sqlite3.DatabaseError(
-                f"torn-extend detected: page count mismatch on {path}: "
-                f"header claims {header_page_count} pages, "
+                f"torn-extend detected: page count mismatch on {path_str}: "
+                f"SQLite snapshot reports {logical_pages} pages, "
                 f"file has {actual_pages} pages "
-                f"(missing {header_page_count - actual_pages} pages, "
+                f"(missing {max(0, logical_pages - actual_pages)} pages, "
                 f"file_size={file_size}, page_size={page_size})"
             )
     except sqlite3.DatabaseError:
         raise
     except Exception:
         pass  # I/O errors during check are non-fatal; let normal ops continue
+    finally:
+        if started_read_txn:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
 
 
 # SQLite's own busy_timeout uses a near-deterministic backoff, so concurrent
