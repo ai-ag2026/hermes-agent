@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import multiprocessing
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -124,6 +125,33 @@ def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypa
         (fake_msvcrt.LK_NBLCK, 1),
         (fake_msvcrt.LK_UNLCK, 1),
     ]
+
+
+def test_cross_process_init_lock_timeout_fails_closed(tmp_path, monkeypatch):
+    """A lock timeout must not run potentially destructive migrations unlocked."""
+    fake_msvcrt = types.SimpleNamespace(
+        LK_NBLCK=3,
+        LK_UNLCK=2,
+        locking=lambda *_args: (_ for _ in ()).throw(OSError("busy")),
+    )
+    monkeypatch.setattr(kb, "_IS_WINDOWS", True)
+    monkeypatch.setattr(kb, "_INIT_LOCK_TIMEOUT_SECONDS", 0)
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+
+    with pytest.raises(TimeoutError, match="refusing to run schema migration"):
+        with kb._cross_process_init_lock(tmp_path / "kanban.db"):
+            pytest.fail("lock body must not run")
+
+
+def test_connect_rejects_existing_zero_byte_db(tmp_path):
+    """An existing empty file is truncation, not permission to recreate a board."""
+    db_path = tmp_path / "kanban.db"
+    db_path.touch()
+
+    with pytest.raises(sqlite3.DatabaseError, match="existing zero-byte kanban DB"):
+        kb.connect(db_path=db_path)
+
+    assert db_path.stat().st_size == 0
 
 
 def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
@@ -4294,6 +4322,47 @@ def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
     assert second_backup.exists()
 
 
+def test_corrupt_backup_rejects_source_that_changes_during_copy(tmp_path, monkeypatch):
+    """Never preserve a mixed-generation main/WAL forensic set."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    real_copy = shutil.copyfileobj
+    mutated = False
+
+    def copy_then_mutate(reader, writer, *args, **kwargs):
+        nonlocal mutated
+        result = real_copy(reader, writer, *args, **kwargs)
+        if not mutated:
+            with db_path.open("ab") as source:
+                source.write(b"changed-during-copy")
+            mutated = True
+        return result
+
+    monkeypatch.setattr(kb.shutil, "copyfileobj", copy_then_mutate)
+
+    assert kb._backup_corrupt_db(db_path) is None
+    assert list(tmp_path.glob("kanban.db.corrupt.*")) == []
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_corrupt_backup_preserves_existing_sidecar_evidence(tmp_path):
+    """Same main hash with a different WAL must not overwrite prior evidence."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    wal_path = Path(str(db_path) + "-wal")
+    wal_path.write_bytes(b"first-generation")
+
+    backup = kb._backup_corrupt_db(db_path)
+    assert backup is not None
+    backup_wal = Path(str(backup) + "-wal")
+    assert backup_wal.read_bytes() == b"first-generation"
+
+    wal_path.write_bytes(b"second-generation")
+    assert kb._backup_corrupt_db(db_path) is None
+    assert backup_wal.read_bytes() == b"first-generation"
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     """A transient lock during the probe must not produce a .corrupt backup
     and must not be reported as :class:`KanbanDbCorruptError`. Raw sqlite
@@ -4629,6 +4698,28 @@ def test_write_txn_post_commit_check_fires_every_call(tmp_path):
                     f"VALUES ('t_fire{i:02d}', 'task {i}', 'tester', 'todo', 0, 1234567890)"
                 )
     assert call_count == 3
+    conn.close()
+
+
+def test_write_txn_post_commit_failure_is_explicit_and_not_rolled_back(tmp_path, monkeypatch):
+    """Callers must know that a post-COMMIT guard failure is not retry-safe."""
+    db = tmp_path / "post-commit.db"
+    conn = kb.connect(db_path=db)
+
+    def fail_guard(_conn):
+        raise sqlite3.DatabaseError("synthetic invariant failure")
+
+    monkeypatch.setattr(kb, "_check_file_length_invariant", fail_guard)
+    with pytest.raises(kb.PostCommitIntegrityError, match="must not be retried"):
+        with kb.write_txn(conn) as txn:
+            txn.execute(
+                "INSERT INTO tasks (id, title, status, priority, created_at) "
+                "VALUES ('t_committed', 'durable', 'todo', 0, 1)"
+            )
+
+    assert conn.execute(
+        "SELECT title FROM tasks WHERE id='t_committed'"
+    ).fetchone()[0] == "durable"
     conn.close()
 
 

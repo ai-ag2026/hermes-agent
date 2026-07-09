@@ -1441,13 +1441,10 @@ def _cross_process_init_lock(path: Path):
     critical section (or a stale lock held by a wedged worker) blocked every
     other ``connect()`` — including the long-lived gateway dispatcher's
     next-tick connect — forever, with no traceback and no recovery short of a
-    restart. We now retry a non-blocking acquire up to a deadline; on timeout
-    we log a WARNING and proceed WITHOUT the cross-process lock. That is safe:
-    the in-process ``_INIT_LOCK`` still serializes same-process threads, and
-    the init work itself is idempotent (``CREATE TABLE IF NOT EXISTS`` +
-    additive migrations), so the worst case of two processes racing first-init
-    is redundant work, not corruption. A bounded "proceed anyway" beats an
-    unbounded hang that silently stops the board.
+    restart. We retry a non-blocking acquire up to a deadline and then fail
+    closed. Init includes legacy table rebuilds, so proceeding without the
+    process lock can race non-idempotent DDL and damage the board. A bounded,
+    actionable failure is safer than either an unbounded hang or unlocked DDL.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".init.lock")
@@ -1483,12 +1480,10 @@ def _cross_process_init_lock(path: Path):
                         break
                     time.sleep(_INIT_LOCK_POLL_SECONDS)
         if not acquired:
-            _log.warning(
-                "kanban init lock for %s not acquired within %.0fs — proceeding "
-                "without the cross-process lock (in-process lock + idempotent "
-                "init are the correctness backstop). A stuck holder is no longer "
-                "able to block this connect indefinitely (#36644).",
-                lock_path, _INIT_LOCK_TIMEOUT_SECONDS,
+            raise TimeoutError(
+                f"kanban init lock for {lock_path} was not acquired within "
+                f"{_INIT_LOCK_TIMEOUT_SECONDS:.0f}s; refusing to run schema "
+                "migration without the cross-process lock"
             )
         yield
     finally:
@@ -1613,9 +1608,11 @@ def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
 def _validate_sqlite_header(path: Path) -> None:
     """Fail early with an actionable error for non-SQLite Kanban DB files.
 
-    ``sqlite3.connect()`` creates missing and zero-byte files, so those are
-    allowed. Existing non-empty files must have the SQLite header before we
-    hand them to SQLite/WAL setup. This keeps corrupted page-0 failures from
+    ``sqlite3.connect()`` creates missing files, so missing paths are allowed.
+    An already-existing zero-byte file is treated as truncation and rejected;
+    otherwise a damaged board could be silently reinitialized. Existing files
+    must have the SQLite header before we hand them to SQLite/WAL setup. This
+    keeps corrupted page-0 failures from
     being collapsed into a generic PRAGMA error and lets the gateway's corrupt
     board handling identify the board by fingerprint.
     """
@@ -1626,7 +1623,10 @@ def _validate_sqlite_header(path: Path) -> None:
     except OSError:
         return
     if stat.st_size == 0:
-        return
+        raise sqlite3.DatabaseError(
+            f"refusing to initialize existing zero-byte kanban DB at {path}; "
+            "remove it explicitly only when creating a new board"
+        )
     try:
         with path.open("rb") as handle:
             head = handle.read(64)
@@ -1664,58 +1664,94 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+class PostCommitIntegrityError(RuntimeError):
+    """Integrity guard failed after COMMIT; the mutation is already durable."""
+
+
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
-    """Copy a corrupt DB (and its WAL/SHM sidecars) to a content-addressed backup.
+    """Atomically preserve a stable corrupt DB/WAL/SHM evidence set.
 
-    The backup filename is deterministic in the main DB's sha256, so repeated
-    quarantines of the same corrupt bytes (gateway restarts, dispatcher retries,
-    multi-profile fleets all hitting the same shared DB) reuse one backup
-    instead of amplifying disk usage by N. If the corrupt bytes actually
-    change between attempts — e.g. a partial repair or further damage — the
-    fingerprint changes and a separate backup is preserved.
-
-    Returns the backup path of the main DB file, or ``None`` if the copy
-    itself failed (the caller still raises loudly in that case).
-
-    Writes are confined to the original DB's parent directory. The backup
-    basename is derived purely from ``path.name`` and a content hash, never
-    from caller-supplied directory segments — no traversal is possible.
+    Returns ``None`` if any source changes while it is copied. That is safer
+    than presenting a mixed-generation main/WAL set as forensic evidence.
     """
-    # Resolve once and pin the parent so subsequent path operations cannot
-    # escape it. ``Path.resolve()`` collapses any ``..`` segments and
-    # symlinks, and we only ever write inside ``parent``.
     resolved = path.resolve()
     parent = resolved.parent
-    base_name = resolved.name  # basename only
-    digest = hashlib.sha256()
+    base_name = resolved.name
+    temp_paths: list[Path] = []
+    created_paths: list[Path] = []
+
+    def signature(source: Path) -> tuple[int, int]:
+        stat = source.stat()
+        return stat.st_size, stat.st_mtime_ns
+
+    def file_digest(source: Path) -> bytes:
+        value = hashlib.sha256()
+        with source.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                value.update(chunk)
+        return value.digest()
+
+    def same_bytes(left: Path, right: Path) -> bool:
+        return file_digest(left) == file_digest(right)
+
+    def copy_stable(source: Path, target: Path) -> None:
+        before = signature(source)
+        temp = parent / f".{target.name}.{secrets.token_hex(6)}.tmp"
+        temp_paths.append(temp)
+        with source.open("rb") as reader, temp.open("xb") as writer:
+            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+            writer.flush()
+            os.fsync(writer.fileno())
+        if signature(source) != before:
+            raise OSError(f"source changed while copying: {source}")
+        if target.exists():
+            if not same_bytes(temp, target):
+                raise OSError(f"existing forensic backup differs: {target}")
+            temp.unlink()
+            temp_paths.remove(temp)
+        else:
+            os.replace(temp, target)
+            temp_paths.remove(temp)
+            created_paths.append(target)
+
     try:
+        before_sidecars = {
+            suffix for suffix in ("-wal", "-shm")
+            if (parent / (base_name + suffix)).exists()
+        }
+        digest = hashlib.sha256()
         with resolved.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
-    except OSError:
-        return None
-    token = digest.hexdigest()[:16]
-    candidate = parent / f"{base_name}.corrupt.{token}.bak"
-    # Defensive: candidate must still be inside parent after construction.
-    if candidate.parent != parent:
-        return None
-    if not candidate.exists():
-        try:
-            shutil.copy2(resolved, candidate)
-        except OSError:
+        candidate = parent / f"{base_name}.corrupt.{digest.hexdigest()[:16]}.bak"
+        if candidate.parent != parent:
             return None
-    for suffix in ("-wal", "-shm"):
-        sidecar = parent / (base_name + suffix)
-        if sidecar.parent != parent or not sidecar.exists():
-            continue
-        sidecar_backup = parent / (candidate.name + suffix)
-        if sidecar_backup.parent != parent or sidecar_backup.exists():
-            continue
+        copy_stable(resolved, candidate)
+        if file_digest(candidate) != digest.digest():
+            raise OSError("main DB changed between hashing and stable copy")
+        for suffix in sorted(before_sidecars):
+            copy_stable(
+                parent / (base_name + suffix),
+                parent / (candidate.name + suffix),
+            )
+        after_sidecars = {
+            suffix for suffix in ("-wal", "-shm")
+            if (parent / (base_name + suffix)).exists()
+        }
+        if after_sidecars != before_sidecars:
+            raise OSError("SQLite sidecar set changed while copying")
+        dir_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
-            shutil.copy2(sidecar, sidecar_backup)
-        except OSError:
-            pass
-    return candidate
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        return candidate
+    except OSError:
+        for temp in temp_paths:
+            temp.unlink(missing_ok=True)
+        for created in reversed(created_paths):
+            created.unlink(missing_ok=True)
+        return None
 
 
 def _guard_existing_db_is_healthy(path: Path) -> None:
@@ -2493,9 +2529,15 @@ def write_txn(conn: sqlite3.Connection):
             except sqlite3.OperationalError:
                 pass
             raise
-        # Post-commit file-length check: header page_count must match actual file pages.
-        # A discrepancy means a torn-extend — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        # This guard runs after COMMIT. Surface a distinct exception so callers
+        # know the mutation may not be retried as though it had rolled back.
+        try:
+            _check_file_length_invariant(conn)
+        except Exception as exc:
+            raise PostCommitIntegrityError(
+                "post-commit integrity guard failed; transaction is already "
+                "committed and must not be retried blindly"
+            ) from exc
 
 
 # ---------------------------------------------------------------------------
