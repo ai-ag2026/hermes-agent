@@ -4766,3 +4766,67 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Quality-class routing hardening (audit follow-up 2026-07-09)
+# ---------------------------------------------------------------------------
+
+class TestSetTaskClassNormalisation:
+    """set_task_class centralises the 'clear' semantics so a plugin calling
+    the setter directly can't leak a literal sentinel string into task_class."""
+
+    def test_real_class_is_stored(self, kanban_home):
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="x")
+            assert kb.set_task_class(conn, tid, "hard") is True
+            assert kb.get_task(conn, tid).task_class == "hard"
+
+    @pytest.mark.parametrize("sentinel", ["none", "None", "NULL", "-", "", "  "])
+    def test_sentinels_clear_the_class(self, kanban_home, sentinel):
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="x")
+            kb.set_task_class(conn, tid, "hard")
+            assert kb.set_task_class(conn, tid, sentinel) is True
+            # No literal 'none'/'null'/etc. leaks through — the class is cleared.
+            assert kb.get_task(conn, tid).task_class is None
+
+    def test_whitespace_is_stripped(self, kanban_home):
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="x")
+            kb.set_task_class(conn, tid, "  hard  ")
+            assert kb.get_task(conn, tid).task_class == "hard"
+
+
+class TestProtectedBranchGuard:
+    """_is_protected_branch keeps the worktree cleanup from ``branch -D``'ing a
+    shared/long-lived branch named via a custom tasks.branch_name."""
+
+    def _init_repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        for cmd in (["git", "init", "-b", "main"], ["git", "commit", "--allow-empty", "-m", "init"]):
+            subprocess.run(cmd, cwd=repo, env=env, check=True, capture_output=True)
+        return repo
+
+    def test_default_and_conventional_branches_are_protected(self, tmp_path):
+        repo = self._init_repo(tmp_path)
+        for b in ("main", "master", "develop", "trunk", "", "   "):
+            assert kb._is_protected_branch(repo, b) is True
+
+    def test_task_scoped_branch_is_not_protected(self, tmp_path):
+        repo = self._init_repo(tmp_path)
+        assert kb._is_protected_branch(repo, "wt/t_abc123") is False
+        assert kb._is_protected_branch(repo, "feature/some-work") is False
+
+    def test_current_head_branch_is_protected(self, tmp_path):
+        # A branch checked out in the main worktree must not be deleted even if
+        # it isn't the conventional default name.
+        repo = self._init_repo(tmp_path)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "checkout", "-b", "integration"], cwd=repo, env=env,
+                       check=True, capture_output=True)
+        assert kb._is_protected_branch(repo, "integration") is True

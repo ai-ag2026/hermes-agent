@@ -345,3 +345,80 @@ def test_decompose_no_aux_client_configured(kanban_home):
 
     assert outcome.ok is False
     assert "no auxiliary client" in outcome.reason
+
+
+def test_decompose_class_role_falls_back_to_default(kanban_home):
+    """When the class-specific planner role can't be resolved at runtime
+    (e.g. its provider's quota is exhausted), the decomposer falls back to the
+    default role instead of failing outright — a class=hard task must not be
+    MORE fragile than an unclassified one."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="hard epic", triage=True)
+        kb.set_task_class(conn, tid, "hard")
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True, "rationale": "split",
+        "tasks": [{"title": "a", "body": "b", "assignee": "engineer", "parents": []}],
+    })
+    default_client = _mock_client_returning(llm_payload)
+
+    def _aux(role):
+        # The class-specific role is "configured" but unavailable at runtime;
+        # the default role works.
+        if role == "kanban_decomposer_hard":
+            return (None, None)
+        return (default_client, "default-model")
+
+    cfg = {"auxiliary": {"kanban_decomposer_hard": {"model": "fable", "provider": "x"}}}
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.get_text_auxiliary_client", side_effect=_aux), \
+             patch("hermes_cli.kanban_decompose._load_config", return_value=cfg), \
+             _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is True
+    # The default client (not the class role) produced the plan.
+    assert default_client.chat.completions.create.called
+
+
+def test_decompose_class_role_used_when_available(kanban_home):
+    """Sanity: when the class role IS resolvable, it is used (no fallback)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="hard epic", triage=True)
+        kb.set_task_class(conn, tid, "hard")
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True, "rationale": "split",
+        "tasks": [{"title": "a", "body": "b", "assignee": "engineer", "parents": []}],
+    })
+    hard_client = _mock_client_returning(llm_payload)
+    calls = {}
+
+    def _aux(role):
+        calls["role"] = role
+        return (hard_client, "fable-model")
+
+    cfg = {"auxiliary": {"kanban_decomposer_hard": {"model": "fable", "provider": "x"}}}
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.get_text_auxiliary_client", side_effect=_aux), \
+             patch("hermes_cli.kanban_decompose._load_config", return_value=cfg), \
+             _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert calls["role"] == "kanban_decomposer_hard"

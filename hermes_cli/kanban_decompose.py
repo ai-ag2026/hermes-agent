@@ -338,11 +338,28 @@ def decompose_task(
                 task.id, task.task_class, decomposer_role,
             )
 
-    try:
-        client, model = get_text_auxiliary_client(decomposer_role)
-    except Exception as exc:
-        logger.debug("decompose: get_text_auxiliary_client failed: %s", exc)
-        return DecomposeOutcome(task_id, False, "auxiliary client unavailable")
+    def _resolve_client(role: str):
+        try:
+            c, m = get_text_auxiliary_client(role)
+        except Exception as exc:
+            logger.debug("decompose: get_text_auxiliary_client(%r) failed: %s", role, exc)
+            return None, None
+        return c, m
+
+    client, model = _resolve_client(decomposer_role)
+    # Runtime fallback: if the class-specific planner role can't be resolved
+    # (e.g. its provider's quota is exhausted or the endpoint is down), fall
+    # back to the default decomposer before giving up. Without this a
+    # ``class=hard`` task is MORE fragile than an unclassified one — the exact
+    # opposite of the intent — because it depends on a single scarcer model.
+    if (client is None or not model) and decomposer_role != "kanban_decomposer":
+        logger.warning(
+            "decompose: class planner role %r unavailable for task %s; "
+            "falling back to default decomposer",
+            decomposer_role, task.id,
+        )
+        decomposer_role = "kanban_decomposer"
+        client, model = _resolve_client(decomposer_role)
 
     if client is None or not model:
         return DecomposeOutcome(task_id, False, "no auxiliary client configured")

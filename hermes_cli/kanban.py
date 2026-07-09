@@ -1321,6 +1321,38 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warn_if_class_role_unconfigured(task_class: Optional[str]) -> None:
+    """Soft operator feedback for ``--class``/``reclassify``.
+
+    The quality class is deliberately free-form (no enum schema), so a typo
+    like ``--class harnd`` is accepted and silently routes to the default
+    decomposer. To turn that silent fallback into visible feedback, warn on
+    stderr when no matching ``auxiliary.kanban_decomposer_<class>`` role is
+    configured. This never rejects the value — the role may be added later, and
+    an unconfigured class is a valid "default routing" state. Best-effort:
+    a config-read failure just skips the warning.
+    """
+    if not task_class:
+        return
+    normalized = str(task_class).strip().lower()
+    if normalized in {"", "none", "-", "null"}:
+        return
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        aux = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
+        role = "kanban_decomposer_" + normalized
+        if not (isinstance(aux, dict) and isinstance(aux.get(role), dict)):
+            print(
+                f"note: class {task_class!r} has no configured planner role "
+                f"(auxiliary.{role}); it will use the default decomposer. "
+                f"Check for a typo if you expected a class-specific planner.",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass  # best-effort — never block create/reclassify over a warning
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
@@ -1331,6 +1363,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if branch_name and ws_kind != "worktree":
         print("kanban: --branch is only valid with --workspace worktree", file=sys.stderr)
         return 2
+    _warn_if_class_role_unconfigured(getattr(args, "task_class", None))
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
     except ValueError as exc:
@@ -1654,6 +1687,7 @@ def _cmd_reclassify(args: argparse.Namespace) -> int:
         if str(args.task_class).lower() in {"none", "-", "null", ""}
         else args.task_class
     )
+    _warn_if_class_role_unconfigured(cls)
     with kb.connect_closing() as conn:
         ok = kb.set_task_class(conn, args.task_id, cls)
     if not ok:

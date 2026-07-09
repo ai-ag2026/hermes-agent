@@ -2951,11 +2951,15 @@ def set_task_class(
 ) -> bool:
     """Set or clear a task's quality class. Returns True on success.
 
-    ``task_class=None`` (or an empty/whitespace string) clears the class,
-    reverting the task to unclassified/default routing.
+    ``task_class=None`` (or an empty/whitespace string, or one of the clear
+    sentinels ``none``/``-``/``null``) clears the class, reverting the task to
+    unclassified/default routing. The sentinel normalisation lives here rather
+    than only in the CLI wrapper so a plugin calling the setter directly can't
+    leak a literal ``"none"`` string into task_class.
     """
     if task_class is not None:
-        task_class = str(task_class).strip() or None
+        normalized = str(task_class).strip()
+        task_class = None if normalized.lower() in {"", "none", "-", "null"} else normalized
     with write_txn(conn):
         row = conn.execute(
             "SELECT id FROM tasks WHERE id = ?", (task_id,)
@@ -4571,6 +4575,45 @@ def _worktree_is_dirty(worktree_path: str, timeout: int = 10) -> bool:
         return True
 
 
+def _is_protected_branch(repo_root: Path, branch: str, timeout: int = 10) -> bool:
+    """Whether ``branch`` is a shared/long-lived branch that must never be reaped.
+
+    The worktree cleanup deletes the task's branch after removing its worktree.
+    A worker-skill default branch (``wt/<task-id>``) is ephemeral and safe by
+    construction, but ``tasks.branch_name`` is free-form — a task created with
+    ``--branch main`` (or pointed at a shared integration branch) must not get
+    that branch ``git branch -D``'d. Protects: the repo's default branch (via
+    ``origin/HEAD``, falling back to the main checkout's current HEAD) plus the
+    conventional ``main``/``master`` names. Fails SAFE: on any ambiguity or
+    error, treats the branch as protected (skip deletion).
+    """
+    b = (branch or "").strip()
+    if not b:
+        return True
+    if b in {"main", "master", "trunk", "develop"}:
+        return True
+    try:
+        # Repo default branch, e.g. "origin/main" -> "main".
+        res = subprocess.run(
+            ["git", "-C", str(repo_root), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        if res.returncode == 0:
+            default = res.stdout.strip().split("/", 1)[-1]
+            if default and b == default:
+                return True
+        # The branch currently checked out in the main worktree.
+        res2 = subprocess.run(
+            ["git", "-C", str(repo_root), "symbolic-ref", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        if res2.returncode == 0 and res2.stdout.strip() == b:
+            return True
+    except Exception:
+        return True  # fail safe — don't delete when we can't verify
+    return False
+
+
 def _maybe_cleanup_worktree(conn: sqlite3.Connection, task_id: str, path: str) -> None:
     """Best-effort teardown of a completed task's git worktree (landscape-research #4).
 
@@ -4627,13 +4670,24 @@ def _maybe_cleanup_worktree(conn: sqlite3.Connection, task_id: str, path: str) -
         except Exception:
             branch = None
         branch = (branch or f"wt/{task_id}").strip() or f"wt/{task_id}"
-        # unlock (harmless if not locked); remove is the critical step; branch -D
-        # is harmless if the branch is already gone.
-        for label, cmd in (
+        # Guard the branch reap: a custom ``tasks.branch_name`` could name a
+        # shared/long-lived branch (e.g. a task created with ``--branch main``).
+        # Deleting the worktree is always fine, but ``branch -D`` on a protected
+        # branch would destroy shared history — so drop the branch step for
+        # those. ``wt/<task-id>`` and other task-scoped branches still get reaped.
+        steps = [
             ("unlock", ["git", "-C", str(repo_root), "worktree", "unlock", str(wt)]),
             ("remove", ["git", "-C", str(repo_root), "worktree", "remove", str(wt), "--force"]),
-            ("branch", ["git", "-C", str(repo_root), "branch", "-D", branch]),
-        ):
+        ]
+        if _is_protected_branch(repo_root, branch):
+            _log.info(
+                "worktree cleanup: not deleting protected branch %r for task %s "
+                "(worktree removed, branch kept)", branch, task_id,
+            )
+        else:
+            # branch -D is harmless if the branch is already gone.
+            steps.append(("branch", ["git", "-C", str(repo_root), "branch", "-D", branch]))
+        for label, cmd in steps:
             try:
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
                 if res.returncode != 0 and label == "remove":
