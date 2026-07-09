@@ -952,9 +952,16 @@ class Task:
     # set manually (``--class`` on ``kanban create``/``edit``) or by a
     # plugin. Consumed by the decomposer to pick a class-specific planner
     # auxiliary role (see kanban_decompose.py). ``None`` = unclassified =
-    # today's behaviour. Deliberately fully wired through ``from_row``
-    # below — unlike the dormant ``effort`` column which is never read.
+    # today's behaviour. Deliberately fully wired through ``from_row`` below.
     task_class: Optional[str] = None
+    # Per-task reasoning-effort override (one of VALID_REASONING_EFFORTS, e.g.
+    # "low"/"high"/"xhigh"). Written by the tars-workflow plugin for chained
+    # goal_mode cards so cheap phases run on low effort and hard verify/judge
+    # phases run high. When set, the dispatcher exports HERMES_REASONING_EFFORT
+    # into the worker env; the worker's config loader lets that env value take
+    # precedence over the profile's ``agent.reasoning_effort``. ``None`` (the
+    # common case) = use the profile default = today's behaviour.
+    effort: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1060,6 +1067,7 @@ class Task:
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             task_class=row["task_class"] if "task_class" in keys and row["task_class"] else None,
+            effort=row["effort"] if "effort" in keys and row["effort"] else None,
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
@@ -1227,6 +1235,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the decomposer maps it to a class-specific planner auxiliary role.
     -- NULL = unclassified = default behaviour.
     task_class           TEXT,
+    -- Per-task reasoning-effort override. When set, the dispatcher exports
+    -- HERMES_REASONING_EFFORT to the worker, overriding the profile's
+    -- agent.reasoning_effort. NULL = use the profile default.
+    effort               TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -8205,6 +8217,12 @@ def _default_spawn(
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
         if task.goal_max_turns is not None:
             env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
+    # Per-task reasoning-effort override (tars-workflow chained goal cards).
+    # Only set when present so non-overridden tasks keep a clean env and fall
+    # through to the profile's agent.reasoning_effort. The worker's config
+    # loader gives this env value precedence (see cli.py reasoning_config).
+    if task.effort:
+        env["HERMES_REASONING_EFFORT"] = str(task.effort)
     terminal_timeout = _worker_terminal_timeout_env(
         task.max_runtime_seconds,
         env.get("TERMINAL_TIMEOUT"),

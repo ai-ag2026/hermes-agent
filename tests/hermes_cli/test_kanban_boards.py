@@ -462,6 +462,52 @@ class TestWorkerSpawnEnv:
         assert env["HERMES_KANBAN_BOARD"] == "default"
         assert env["HERMES_KANBAN_DB"] == str(fresh_home / "kanban.db")
 
+    def _spawn_capture_env(self, fresh_home, monkeypatch, *, effort):
+        """Spawn a task with the given ``effort`` and return the worker env."""
+        captured = {}
+
+        class FakeProc:
+            pid = 7
+
+        def fake_popen(cmd, *args, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            return FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        task = kb.Task(
+            id="t_effort",
+            title="",
+            body=None,
+            assignee="teknium",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            effort=effort,
+        )
+        kb._default_spawn(task, str(fresh_home / "ws"), board=None)
+        return captured["env"]
+
+    def test_default_spawn_exports_effort_when_set(self, fresh_home, monkeypatch):
+        # A per-task reasoning-effort override must reach the worker via
+        # HERMES_REASONING_EFFORT so cli.py can give it precedence over the
+        # profile's agent.reasoning_effort.
+        env = self._spawn_capture_env(fresh_home, monkeypatch, effort="high")
+        assert env["HERMES_REASONING_EFFORT"] == "high"
+
+    def test_default_spawn_omits_effort_env_when_unset(self, fresh_home, monkeypatch):
+        # Behaviour-neutral default: no override → env stays clean so the
+        # worker falls through to its profile's reasoning_effort.
+        env = self._spawn_capture_env(fresh_home, monkeypatch, effort=None)
+        assert "HERMES_REASONING_EFFORT" not in env
+
 
 # ---------------------------------------------------------------------------
 # CLI surface

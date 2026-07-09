@@ -3901,9 +3901,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _resolve_prefill_messages_file(CLI_CONFIG)
         )
         
-        # Reasoning config (OpenRouter reasoning effort level)
+        # Reasoning config (OpenRouter reasoning effort level).
+        # HERMES_REASONING_EFFORT (exported by the kanban dispatcher for a
+        # task carrying a per-phase effort override) takes precedence over the
+        # profile's agent.reasoning_effort, matching the documented "env vars
+        # take precedence over config" contract. Unset = use the config value.
         self.reasoning_config = _parse_reasoning_config(
-            CLI_CONFIG["agent"].get("reasoning_effort", "")
+            os.environ.get("HERMES_REASONING_EFFORT", "").strip()
+            or CLI_CONFIG["agent"].get("reasoning_effort", "")
         )
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
