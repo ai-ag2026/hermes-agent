@@ -256,24 +256,39 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
 def _safe_copy_db(src: Path, dst: Path) -> bool:
     """Copy a SQLite database safely using the backup() API.
 
-    Handles WAL mode — produces a consistent snapshot even while
-    the DB is being written to.  Falls back to raw copy on failure.
+    Handles WAL mode and produces a consistent snapshot while the source is
+    being written. Fail closed if SQLite cannot produce that snapshot: a raw
+    main-file copy can omit committed WAL frames and must never be presented as
+    a valid backup. The destination is replaced only after validation.
     """
+    conn = backup_conn = None
+    fd, temp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=dst.parent)
+    os.close(fd)
+    temp_path = Path(temp_name)
     try:
         conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-        backup_conn = sqlite3.connect(str(dst))
+        backup_conn = sqlite3.connect(str(temp_path))
         conn.backup(backup_conn)
+        row = backup_conn.execute("PRAGMA quick_check").fetchone()
+        if not row or row[0] != "ok":
+            raise sqlite3.DatabaseError(f"backup quick_check returned {row!r}")
         backup_conn.close()
+        backup_conn = None
         conn.close()
+        conn = None
+        with temp_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temp_path, dst)
         return True
     except Exception as exc:
-        logger.warning("SQLite safe copy failed for %s: %s", src, exc)
-        try:
-            shutil.copy2(src, dst)
-            return True
-        except Exception as exc2:
-            logger.error("Raw copy also failed for %s: %s", src, exc2)
-            return False
+        logger.error("SQLite safe copy failed for %s: %s", src, exc)
+        return False
+    finally:
+        if backup_conn is not None:
+            backup_conn.close()
+        if conn is not None:
+            conn.close()
+        temp_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

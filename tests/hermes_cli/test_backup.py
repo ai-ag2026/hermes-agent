@@ -1369,6 +1369,28 @@ class TestSafeCopyDb:
         conn.close()
         assert rows == [("wal-test",)]
 
+    def test_failure_preserves_existing_destination_and_leaves_no_temp(self, tmp_path):
+        from hermes_cli.backup import _safe_copy_db
+
+        src = tmp_path / "corrupt.db"
+        dst = tmp_path / "existing.db"
+        src.write_bytes(b"SQLite format 3\x00" + b"broken")
+        dst.write_bytes(b"known-good-placeholder")
+
+        assert _safe_copy_db(src, dst) is False
+        assert dst.read_bytes() == b"known-good-placeholder"
+        assert list(tmp_path.glob(f".{dst.name}.*.tmp")) == []
+
+    def test_missing_source_fails_closed_without_creating_destination(self, tmp_path):
+        from hermes_cli.backup import _safe_copy_db
+
+        src = tmp_path / "missing.db"
+        dst = tmp_path / "copy.db"
+
+        assert _safe_copy_db(src, dst) is False
+        assert not dst.exists()
+        assert list(tmp_path.glob(f".{dst.name}.*.tmp")) == []
+
 
 # ---------------------------------------------------------------------------
 # Quick state snapshot tests
