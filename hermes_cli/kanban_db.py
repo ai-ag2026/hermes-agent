@@ -3544,6 +3544,53 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return out
 
 
+# Bound how much a single goal-loop progress event can carry. The payload
+# is already response-hash-only (see ``goals.run_kanban_goal_loop``'s
+# ``_emit``), but this is a second, independent backstop against an
+# unbounded/secret-carrying payload ever reaching durable storage.
+_GOAL_PROGRESS_EVENT_PAYLOAD_LIMIT = 4000
+
+
+def record_goal_progress_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    payload: dict,
+    *,
+    run_id: Optional[int] = None,
+) -> None:
+    """Persist one ``goals.run_kanban_goal_loop`` budget/progress snapshot.
+
+    This is the dispatcher-visible sink for the goal loop's per-turn
+    telemetry (turns used/max, judge verdict history, no-progress count,
+    closeout-corridor state, ...) — a human or the dashboard can tail
+    ``list_events(conn, task_id)`` for ``kind == "goal_progress"`` rows to
+    see WHY a goal-mode card is burning budget without having to attach a
+    debugger. The goal loop itself has zero hard dependency on this module
+    (see ``goals.py``'s module docstring) — callers wire this in as the
+    ``emit_progress`` callback (see ``cli._run_kanban_goal_loop_q``).
+
+    Best-effort by design: a caller that can't persist this (DB busy, task
+    already archived, ...) should log and move on rather than let telemetry
+    failures interrupt the goal loop — see the try/except around the
+    ``emit_progress`` call site.
+    """
+    encoded = json.dumps(payload, ensure_ascii=False, default=str)
+    if len(encoded) > _GOAL_PROGRESS_EVENT_PAYLOAD_LIMIT:
+        # Never silently drop the event over a payload-size surprise — trim
+        # it to a short, clearly-marked summary instead so the telemetry
+        # stream stays informative (and bounded).
+        payload = {
+            "task_id": payload.get("task_id"),
+            "phase": payload.get("phase"),
+            "turns_used": payload.get("turns_used"),
+            "max_turns": payload.get("max_turns"),
+            "truncated": True,
+            "original_size": len(encoded),
+        }
+    with write_txn(conn):
+        _append_event(conn, task_id, "goal_progress", payload, run_id=run_id)
+
+
 def _append_event(
     conn: sqlite3.Connection,
     task_id: str,

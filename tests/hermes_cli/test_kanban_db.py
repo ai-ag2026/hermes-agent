@@ -1738,6 +1738,55 @@ def test_events_capture_lifecycle(kanban_home):
     assert "completed" in kinds
 
 
+def test_record_goal_progress_event_persists_and_round_trips(kanban_home):
+    """The S4 goal-loop budget/progress sink: a caller wiring
+    ``goals.run_kanban_goal_loop``'s ``emit_progress`` callback to this
+    function must get a retrievable ``goal_progress`` event with the
+    payload intact."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+        run = kb.latest_run(conn, t)
+        kb.record_goal_progress_event(
+            conn,
+            t,
+            {
+                "task_id": t,
+                "phase": "closeout",
+                "turns_used": 2,
+                "max_turns": 3,
+                "verdict_history": ["continue", "continue"],
+            },
+            run_id=run.id if run else None,
+        )
+        events = [e for e in kb.list_events(conn, t) if e.kind == "goal_progress"]
+    assert len(events) == 1
+    assert events[0].payload["phase"] == "closeout"
+    assert events[0].payload["turns_used"] == 2
+    if run is not None:
+        assert events[0].run_id == run.id
+
+
+def test_record_goal_progress_event_truncates_oversized_payload(kanban_home):
+    """An oversized payload must never be silently dropped — it's replaced
+    with a short, clearly-marked summary instead of growing the events
+    table unboundedly."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        huge_payload = {
+            "task_id": t,
+            "phase": "continue",
+            "turns_used": 1,
+            "max_turns": 10,
+            "junk": "x" * 10000,
+        }
+        kb.record_goal_progress_event(conn, t, huge_payload)
+        events = [e for e in kb.list_events(conn, t) if e.kind == "goal_progress"]
+    assert len(events) == 1
+    assert events[0].payload.get("truncated") is True
+    assert "junk" not in events[0].payload
+
+
 def test_worker_context_includes_parent_results_and_comments(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="p")
