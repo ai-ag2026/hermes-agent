@@ -2667,6 +2667,15 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Linux-only worker resource-stall detection. Unsupported/missing
+        # procfs or cgroup-v2 signals degrade to no-op probes.
+        "resource_monitor": {
+            "enabled": True,
+            "d_state_seconds": 120,
+            "memory_high_ratio": 0.98,
+            "psi_some_avg10": 1.0,
+            "high_event_delta": 1,
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

@@ -1344,6 +1344,12 @@ CREATE TABLE IF NOT EXISTS task_runs (
     worker_pid          INTEGER,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
+    last_activity_at    INTEGER,
+    last_semantic_progress_at INTEGER,
+    worker_start_ticks  INTEGER,
+    d_state_since       INTEGER,
+    resource_sample     TEXT,
+    termination_pending_since INTEGER,
     started_at          INTEGER NOT NULL,
     ended_at            INTEGER,
     outcome             TEXT,
@@ -2249,6 +2255,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "last_heartbeat_at", "last_heartbeat_at INTEGER"
         )
+    if "last_activity_at" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "last_activity_at", "last_activity_at INTEGER"
+        )
+    if "last_semantic_progress_at" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "last_semantic_progress_at", "last_semantic_progress_at INTEGER"
+        )
     if "current_run_id" not in cols:
         _add_column_if_missing(
             conn, "tasks", "current_run_id", "current_run_id INTEGER"
@@ -2377,6 +2391,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
         if "session_id" not in run_cols:
             _add_column_if_missing(conn, "task_runs", "session_id", "session_id TEXT")
+        for name, definition in (
+            ("last_activity_at", "last_activity_at INTEGER"),
+            ("last_semantic_progress_at", "last_semantic_progress_at INTEGER"),
+            ("worker_start_ticks", "worker_start_ticks INTEGER"),
+            ("d_state_since", "d_state_since INTEGER"),
+            ("resource_sample", "resource_sample TEXT"),
+            ("termination_pending_since", "termination_pending_since INTEGER"),
+        ):
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, definition)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_runs_session ON task_runs(session_id)"
         )
@@ -7471,6 +7495,8 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    resource_stalled: list[str] = field(default_factory=list)
+    """Task ids blocked after sustained kernel/cgroup resource-stall evidence."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -7781,30 +7807,33 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    semantic: bool = True,
 ) -> bool:
-    """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
+    """Persist liveness/activity separately from semantic progress.
 
-    Called by long-running workers as a liveness signal orthogonal to
-    the PID check. A worker that forks a long-lived child (train loop,
-    video encode, web crawl) can have its Python still alive while the
-    actual work process is stuck; periodic heartbeats catch that.
-
-    Returns True on success, False if the task is not in a state that
-    should be heartbeating (not running, or claim expired).
+    Explicit worker heartbeats are semantic by default. Runtime-generated
+    activity heartbeats pass ``semantic=False`` so streaming/tool chatter
+    cannot conceal a worker that has stopped making useful progress.
     """
     now = int(time.time())
+    task_set = "last_heartbeat_at = ?, last_activity_at = ?"
+    run_set = "last_heartbeat_at = ?, last_activity_at = ?"
+    values: list[Any] = [now, now]
+    if semantic:
+        task_set += ", last_semantic_progress_at = ?"
+        run_set += ", last_semantic_progress_at = ?"
+        values.append(now)
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running'",
-                (now, task_id),
+                f"UPDATE tasks SET {task_set} WHERE id = ? AND status = 'running'",
+                (*values, task_id),
             )
         else:
             cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
+                f"UPDATE tasks SET {task_set} "
                 "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (now, task_id, int(expected_run_id)),
+                (*values, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -7815,15 +7844,145 @@ def heartbeat_worker(
         )
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
-                (now, run_id),
+                f"UPDATE task_runs SET {run_set} WHERE id = ?",
+                (*values, run_id),
             )
         _append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            (
+                {"note": note, "semantic": False}
+                if not semantic
+                else ({"note": note} if note else None)
+            ),
             run_id=run_id,
         )
     return True
+
+
+def detect_resource_stalls(
+    conn: sqlite3.Connection,
+    *,
+    cgroup_path: Optional[str | Path] = None,
+    d_state_seconds: int = 120,
+    memory_high_ratio: float = 0.98,
+    psi_some_avg10: float = 1.0,
+    high_event_delta: int = 1,
+    signal_fn=None,
+) -> list[str]:
+    """Fail closed when an identity-bound worker is resource-stalled."""
+    from hermes_cli import kanban_resource_monitor as monitor
+
+    if sys.platform != "linux":
+        return []
+    resolved_cgroup = Path(cgroup_path) if cgroup_path else monitor.current_cgroup_path()
+    if resolved_cgroup is None:
+        return []
+    now = int(time.time())
+    blocked: list[str] = []
+    rows = conn.execute(
+        "SELECT t.id, t.claim_lock, t.worker_pid, t.current_run_id, r.worker_start_ticks, "
+        "r.d_state_since, r.resource_sample FROM tasks t "
+        "JOIN task_runs r ON r.id=t.current_run_id "
+        "WHERE t.status='running' AND t.worker_pid IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        try:
+            previous = json.loads(row["resource_sample"] or "{}")
+        except (TypeError, ValueError):
+            previous = {}
+        try:
+            process = monitor.probe_process(
+                int(row["worker_pid"]), expected_start_ticks=row["worker_start_ticks"]
+            )
+            sample = monitor.probe_cgroup(resolved_cgroup, previous=previous)
+        except Exception as exc:
+            process = {"supported": True, "errors": [f"probe:{type(exc).__name__}"]}
+            sample = {"supported": False, "errors": []}
+        errors = list(process.get("errors") or []) + list(sample.get("errors") or [])
+        error_count = int(previous.get("monitoring_error_count", 0))
+        if errors:
+            error_count += 1
+            sample["monitoring_error_count"] = error_count
+            if error_count & (error_count - 1) == 0:
+                error_payload = {"count": error_count, "errors": errors}
+                _log.warning(
+                    "kanban resource monitor error for task %s (sample %d): %s",
+                    row["id"], error_count, ", ".join(errors),
+                )
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "monitoring_error", error_payload,
+                        run_id=int(row["current_run_id"]),
+                    )
+        if not process.get("identity_matches", True):
+            _log.warning("kanban resource monitor: task %s PID identity mismatch", row["id"])
+            continue
+        is_d = process.get("state") == "D"
+        d_since = int(row["d_state_since"]) if row["d_state_since"] is not None else None
+        if is_d and d_since is None:
+            d_since = now
+        elif not is_d:
+            d_since = None
+        high_ratio = sample.get("high_ratio")
+        high_delta = int((sample.get("events_delta") or {}).get("high", 0))
+        psi = float((sample.get("pressure") or {}).get("some_avg10", 0.0))
+        pressure_rising = high_delta >= max(1, high_event_delta) or psi >= psi_some_avg10
+        at_high = high_ratio is not None and float(high_ratio) >= memory_high_ratio
+        sustained_d = is_d and d_since is not None and now - d_since >= max(1, d_state_seconds)
+        resource_stalled = sustained_d and (at_high or pressure_rising)
+        encoded = json.dumps(sample, sort_keys=True, separators=(",", ":"))[:8192]
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET d_state_since=?, resource_sample=? WHERE id=?",
+                (d_since, encoded, int(row["current_run_id"])),
+            )
+        if not resource_stalled:
+            continue
+        payload = {
+            "kind": "resource_stalled", "process": process, "cgroup": sample,
+            "d_state_seconds": now - int(d_since),
+        }
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn
+        )
+        payload["termination"] = termination
+        termination_pending = _worker_survived_termination(termination)
+        termination_pending_since = now if termination_pending else None
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status='blocked', "
+                "block_kind='capability', claim_expires=NULL "
+                "WHERE id=? AND status='running' AND current_run_id=?",
+                (row["id"], row["current_run_id"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            conn.execute(
+                "UPDATE task_runs SET termination_pending_since=? WHERE id=?",
+                (termination_pending_since, int(row["current_run_id"])),
+            )
+            run_outcome = "termination_pending" if termination_pending else "resource_stalled"
+            run_metadata = (
+                {"resource_stall": payload, "termination": termination}
+                if termination_pending else payload
+            )
+            run_id = _end_run(
+                conn, row["id"], outcome=run_outcome, status="blocked",
+                error=run_outcome, metadata=run_metadata,
+            )
+            _append_event(conn, row["id"], "resource_stalled", payload, run_id=run_id)
+            _append_event(
+                conn, row["id"], "blocked",
+                {"reason": "resource_stalled", "kind": "capability"}, run_id=run_id,
+            )
+            if termination_pending:
+                _append_event(
+                    conn, row["id"], "termination_pending",
+                    {"pid": int(row["worker_pid"]), "since": now, **termination},
+                    run_id=run_id,
+                )
+            blocked.append(row["id"])
+    return blocked
 
 
 def enforce_max_runtime(
@@ -7953,7 +8112,7 @@ def detect_stale_running(
     stale_timeout_seconds: int = 0,
     signal_fn=None,
 ) -> list[str]:
-    """Reclaim ``running`` tasks that show no progress (heartbeat) within the
+    """Reclaim ``running`` tasks that show no semantic progress within the
     staleness window.
 
     A task is considered stale when BOTH of these hold:
@@ -7961,8 +8120,8 @@ def detect_stale_running(
     1. It has been running for longer than ``stale_timeout_seconds``
        (measured from the active run's ``started_at``, falling back to
        ``tasks.started_at`` on older runs).
-    2. Its ``last_heartbeat_at`` is older than
-       ``_STALE_HEARTBEAT_GAP_SECONDS`` (or NULL — never sent a heartbeat).
+    2. Its ``last_semantic_progress_at`` is older than the same window.
+       Automatic liveness heartbeats deliberately do not reset this clock.
 
     On reclaim the task is reset to ``ready``, the run is closed with
     ``outcome='stale'``, and the host-local worker (if still running) is
@@ -7984,7 +8143,8 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, "
+        "       t.last_semantic_progress_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -8000,10 +8160,14 @@ def detect_stale_running(
         if elapsed < stale_timeout_seconds:
             continue  # not old enough to check
 
+        last_progress = row["last_semantic_progress_at"]
+        progress_age = (
+            now - int(last_progress) if last_progress is not None else elapsed
+        )
+        if progress_age < stale_timeout_seconds:
+            continue
         last_hb = row["last_heartbeat_at"]
         hb_age = (now - int(last_hb)) if last_hb is not None else None
-        if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
-            continue  # recent heartbeat → still alive
 
         pid = row["worker_pid"]
         tid = row["id"]
@@ -8043,6 +8207,10 @@ def detect_stale_running(
                 "heartbeat_age_seconds": (
                     int(hb_age) if hb_age is not None else None
                 ),
+                "last_semantic_progress_at": (
+                    int(last_progress) if last_progress is not None else None
+                ),
+                "semantic_progress_age_seconds": int(progress_age),
                 "timeout_seconds": stale_timeout_seconds,
                 "pid": int(pid) if pid else None,
             }
@@ -8483,13 +8651,17 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
-
-    The event's payload carries the pid so a human reading ``hermes kanban
-    tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
-    """
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    start_ticks: Optional[int] = None,
+) -> None:
+    """Bind the spawned PID to its Linux process start time."""
+    if start_ticks is None:
+        from hermes_cli.kanban_resource_monitor import process_start_ticks
+        start_ticks = process_start_ticks(int(pid))
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
@@ -8498,10 +8670,13 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+                "UPDATE task_runs SET worker_pid = ?, worker_start_ticks = ? WHERE id = ?",
+                (int(pid), start_ticks, run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        payload = {"pid": int(pid)}
+        if start_ticks is not None:
+            payload["start_ticks"] = start_ticks
+        _append_event(conn, task_id, "spawned", payload, run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -8713,6 +8888,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    resource_monitor: Optional[dict[str, Any]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8747,6 +8923,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            resource_monitor=resource_monitor,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8763,6 +8940,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            resource_monitor=resource_monitor,
         )
 
 
@@ -8779,6 +8957,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    resource_monitor: Optional[dict[str, Any]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8813,6 +8992,16 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    if resource_monitor and resource_monitor.get("enabled", False):
+        monitor_args = {
+            key: resource_monitor[key]
+            for key in (
+                "cgroup_path", "d_state_seconds", "memory_high_ratio",
+                "psi_some_avg10", "high_event_delta",
+            )
+            if key in resource_monitor
+        }
+        result.resource_stalled = detect_resource_stalls(conn, **monitor_args)
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,

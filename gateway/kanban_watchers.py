@@ -876,6 +876,9 @@ class GatewayKanbanWatchersMixin:
 
         # Read stale_timeout_seconds — 0 disables stale detection.
         raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
+        resource_monitor = kanban_cfg.get("resource_monitor", {})
+        if not isinstance(resource_monitor, dict):
+            resource_monitor = {}
         try:
             stale_timeout_seconds = int(raw_stale or 0)
         except (TypeError, ValueError):
@@ -1022,6 +1025,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    resource_monitor=resource_monitor,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
