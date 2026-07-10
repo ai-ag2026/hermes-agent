@@ -3911,6 +3911,220 @@ def claim_review_task(
         return claimed
 
 
+VALID_REVIEW_DECISIONS = frozenset({"ACCEPT", "NEEDS_REPAIR", "BLOCK"})
+
+
+def _pending_review_request(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict]:
+    """Return the latest unmatched ``review_requested`` payload, if any."""
+    row = conn.execute(
+        """
+        SELECT kind, payload
+          FROM task_events
+         WHERE task_id = ?
+           AND kind IN ('review_requested', 'review_decided')
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if row is None or row["kind"] != "review_requested":
+        return None
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def request_task_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reviewer: str,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Atomically hand an implementation run to the first-class review lane.
+
+    The same task is reassigned to ``reviewer`` and moved to ``review``; no
+    dependency child is created, so a review-waiting implementation cannot gate
+    its own reviewer. Repeating the same request while it is pending is a no-op.
+    """
+    reviewer_name = _canonical_assignee(reviewer)
+    if not reviewer_name:
+        raise ValueError("reviewer is required")
+    reviewer = reviewer_name
+    with write_txn(conn):
+        pending = _pending_review_request(conn, task_id)
+        row = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if pending is not None:
+            return row["status"] in {"review", "running"}
+        if row["status"] != "running":
+            return False
+        run_id = row["current_run_id"]
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            return False
+        implementation_assignee = row["assignee"]
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'review', assignee = ?,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+             WHERE id = ? AND status = 'running'
+            """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+            (reviewer, task_id)
+            if expected_run_id is None
+            else (reviewer, task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        closed_run_id = _end_run(
+            conn,
+            task_id,
+            outcome="review_requested",
+            status="review",
+            summary=summary,
+            metadata=metadata,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "review_requested",
+            {
+                "reviewer": reviewer,
+                "implementation_assignee": implementation_assignee,
+                "summary": (summary or "").strip().splitlines()[0][:400] or None,
+            },
+            run_id=closed_run_id,
+        )
+    _fire_kanban_lifecycle_hook(
+        "kanban_review_requested",
+        task_id,
+        board=get_current_board(),
+        assignee=reviewer,
+        run_id=closed_run_id,
+        summary=summary,
+    )
+    return True
+
+
+def decide_task_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision: str,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Atomically apply ``ACCEPT|NEEDS_REPAIR|BLOCK`` to a review run."""
+    decision = str(decision).strip().upper()
+    if decision not in VALID_REVIEW_DECISIONS:
+        raise ValueError(
+            f"review decision must be one of {sorted(VALID_REVIEW_DECISIONS)}"
+        )
+    now = int(time.time())
+    with write_txn(conn):
+        request = _pending_review_request(conn, task_id)
+        if request is None:
+            return False
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return False
+        run_id = row["current_run_id"]
+        if run_id is None:
+            return False
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            return False
+        implementation_assignee = request.get("implementation_assignee")
+        if not implementation_assignee:
+            return False
+        target_status = {
+            "ACCEPT": "done",
+            "NEEDS_REPAIR": "ready",
+            "BLOCK": "blocked",
+        }[decision]
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?, assignee = ?,
+                   completed_at = CASE WHEN ? = 'done' THEN ? ELSE NULL END,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                   block_kind = CASE WHEN ? = 'blocked' THEN 'needs_input' ELSE NULL END
+             WHERE id = ? AND status = 'running' AND current_run_id = ?
+            """,
+            (
+                target_status,
+                implementation_assignee,
+                target_status,
+                now,
+                target_status,
+                task_id,
+                int(run_id),
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        _end_run(
+            conn,
+            task_id,
+            outcome=decision.lower(),
+            status=target_status,
+            summary=summary,
+            metadata=metadata,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "review_decided",
+            {
+                "decision": decision,
+                "summary": (summary or "").strip().splitlines()[0][:400] or None,
+            },
+            run_id=run_id,
+        )
+        if decision == "ACCEPT":
+            _append_event(
+                conn,
+                task_id,
+                "completed",
+                {"summary": (summary or "").strip().splitlines()[0][:400] or None},
+                run_id=run_id,
+            )
+    if decision == "ACCEPT":
+        _clear_failure_counter(conn, task_id)
+        recompute_ready(conn)
+        _cleanup_workspace(conn, task_id)
+        hook_name = "kanban_task_completed"
+    elif decision == "NEEDS_REPAIR":
+        recompute_ready(conn)
+        hook_name = "kanban_review_needs_repair"
+    else:
+        hook_name = "kanban_task_blocked"
+    task = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        hook_name,
+        task_id,
+        board=get_current_board(),
+        assignee=task.assignee if task else None,
+        run_id=run_id,
+        summary=summary,
+        decision=decision,
+    )
+    return True
+
+
 def heartbeat_claim(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4359,6 +4573,12 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    # A pending first-class review can only reach ``done`` through an explicit
+    # ACCEPT decision. This prevents a reviewer run from bypassing the handshake
+    # by calling the generic completion path.
+    if _pending_review_request(conn, task_id) is not None:
+        return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5110,6 +5330,57 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+
+    # Dependency waits are a complete transition of their own. Keep the hook
+    # outside ``write_txn`` so subscribers can only observe committed state.
+    if kind == "dependency":
+        with write_txn(conn):
+            if expected_run_id is None:
+                params = (kind, task_id)
+                run_guard = ""
+            else:
+                params = (kind, task_id, int(expected_run_id))
+                run_guard = " AND current_run_id = ?"
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'todo', claim_lock = NULL,
+                       claim_expires = NULL, worker_pid = NULL, block_kind = ?
+                 WHERE id = ? AND status IN ('running', 'ready')
+                """ + run_guard,
+                params,
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="blocked",
+                status="blocked",
+                summary=reason,
+            )
+            if run_id is None and reason:
+                run_id = _synthesize_ended_run(
+                    conn, task_id, outcome="blocked", summary=reason,
+                )
+            _append_event(
+                conn,
+                task_id,
+                "dependency_wait",
+                {"reason": reason, "kind": kind},
+                run_id=run_id,
+            )
+            blocked_task = get_task(conn, task_id)
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=blocked_task.assignee if blocked_task else None,
+            run_id=run_id,
+            reason=reason,
+        )
+        return True
+
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
@@ -5126,52 +5397,6 @@ def block_task(
             and cur_row["block_recurrences"] is not None
             else 0
         )
-
-        # Dependency blocks never enter the human ``blocked`` bucket — they
-        # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
-        # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
-        if kind == "dependency":
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status        = 'todo',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
-                       block_kind    = ?
-                 WHERE id = ?
-                   AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
-            )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn, task_id,
-                outcome="blocked", status="blocked",
-                summary=reason,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
-                )
-            _append_event(
-                conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
-            )
-            routed_to = "todo"
-            _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_blocked",
-                task_id,
-                board=get_current_board(),
-                assignee=_blocked_task.assignee if _blocked_task else None,
-                run_id=run_id,
-                reason=reason,
-            )
-            return True
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
         # re-block for the SAME reason after a prior unblock. block_task only

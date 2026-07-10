@@ -55,7 +55,8 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_complete", "kanban_request_review",
+        "kanban_review_decide", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -135,7 +136,8 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_list",
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_complete", "kanban_request_review",
+        "kanban_review_decide", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
     }
@@ -309,6 +311,65 @@ def test_complete_happy_path(worker_env):
         assert run.metadata == {"files": 2}
     finally:
         conn.close()
+
+
+def test_request_review_and_accept_handlers(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    requested = json.loads(kt._handle_request_review({
+        "reviewer": "reviewer",
+        "summary": "implementation with tests",
+        "metadata": {"tests": ["pytest -q"]},
+    }))
+    assert requested["ok"] is True
+    assert requested["status"] == "review"
+
+    with kb.connect() as conn:
+        review = kb.claim_review_task(conn, worker_env)
+        assert review is not None
+        review_run_id = review.current_run_id
+    assert review_run_id is not None
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review_run_id))
+
+    decided = json.loads(kt._handle_review_decide({
+        "decision": "ACCEPT",
+        "summary": "ACCEPT: diff and tests verified",
+        "metadata": {"checks": ["git diff --check"]},
+    }))
+    assert decided["ok"] is True
+    assert decided["decision"] == "ACCEPT"
+    assert decided["status"] == "done"
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "done"
+        assert task.assignee == "test-worker"
+        assert kb.latest_run(conn, worker_env).outcome == "accept"
+
+
+def test_review_decide_handler_rejects_stale_run(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    assert json.loads(kt._handle_request_review({
+        "reviewer": "reviewer",
+        "summary": "implementation handoff",
+    }))["ok"] is True
+    with kb.connect() as conn:
+        review = kb.claim_review_task(conn, worker_env)
+        assert review is not None and review.current_run_id is not None
+        run_id = review.current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(int(run_id) + 1))
+    out = json.loads(kt._handle_review_decide({
+        "decision": "ACCEPT",
+        "summary": "stale review",
+    }))
+    assert "stale run" in out["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
 
 
 def test_complete_metadata_round_trips_through_show(worker_env):

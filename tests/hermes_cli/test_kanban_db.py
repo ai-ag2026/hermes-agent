@@ -5106,3 +5106,191 @@ class TestProtectedBranchGuard:
         subprocess.run(["git", "checkout", "-b", "integration"], cwd=repo, env=env,
                        check=True, capture_output=True)
         assert kb._is_protected_branch(repo, "integration") is True
+
+
+# ---------------------------------------------------------------------------
+# First-class review handshake / deterministic promotion (S2)
+# ---------------------------------------------------------------------------
+
+
+def _request_review(conn, tid, *, reviewer="reviewer"):
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    return kb.request_task_review(
+        conn,
+        tid,
+        reviewer=reviewer,
+        summary="implementation ready",
+        metadata={"tests": ["pytest -q"]},
+        expected_run_id=task.current_run_id,
+    )
+
+
+def test_review_request_is_dispatchable_and_idempotent(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implement", assignee="backend-eng")
+        implementation = kb.claim_task(conn, tid)
+        assert implementation is not None
+
+        assert _request_review(conn, tid) is True
+        assert _request_review(conn, tid) is True
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "review"
+        assert task.assignee == "reviewer"
+        assert task.current_run_id is None
+        requested = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"]
+        assert len(requested) == 1
+
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        assert review.status == "running"
+        assert review.assignee == "reviewer"
+        assert review.current_run_id is not None
+
+
+def test_pending_review_cannot_bypass_accept_with_complete(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implement", assignee="backend-eng")
+        kb.claim_task(conn, tid)
+        assert _request_review(conn, tid)
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="bypass",
+            expected_run_id=review.current_run_id,
+        ) is False
+        assert kb.get_task(conn, tid).status == "running"
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_status", "expected_assignee"),
+    [
+        ("ACCEPT", "done", "backend-eng"),
+        ("NEEDS_REPAIR", "ready", "backend-eng"),
+        ("BLOCK", "blocked", "backend-eng"),
+    ],
+)
+def test_review_decisions_are_atomic(
+    kanban_home, decision, expected_status, expected_assignee,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implement", assignee="backend-eng")
+        kb.claim_task(conn, tid)
+        assert _request_review(conn, tid)
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+
+        assert kb.decide_task_review(
+            conn,
+            tid,
+            decision=decision,
+            summary=f"review says {decision}",
+            metadata={"reviewer": "independent"},
+            expected_run_id=review.current_run_id,
+        ) is True
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == expected_status
+        assert task.assignee == expected_assignee
+        assert task.current_run_id is None
+        latest = kb.latest_run(conn, tid)
+        assert latest is not None
+        assert latest.outcome == decision.lower()
+        events = kb.list_events(conn, tid)
+        assert events[-1].kind in {"review_decided", "completed"}
+
+
+def test_stale_review_decision_is_rejected(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implement", assignee="backend-eng")
+        kb.claim_task(conn, tid)
+        assert _request_review(conn, tid)
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        assert kb.decide_task_review(
+            conn,
+            tid,
+            decision="ACCEPT",
+            summary="stale",
+            expected_run_id=int(review.current_run_id) + 1,
+        ) is False
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_dependency_block_hook_observes_committed_state(kanban_home, monkeypatch):
+    seen = []
+
+    def hook(_name, task_id, **_payload):
+        with kb.connect() as observer:
+            seen.append(kb.get_task(observer, task_id).status)
+
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", hook)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="waiting", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="parent outstanding",
+            kind="dependency",
+            expected_run_id=claimed.current_run_id,
+        ) is True
+    assert seen[-1] == "todo"
+
+
+def test_link_to_done_parent_promotes_child_immediately(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child")
+        assert kb.complete_task(conn, parent, summary="done")
+        kb.link_tasks(conn, parent, child)
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_create_with_done_parent_is_immediately_ready(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        assert kb.complete_task(conn, parent, summary="done")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        assert kb.get_task(conn, child).status == "ready"
+
+
+def test_recompute_does_not_promote_sticky_block(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="human decision", assignee="worker")
+        assert kb.block_task(conn, tid, reason="choose", kind="needs_input")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_archive_complete_race_leaves_one_consistent_terminal_state(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="race", assignee="worker")
+
+    def complete():
+        with kb.connect() as conn:
+            return kb.complete_task(conn, tid, summary="done")
+
+    def archive():
+        with kb.connect() as conn:
+            return kb.archive_task(conn, tid)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(complete), pool.submit(archive)]
+        won = [future.result() for future in futures]
+
+    # done -> archived is a legitimate explicit transition, so both operations
+    # may serialize successfully. The invariant is one final terminal state and
+    # no orphaned active run/claim regardless of ordering.
+    assert any(bool(result) for result in won)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status in {"done", "archived"}
+        assert task.current_run_id is None
+        assert task.claim_lock is None

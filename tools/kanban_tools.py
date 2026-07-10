@@ -665,6 +665,112 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
+def _redact_review_payload(summary: Any, metadata: Any):
+    clean_summary = redact_sensitive_text(str(summary), force=True) if summary else None
+    clean_metadata = metadata
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            return None, None, "metadata must be an object/dict"
+        encoded = redact_sensitive_text(json.dumps(metadata), force=True)
+        try:
+            clean_metadata = json.loads(encoded)
+        except json.JSONDecodeError:
+            clean_metadata = metadata
+    return clean_summary, clean_metadata, None
+
+
+def _handle_request_review(args: dict, **kw) -> str:
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    reviewer = args.get("reviewer")
+    if not reviewer or not str(reviewer).strip():
+        return tool_error("reviewer is required")
+    summary, metadata, payload_error = _redact_review_payload(
+        args.get("summary"), args.get("metadata")
+    )
+    if payload_error:
+        return tool_error(payload_error)
+    if not summary:
+        return tool_error("summary is required — provide the implementation handoff")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok = kb.request_task_review(
+                conn,
+                tid,
+                reviewer=str(reviewer),
+                summary=summary,
+                metadata=_stamp_worker_session_metadata(tid, metadata),
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not request review for {tid} (stale run or invalid state)"
+                )
+            task = kb.get_task(conn, tid)
+            return _ok(task_id=tid, status=task.status if task else None)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_request_review: {e}")
+    except Exception as e:
+        logger.exception("kanban_request_review failed")
+        return tool_error(f"kanban_request_review: {e}")
+
+
+def _handle_review_decide(args: dict, **kw) -> str:
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    decision = str(args.get("decision") or "").strip().upper()
+    summary, metadata, payload_error = _redact_review_payload(
+        args.get("summary"), args.get("metadata")
+    )
+    if payload_error:
+        return tool_error(payload_error)
+    if not summary:
+        return tool_error("summary is required — provide review evidence")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            if decision not in kb.VALID_REVIEW_DECISIONS:
+                return tool_error(
+                    f"decision must be one of {sorted(kb.VALID_REVIEW_DECISIONS)}"
+                )
+            ok = kb.decide_task_review(
+                conn,
+                tid,
+                decision=decision,
+                summary=summary,
+                metadata=_stamp_worker_session_metadata(tid, metadata),
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not decide review for {tid} (stale run or invalid state)"
+                )
+            task = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                decision=decision,
+                status=task.status if task else None,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_review_decide: {e}")
+    except Exception as e:
+        logger.exception("kanban_review_decide failed")
+        return tool_error(f"kanban_review_decide: {e}")
+
+
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     tid = _default_task_id(args.get("task_id"))
@@ -1287,6 +1393,64 @@ KANBAN_COMPLETE_SCHEMA = {
     },
 }
 
+KANBAN_REQUEST_REVIEW_SCHEMA = {
+    "name": "kanban_request_review",
+    "description": (
+        "Hand the current implementation run to an independent reviewer on the "
+        "same card. The implementation run closes, the card enters the review "
+        "lane, and no dependency child is created. Repeated requests are idempotent."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "reviewer": {
+                "type": "string",
+                "description": "Reviewer profile that should claim the review lane.",
+            },
+            "summary": {
+                "type": "string",
+                "description": "Implementation handoff and concrete verification evidence.",
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Optional structured changed-files/tests/evidence manifest.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["reviewer", "summary"],
+    },
+}
+
+KANBAN_REVIEW_DECIDE_SCHEMA = {
+    "name": "kanban_review_decide",
+    "description": (
+        "Close the current review run atomically with ACCEPT, NEEDS_REPAIR, or "
+        "BLOCK. ACCEPT alone completes the card; NEEDS_REPAIR returns it to the "
+        "implementer; BLOCK surfaces it for human action."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "decision": {
+                "type": "string",
+                "enum": ["ACCEPT", "NEEDS_REPAIR", "BLOCK"],
+            },
+            "summary": {
+                "type": "string",
+                "description": "Review verdict with concrete file/line and test evidence.",
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Optional structured review findings and checks.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["decision", "summary"],
+    },
+}
+
 KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
@@ -1615,6 +1779,24 @@ registry.register(
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
     emoji="✔",
+)
+
+registry.register(
+    name="kanban_request_review",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_REVIEW_SCHEMA,
+    handler=_handle_request_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔎",
+)
+
+registry.register(
+    name="kanban_review_decide",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_DECIDE_SCHEMA,
+    handler=_handle_review_decide,
+    check_fn=_check_kanban_mode,
+    emoji="⚖",
 )
 
 registry.register(
