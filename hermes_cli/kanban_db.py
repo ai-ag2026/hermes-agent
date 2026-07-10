@@ -8258,7 +8258,7 @@ def _default_spawn(
     *,
     board: Optional[str] = None,
 ) -> Optional[int]:
-    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
+    """Fire-and-forget ``hermes -p <profile> chat -Q -q ...`` subprocess.
 
     Returns the spawned child's PID so the dispatcher can detect crashes
     before the claim TTL expires. The child's completion is still observed
@@ -8401,6 +8401,12 @@ def _default_spawn(
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
+        # Kanban workers are automation, not interactive CLI sessions. The
+        # quiet one-shot branch retains the structured run result and maps a
+        # terminal provider quota/rate-limit to EX_TEMPFAIL (75), which the
+        # dispatcher reaper classifies as transient. Plain ``chat -q`` goes
+        # through ``HermesCLI.chat`` and discards that failure envelope.
+        "-Q",
         "-q", prompt,
     ])
     # Redirect output to a per-task log under <board-root>/logs/.

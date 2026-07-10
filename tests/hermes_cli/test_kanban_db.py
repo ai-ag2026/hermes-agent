@@ -938,6 +938,59 @@ def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
 
 
+def test_real_child_rate_limit_exit_reaps_into_transient_run(
+    kanban_home, monkeypatch,
+):
+    """Exercise the real Popen -> waitpid -> reaper -> ledger contract.
+
+    This deliberately does not call ``Popen.wait``/``poll`` because either would
+    reap the child before ``reap_worker_zombies`` can record its raw wait status.
+    ``waitid(..., WNOWAIT)`` blocks until exit while preserving the zombie for
+    the dispatcher reaper.
+    """
+    if os.name == "nt" or not all(
+        hasattr(os, attr) for attr in ("waitid", "P_PID", "WEXITED", "WNOWAIT")
+    ):
+        pytest.skip("requires POSIX waitid(..., WNOWAIT)")
+
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    _kb._recent_worker_exits.clear()
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="real rate-limit child", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_task(conn, tid, claimer=f"{host}:real-child")
+        assert claimed is not None
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", f"raise SystemExit({_kb.KANBAN_RATE_LIMIT_EXIT_CODE})"]
+        )
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (proc.pid, tid))
+        conn.commit()
+
+        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+        assert proc.pid in _kb.reap_worker_zombies()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+        assert tid in getattr(_kb.detect_crashed_workers, "_last_rate_limited", [])
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        run = conn.execute(
+            "SELECT status, outcome, error FROM task_runs WHERE task_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run["status"] == "rate_limited"
+        assert run["outcome"] == "rate_limited"
+        assert "rate-limited" in (run["error"] or "")
+
+
 def test_rate_limit_exit_requeues_without_counting_failure(
     kanban_home, monkeypatch,
 ):

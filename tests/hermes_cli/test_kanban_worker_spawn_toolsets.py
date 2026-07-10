@@ -88,6 +88,14 @@ agent:
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
         assert required in pinned
 
+    # Dispatcher workers must use the quiet one-shot branch. That is the branch
+    # which translates a terminal provider quota/rate-limit failure into the
+    # EX_TEMPFAIL sentinel consumed by the reaper; plain ``chat -q`` returns
+    # through the human CLI path and loses the structured failure result.
+    assert captured["cmd"][-4:] == [
+        "chat", "-Q", "-q", "work kanban task t_spawn_tools",
+    ]
+
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
