@@ -341,6 +341,19 @@ def test_link_keeps_ready_child_when_parent_already_done(kanban_home):
         assert kb.get_task(conn, b).status == "ready"
 
 
+def test_link_keeps_ready_child_when_parent_already_archived(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="archived parent")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        child = kb.create_task(conn, title="child")
+        assert kb.get_task(conn, child).status == "ready"
+
+        kb.link_tasks(conn, parent, child)
+
+        assert kb.get_task(conn, child).status == "ready"
+
+
 def test_link_rejects_self_loop(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
