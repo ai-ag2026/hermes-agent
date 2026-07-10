@@ -2661,6 +2661,16 @@ DEFAULT_CONFIG = {
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
         "auto_decompose_per_tick": 3,
+        # Authors whose triage cards the AUTO-decomposer must never touch
+        # (Kanban-Krise 2026-07-10 geparkter Repair-Punkt 8): the gateway's
+        # auto-decompose tick fanned out an operator-created notice card
+        # into a duplicate task chain after a needs_input-recurrence
+        # escalation routed it to triage. A card whose `created_by` is in
+        # this list stays in triage for a human/operator decision instead.
+        # Explicit decomposition (`hermes kanban decompose <id>` /
+        # `decompose_task(..., author=...)`) is UNAFFECTED — this only
+        # gates the unattended dispatcher-tick loop.
+        "operator_authors": ["claude-code", "manfred"],
         # Stale detection: running tasks that have exceeded this many
         # seconds without a heartbeat (since ``last_heartbeat_at``) are
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The

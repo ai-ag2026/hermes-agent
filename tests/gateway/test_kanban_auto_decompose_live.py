@@ -81,3 +81,44 @@ def test_live_toggle_takes_effect_between_calls():
     # User edits config.yaml mid-run.
     state["kanban"]["auto_decompose"] = False
     assert _resolve_auto_decompose_settings(lambda: state)[0] is False
+
+
+# ---------------------------------------------------------------------------
+# kanban.operator_authors (Kanban-Krise 2026-07-10 geparkter Repair-Punkt 8):
+# the AUTO-decomposer must never touch a triage card an operator author
+# created. _resolve_operator_authors mirrors _resolve_auto_decompose_settings
+# above -- read live every tick, fail-safe defaults on error.
+# ---------------------------------------------------------------------------
+
+from gateway.kanban_watchers import _resolve_operator_authors
+
+
+def test_operator_authors_default_when_key_absent():
+    authors = _resolve_operator_authors(lambda: {"kanban": {}})
+    assert authors == frozenset({"claude-code", "manfred"})
+
+
+def test_operator_authors_respects_config_override():
+    authors = _resolve_operator_authors(
+        lambda: {"kanban": {"operator_authors": ["ops-bot"]}}
+    )
+    assert authors == frozenset({"ops-bot"})
+
+
+def test_operator_authors_empty_list_disables_filter():
+    authors = _resolve_operator_authors(lambda: {"kanban": {"operator_authors": []}})
+    assert authors == frozenset()
+
+
+def test_operator_authors_malformed_value_falls_back_to_default():
+    authors = _resolve_operator_authors(
+        lambda: {"kanban": {"operator_authors": "not-a-list"}}
+    )
+    assert authors == frozenset({"claude-code", "manfred"})
+
+
+def test_operator_authors_config_read_error_falls_back_to_default():
+    def _boom():
+        raise RuntimeError("config read failed")
+
+    assert _resolve_operator_authors(_boom) == frozenset({"claude-code", "manfred"})

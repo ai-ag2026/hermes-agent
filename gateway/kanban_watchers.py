@@ -57,6 +57,92 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+def _resolve_operator_authors(load_config: Callable[[], Any]) -> "frozenset[str]":
+    """Resolve ``kanban.operator_authors`` — read live each tick, same as
+    :func:`_resolve_auto_decompose_settings`, so an operator can widen/narrow
+    the list without a gateway restart. Falls back to the config default
+    (``{"claude-code", "manfred"}``) on any read error or malformed value —
+    the auto-decomposer must never come back on for a card it was told to
+    leave alone just because a config read glitched.
+    """
+    default = frozenset({"claude-code", "manfred"})
+    try:
+        cfg = load_config()
+    except Exception:
+        return default
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    raw = kcfg.get("operator_authors", default)
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return default
+    authors = frozenset(str(a) for a in raw if a)
+    return authors
+
+
+# Triage card ids the auto-decomposer has already logged a skip for
+# (Kanban-Krise 2026-07-10 geparkter Repair-Punkt 8). Module-level and
+# process-lifetime: a card stays logged once even across dispatcher ticks,
+# so an operator card sitting untouched in triage doesn't spam the log
+# every tick. Resets on gateway restart, which is fine — worst case is one
+# extra log line.
+_operator_owned_skip_logged: "set[str]" = set()
+
+
+def _filter_operator_owned_triage_ids(
+    triage_ids: "list[str]",
+    *,
+    board_slug: str,
+    operator_authors: "frozenset[str]",
+    kb_module: Any,
+) -> "list[str]":
+    """Drop triage ids created_by an operator author from the AUTO-decompose
+    batch; explicit decomposition (CLI / decompose_task with another author)
+    is a separate call path and is untouched by this filter.
+
+    Fails open on lookup errors (returns ``triage_ids`` unchanged) — a DB
+    hiccup here must not silently wedge auto-decompose for an entire board;
+    worst case an operator card slips through on that one tick, same risk
+    profile as before this fix existed.
+    """
+    if not triage_ids or not operator_authors:
+        return triage_ids
+    conn = None
+    try:
+        conn = kb_module.connect(board=board_slug)
+        placeholders = ",".join(["?"] * len(triage_ids))
+        rows = conn.execute(
+            f"SELECT id, created_by FROM tasks WHERE id IN ({placeholders})",
+            tuple(triage_ids),
+        ).fetchall()
+        created_by_map = {r["id"]: r["created_by"] for r in rows}
+    except Exception:
+        logger.debug(
+            "kanban auto-decompose: operator-author lookup failed on board %s",
+            board_slug, exc_info=True,
+        )
+        return triage_ids
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    kept: "list[str]" = []
+    for tid in triage_ids:
+        created_by = created_by_map.get(tid)
+        if created_by and created_by in operator_authors:
+            if tid not in _operator_owned_skip_logged:
+                _operator_owned_skip_logged.add(tid)
+                logger.info(
+                    "kanban auto-decompose [%s]: %s skipped — operator-created "
+                    "(created_by=%r); left in triage for a human decision",
+                    board_slug, tid, created_by,
+                )
+            continue
+        kept.append(tid)
+    return kept
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -1172,6 +1258,14 @@ class GatewayKanbanWatchersMixin:
                             slug, exc,
                         )
                         triage_ids = []
+                    if triage_ids:
+                        operator_authors = _resolve_operator_authors(_load_config)
+                        triage_ids = _filter_operator_owned_triage_ids(
+                            triage_ids,
+                            board_slug=slug,
+                            operator_authors=operator_authors,
+                            kb_module=_kb,
+                        )
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break
