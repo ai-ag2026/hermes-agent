@@ -877,6 +877,40 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- audit / repair (invariant reconciler) ---
+    p_audit = sub.add_parser(
+        "audit",
+        help="Read-only invariant audit: task/run/event/claim/artifact-manifest consistency",
+    )
+    p_audit.add_argument("--json", action="store_true", help="Emit a JSON report")
+
+    p_repair = sub.add_parser(
+        "repair",
+        help="Reconcile mechanically-unambiguous invariant violations (dry-run by default)",
+        description=(
+            "Re-audits the board and applies ONLY the strict allowlist of "
+            "safe, idempotent, CAS-guarded repairs (stale todo/blocked "
+            "promotion, orphan claim release, durable-evidence reattach, "
+            "unambiguous run/task-completion reconciliation). Anything "
+            "contradictory or missing primary evidence is left as a typed "
+            "finding for a human — never an optimistic promotion or a "
+            "fabricated completion."
+        ),
+    )
+    p_repair.add_argument(
+        "--apply", action="store_true",
+        help="Actually apply safe repairs (default: dry-run, no writes)",
+    )
+    p_repair.add_argument(
+        "--actor", default=None,
+        help="Required with --apply: who authorized this repair",
+    )
+    p_repair.add_argument(
+        "--reason", default=None,
+        help="Required with --apply: why this repair is being applied",
+    )
+    p_repair.add_argument("--json", action="store_true", help="Emit a JSON report")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -993,6 +1027,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "audit":    _cmd_audit,
+            "repair":   _cmd_repair,
         }
         handler = handlers.get(action)
         if not handler:
@@ -2848,6 +2884,68 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     )
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+    return 0
+
+
+def _cmd_audit(args: argparse.Namespace) -> int:
+    """Read-only invariant audit — never writes to the database."""
+    from hermes_cli import kanban_repair as kr
+
+    with kb.connect_closing() as conn:
+        report = kr.run_audit(conn, board=kb.get_current_board())
+
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+        return 0
+
+    if not report.findings:
+        print(f"No invariant violations found ({report.scanned_tasks} task(s) scanned).")
+        return 0
+
+    print(
+        f"{len(report.findings)} finding(s) across {report.scanned_tasks} "
+        f"task(s) scanned:\n"
+    )
+    for f in report.findings:
+        marker = "→ safe repair" if f.bucket == "safe_repair" else "⚠ triage"
+        print(f"  {f.task_id}  [{f.kind}]  {marker}")
+        print(f"    {f.detail}")
+    return 0
+
+
+def _cmd_repair(args: argparse.Namespace) -> int:
+    """Dry-run by default; ``--apply`` requires ``--actor`` and ``--reason``."""
+    from hermes_cli import kanban_repair as kr
+
+    apply_mode = bool(getattr(args, "apply", False))
+    actor = getattr(args, "actor", None)
+    reason = getattr(args, "reason", None)
+    with kb.connect_closing() as conn:
+        try:
+            report = kr.run_repair(
+                conn,
+                dry_run=not apply_mode,
+                actor=actor,
+                reason=reason,
+                board=kb.get_current_board(),
+            )
+        except ValueError as exc:
+            print(f"kanban repair: {exc}", file=sys.stderr)
+            return 2
+
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+        return 0
+
+    mode = "DRY-RUN (no writes)" if report.dry_run else "APPLY"
+    print(
+        f"[{mode}] {len(report.results)} finding(s) considered, "
+        f"{report.applied_count()} applied\n"
+    )
+    for r in report.results:
+        f = r.finding
+        outcome = "applied" if r.applied else f"skipped ({r.reason})"
+        print(f"  {f.task_id}  [{f.kind}]  {outcome}")
     return 0
 
 
