@@ -12,6 +12,7 @@ Covers three layers:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -225,6 +226,11 @@ def test_loop_continues_then_worker_completes(monkeypatch):
 
 
 def test_loop_blocks_on_budget_exhaustion(monkeypatch):
+    # With a small budget (max_turns=3) and a work_budget of 2, turn 3 is the
+    # reserved closeout turn. The worker never finalizes, so this now lands
+    # on the typed terminal_step_not_taken outcome rather than a generic
+    # "blocked_budget" — see test_reserved_closeout_* below for the more
+    # targeted DoD coverage of that budget split.
     _patch_judge(monkeypatch, ["continue"] * 10)
     blocked = {}
 
@@ -240,9 +246,9 @@ def test_loop_blocks_on_budget_exhaustion(monkeypatch):
         max_turns=3,
         first_response="turn1",
     )
-    assert res["outcome"] == "blocked_budget"
+    assert res["outcome"] == "blocked_terminal_step_not_taken"
     assert res["turns_used"] == 3
-    assert "turn budget" in blocked["reason"].lower()
+    assert "closeout" in blocked["reason"].lower()
 
 
 def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
@@ -268,7 +274,8 @@ def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
 
 def test_loop_blocks_when_judge_done_but_never_finalizes(monkeypatch):
     # Judge keeps saying done, worker never calls kanban_complete → block
-    # after the single finalize nudge.
+    # after the single finalize nudge, typed as terminal_step_not_taken (the
+    # lifecycle call was never made even though the judge saw "done" twice).
     _patch_judge(monkeypatch, ["done", "done"])
     blocked = {}
 
@@ -281,7 +288,7 @@ def test_loop_blocks_when_judge_done_but_never_finalizes(monkeypatch):
         max_turns=10,
         first_response="looks done",
     )
-    assert res["outcome"] == "blocked_budget"
+    assert res["outcome"] == "blocked_terminal_step_not_taken"
     assert "finalize" in blocked["reason"].lower()
 
 
@@ -296,3 +303,485 @@ def test_loop_stops_if_task_reclaimed(monkeypatch):
         first_response="x",
     )
     assert res["outcome"] == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# S4: reserved closeout turn (DoD 1 + 2)
+# ---------------------------------------------------------------------------
+
+def test_reserved_closeout_turn_caps_ordinary_work(monkeypatch):
+    """max_turns=3 proves at most two work turns plus one reserved closeout
+    turn: turn 1 (first_response) + turn 2 (ordinary continuation) are work,
+    turn 3 must be the lifecycle-only closeout prompt — never a second
+    ordinary continuation."""
+    _patch_judge(monkeypatch, ["continue"] * 10)
+    prompts = []
+
+    def _run_turn(p):
+        prompts.append(p)
+        return f"work #{len(prompts)}"  # always a fresh response — no no_progress interference
+
+    blocked = {}
+    res = goals.run_kanban_goal_loop(
+        task_id="t7",
+        goal_text="task",
+        run_turn=_run_turn,
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.update(reason=r),
+        max_turns=3,
+        first_response="turn1",
+    )
+    assert res["outcome"] == "blocked_terminal_step_not_taken"
+    assert res["turns_used"] == 3
+    assert len(prompts) == 2
+    # The first fed prompt is ordinary continuation, the second (final) one
+    # is the lifecycle-only closeout prompt — never a repeat of ordinary
+    # continuation wording.
+    assert "Take the next concrete step" in prompts[0]
+    assert "reserved" in prompts[1].lower() and "closeout" in prompts[1].lower()
+    assert "Take the next concrete step" not in prompts[1]
+
+
+def test_reserved_closeout_turn_success_ends_normally(monkeypatch):
+    """A successful kanban_complete call made during the reserved closeout
+    turn ends the loop normally — no more prompts are fed afterward."""
+    _patch_judge(monkeypatch, ["continue"] * 10)
+    prompts = []
+    statuses = iter(["running", "running", "done"])
+
+    def _run_turn(p):
+        prompts.append(p)
+        return f"work #{len(prompts)}"
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t8",
+        goal_text="task",
+        run_turn=_run_turn,
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=3,
+        first_response="turn1",
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert res["turns_used"] == 3
+    assert len(prompts) == 2
+    assert "closeout" in prompts[1].lower()
+
+
+def test_reserved_closeout_never_receives_ordinary_continuation(monkeypatch):
+    """Even with a larger reserved corridor, once the loop enters closeout
+    phase it is never handed an ordinary continuation prompt again."""
+    _patch_judge(monkeypatch, ["continue"] * 10)
+    prompts = []
+
+    def _run_turn(p):
+        prompts.append(p)
+        return f"work #{len(prompts)}"
+
+    blocked = {}
+    res = goals.run_kanban_goal_loop(
+        task_id="t8b",
+        goal_text="task",
+        run_turn=_run_turn,
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.update(reason=r),
+        max_turns=5,
+        reserved_closeout_turns=2,
+        first_response="turn1",
+    )
+    assert res["outcome"] == "blocked_terminal_step_not_taken"
+    # work_budget = 5 - 2 = 3; turn 2 ordinary continuation (turn 1 =
+    # first_response fills the rest of work_budget), turns 3 and 4 spend
+    # the two reserved closeout-corridor turns before turn 5 is refused.
+    assert len(prompts) == 4
+    assert "closeout" in prompts[2].lower()
+    assert "closeout" in prompts[3].lower()
+    for p in prompts[2:]:
+        assert "Take the next concrete step" not in p
+
+
+def test_no_room_for_closeout_is_blocked_budget_not_terminal(monkeypatch):
+    """max_turns=1 leaves no room to even attempt the reserved closeout
+    turn — that's a configuration edge, not a worker failure, so it stays
+    the generic blocked_budget outcome."""
+    _patch_judge(monkeypatch, ["continue"])
+    res = goals.run_kanban_goal_loop(
+        task_id="t8c",
+        goal_text="task",
+        run_turn=lambda p: pytest.fail("no budget left for any turn"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: None,
+        max_turns=1,
+        first_response="turn1",
+    )
+    assert res["outcome"] == "blocked_budget"
+    assert res["turns_used"] == 1
+
+
+# ---------------------------------------------------------------------------
+# S4: WAIT barrier (DoD 3)
+# ---------------------------------------------------------------------------
+
+def test_wait_parks_without_spending_a_turn_then_resumes(monkeypatch):
+    """A valid WAIT (pid) directive must not increment turns_used, and the
+    loop must resume once the pid dies."""
+
+    def _fake_judge(goal, response, subgoals=None, background_processes=None, **_kw):
+        if not hasattr(_fake_judge, "n"):
+            _fake_judge.n = 0
+        _fake_judge.n += 1
+        if _fake_judge.n == 1:
+            return "wait", "waiting on background build", False, {"pid": 4242}
+        return "continue", "resumed", False, None
+
+    monkeypatch.setattr(goals, "judge_goal", _fake_judge)
+
+    alive = {"value": True}
+    monkeypatch.setattr(goals, "_pid_alive", lambda pid: alive["value"])
+
+    sleeps = []
+
+    def _sleep(seconds):
+        sleeps.append(seconds)
+        alive["value"] = False  # barrier clears on the first poll
+
+    clock = {"t": 0.0}
+
+    def _monotonic():
+        return clock["t"]
+
+    events = []
+    prompts = []
+    statuses = iter(["running", "running", "done"])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t9",
+        goal_text="task",
+        run_turn=lambda p: prompts.append(p) or "ok",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="turn1",
+        sleep_fn=_sleep,
+        monotonic_fn=_monotonic,
+        emit_progress=events.append,
+    )
+    assert res["outcome"] == "completed_by_worker"
+    # Only one ordinary continuation turn actually ran — the WAIT round
+    # burned no turn at all.
+    assert res["turns_used"] == 2
+    assert len(sleeps) == 1
+    phases = [e["phase"] for e in events]
+    assert "wait" in phases
+    assert "wait_cleared" in phases
+
+
+def test_wait_barrier_gives_up_after_max_wait_seconds(monkeypatch):
+    """A pid that never dies must not hang the loop forever — it resumes
+    once the bounded max_wait_seconds ceiling is hit."""
+
+    def _fake_judge(goal, response, subgoals=None, background_processes=None, **_kw):
+        if not hasattr(_fake_judge, "n"):
+            _fake_judge.n = 0
+        _fake_judge.n += 1
+        if _fake_judge.n == 1:
+            return "wait", "waiting forever", False, {"pid": 999}
+        return "continue", "gave up waiting", False, None
+
+    monkeypatch.setattr(goals, "judge_goal", _fake_judge)
+    monkeypatch.setattr(goals, "_pid_alive", lambda pid: True)  # never dies
+
+    clock = {"t": 0.0}
+
+    def _monotonic():
+        return clock["t"]
+
+    def _sleep(seconds):
+        clock["t"] += seconds
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t10",
+        goal_text="task",
+        run_turn=lambda p: "ok",
+        task_status_fn=lambda: "done" if getattr(_fake_judge, "n", 0) > 1 else "running",
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="turn1",
+        sleep_fn=_sleep,
+        monotonic_fn=_monotonic,
+        max_wait_seconds=30.0,
+        wait_poll_seconds=10.0,
+    )
+    assert res["outcome"] == "completed_by_worker"
+    # Bounded: at most ceiling/poll_interval + 1 polls happened before giving up.
+    assert clock["t"] <= 40.0
+
+
+def test_invalid_wait_directive_degrades_to_continue_without_hanging(monkeypatch):
+    """A WAIT verdict with no usable pid/seconds must not park forever — it
+    degrades to a normal continue turn instead."""
+    calls = {"sleep": 0}
+
+    def _fake_judge(goal, response, subgoals=None, background_processes=None, **_kw):
+        if not hasattr(_fake_judge, "n"):
+            _fake_judge.n = 0
+        _fake_judge.n += 1
+        if _fake_judge.n == 1:
+            return "wait", "no target given", False, {}
+        return "continue", "ok", False, None
+
+    monkeypatch.setattr(goals, "judge_goal", _fake_judge)
+
+    statuses = iter(["running", "done"])
+    prompts = []
+    res = goals.run_kanban_goal_loop(
+        task_id="t11",
+        goal_text="task",
+        run_turn=lambda p: prompts.append(p) or "ok",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="turn1",
+        sleep_fn=lambda s: calls.__setitem__("sleep", calls["sleep"] + 1),
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert calls["sleep"] == 0  # never actually parked
+    assert len(prompts) == 1
+
+
+# ---------------------------------------------------------------------------
+# S4: no_progress classification (DoD 4)
+# ---------------------------------------------------------------------------
+
+def test_repeated_identical_response_is_typed_no_progress(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"] * 20)
+    blocked = {}
+    res = goals.run_kanban_goal_loop(
+        task_id="t12",
+        goal_text="task",
+        run_turn=lambda p: "same prose every time",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.update(reason=r),
+        max_turns=20,
+        no_progress_limit=2,
+        first_response="same prose every time",
+    )
+    assert res["outcome"] == "blocked_no_progress"
+    # Caught well before the numeric budget (20) or reserved closeout (19).
+    assert res["turns_used"] < 19
+    assert "no detectable" in blocked["reason"].lower()
+
+
+def test_real_delta_resets_no_progress_counter(monkeypatch):
+    """A genuine workspace/test-manifest delta reported via progress_fn must
+    reset the no-progress counter even if the response text repeats."""
+    _patch_judge(monkeypatch, ["continue"] * 20)
+    deltas = iter([
+        {"workspace_fingerprint": "a"},
+        {"workspace_fingerprint": "a"},  # repeat -> would trip at limit=2
+        {"workspace_fingerprint": "b"},  # real delta -> resets counter
+        {"workspace_fingerprint": "b"},
+    ])
+    statuses = iter(["running", "running", "running", "running", "done"])
+    res = goals.run_kanban_goal_loop(
+        task_id="t13",
+        goal_text="task",
+        run_turn=lambda p: "same prose every time",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail(f"should not block: {r}"),
+        max_turns=20,
+        no_progress_limit=2,
+        first_response="same prose every time",
+        progress_fn=lambda: next(deltas, {"workspace_fingerprint": "b"}),
+    )
+    assert res["outcome"] == "completed_by_worker"
+
+
+# ---------------------------------------------------------------------------
+# S4: terminal_step_not_taken before hitting a large numeric budget (DoD 5)
+# ---------------------------------------------------------------------------
+
+def test_terminal_step_not_taken_before_large_budget_exhausted(monkeypatch):
+    """Mirrors the real incident (a card dying 90/90 with usable artifacts
+    but no reserved closeout corridor): with a large max_turns, varying
+    responses (so no_progress never trips) still end in a typed
+    terminal_step_not_taken once the reserved closeout turn is spent, not a
+    bare numeric exhaustion."""
+    _patch_judge(monkeypatch, ["continue"] * 200)
+    prompts = []
+
+    def _run_turn(p):
+        prompts.append(p)
+        return f"turn #{len(prompts)} distinct output"
+
+    blocked = {}
+    res = goals.run_kanban_goal_loop(
+        task_id="t14",
+        goal_text="task",
+        run_turn=_run_turn,
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.update(reason=r),
+        max_turns=90,
+        first_response="turn1",
+    )
+    assert res["outcome"] == "blocked_terminal_step_not_taken"
+    assert res["turns_used"] == 90
+    assert "closeout" in prompts[-1].lower()
+
+
+# ---------------------------------------------------------------------------
+# S4: classified run_turn failure retries (DoD 6)
+# ---------------------------------------------------------------------------
+
+def test_transient_failure_is_retried_and_recovers(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"] * 10)
+    attempts = {"n": 0}
+    sleeps = []
+
+    def _run_turn(p):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise goals.KanbanTransientTurnError("429 rate limited")
+        return "recovered"
+
+    statuses = iter(["running", "done"])
+    res = goals.run_kanban_goal_loop(
+        task_id="t15",
+        goal_text="task",
+        run_turn=_run_turn,
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="turn1",
+        sleep_fn=sleeps.append,
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert attempts["n"] == 2
+    assert len(sleeps) == 1  # one bounded backoff before recovering
+
+
+def test_deterministic_failure_gets_exactly_one_retry(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"] * 10)
+    attempts = {"n": 0}
+
+    def _run_turn(p):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise ValueError("unexpected tool schema mismatch")
+        return "recovered after one retry"
+
+    statuses = iter(["running", "done"])
+    res = goals.run_kanban_goal_loop(
+        task_id="t16",
+        goal_text="task",
+        run_turn=_run_turn,
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="turn1",
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert attempts["n"] == 2
+
+
+def test_repeated_identical_failure_fingerprint_escalates_to_triage(monkeypatch):
+    """A second occurrence of the SAME failure must not be blind-retried
+    again — it escalates straight to triage."""
+    _patch_judge(monkeypatch, ["continue"] * 10)
+    blocked = {}
+
+    def _run_turn(p):
+        raise ValueError("same deterministic bug every time")
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t17",
+        goal_text="task",
+        run_turn=_run_turn,
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.update(reason=r),
+        max_turns=10,
+        first_response="turn1",
+    )
+    assert res["outcome"] == "blocked_triage"
+    assert "same" in blocked["reason"].lower()
+
+
+def test_changed_failure_after_retry_keeps_going(monkeypatch):
+    """A different failure on the retry (changed strategy / a new transient
+    blip) is not the "identical second fingerprint" case — it may keep
+    going through its own classification instead of being force-escalated."""
+    _patch_judge(monkeypatch, ["continue"] * 10)
+    attempts = {"n": 0}
+
+    def _run_turn(p):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise ValueError("first distinct failure")
+        if attempts["n"] == 2:
+            raise ValueError("a completely different failure message")
+        return "finally recovered"
+
+    statuses = iter(["running", "done"])
+    res = goals.run_kanban_goal_loop(
+        task_id="t18",
+        goal_text="task",
+        run_turn=_run_turn,
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail(f"should not block: {r}"),
+        max_turns=10,
+        first_response="turn1",
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert attempts["n"] == 3
+
+
+def test_transient_retries_exhausted_with_evidence_routes_to_resume_closeout(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"] * 10)
+    blocked = {}
+    n = {"i": 0}
+
+    def _run_turn(p):
+        n["i"] += 1
+        raise goals.KanbanTransientTurnError(f"timeout attempt {n['i']}")
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t19",
+        goal_text="task",
+        run_turn=_run_turn,
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.update(reason=r),
+        max_turns=10,
+        max_transient_retries=2,
+        first_response="already produced something",
+        sleep_fn=lambda s: None,
+    )
+    assert res["outcome"] == "blocked_resume_closeout"
+
+
+# ---------------------------------------------------------------------------
+# S4: bounded, secret-free progress/budget telemetry (DoD 7)
+# ---------------------------------------------------------------------------
+
+def test_emit_progress_events_are_bounded_and_secret_free(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"] * 10)
+    events = []
+    secret = "sk-super-secret-token-should-never-appear-1234567890"
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t20",
+        goal_text="task",
+        run_turn=lambda p: f"response containing {secret}",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: None,
+        max_turns=4,
+        first_response=f"response containing {secret}",
+        emit_progress=events.append,
+    )
+    assert events  # at least one event was emitted
+    for ev in events:
+        blob = json.dumps(ev)
+        assert secret not in blob
+        assert len(blob) < 4000  # bounded payload, no unbounded response echo
+        assert "turns_used" in ev and "max_turns" in ev
+        assert "verdict_history" in ev
+        assert len(ev["verdict_history"]) <= 5

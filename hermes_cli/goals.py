@@ -29,13 +29,14 @@ Nothing in this module touches the agent's system prompt or toolset.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -1618,9 +1619,19 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "stop without calling one of them."
 )
 
+# Appended to an ordinary continuation prompt once the work budget is
+# running low, so the worker gets an explicit heads-up before it hits the
+# reserved closeout turn — a soft limit ahead of the hard one.
+KANBAN_GOAL_SOFT_LIMIT_SUFFIX = (
+    "\n\n[Budget notice: {used}/{max} turns used, {remaining} ordinary work "
+    "turn(s) left before the reserved closeout turn. Start wrapping up now "
+    "so you have something concrete to hand off.]"
+)
+
 # Fed when the judge believes the work is done but the worker never called
 # kanban_complete / kanban_block. One explicit nudge to terminate the task
-# the right way before the loop gives up.
+# the right way before the loop gives up. This consumes the reserved
+# closeout turn — see ``run_kanban_goal_loop``.
 KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "[The work looks complete, but the task is still open]\n"
     "Reason: {reason}\n\n"
@@ -1628,6 +1639,159 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "summary of what you did. If something still blocks completion, call "
     "kanban_block with the reason instead."
 )
+
+# Fed on the reserved closeout turn when the work budget ran out before the
+# judge ever saw a "done" response. This is a lifecycle-only turn: no new
+# work, just terminate the task honestly with whatever evidence exists.
+KANBAN_GOAL_CLOSEOUT_TEMPLATE = (
+    "[Closeout — this is the reserved final turn for this task]\n"
+    "Reason: {reason}\n\n"
+    "Your ordinary work budget is used up. This turn is reserved exclusively "
+    "for wrapping up: call kanban_complete with an honest summary of what you "
+    "actually accomplished (partial progress counts — describe it plainly), "
+    "or call kanban_block with the reason you could not finish. Do not start "
+    "new work and do not reply with prose alone — call kanban_complete or "
+    "kanban_block this turn."
+)
+
+
+DEFAULT_RESERVED_CLOSEOUT_TURNS = 1
+DEFAULT_NO_PROGRESS_LIMIT = 2
+DEFAULT_MAX_TRANSIENT_RETRIES = 3
+DEFAULT_WAIT_POLL_SECONDS = 5.0
+DEFAULT_MAX_WAIT_SECONDS = 900.0
+# Overall safety valve across ALL run_turn retries in one loop, regardless
+# of classification — guards against a pathological "always slightly
+# different error message" defeating the repeat-fingerprint check forever.
+_GOAL_MAX_TOTAL_TURN_RETRIES = 5
+# How many recent judge verdicts ride along in emitted progress events.
+# Bounded so the payload can never grow unbounded across a long-running loop.
+_GOAL_VERDICT_HISTORY_LIMIT = 5
+# Judge reasons are free text from an auxiliary model; cap what we persist.
+_GOAL_PROGRESS_REASON_LIMIT = 200
+
+
+class KanbanTurnError(Exception):
+    """Raised by an injected ``run_turn`` to report a classified turn failure.
+
+    Subclass with :class:`KanbanTransientTurnError` for infrastructure /
+    cooldown failures the loop should retry. A plain ``KanbanTurnError`` (or
+    any other exception ``run_turn`` happens to raise) is treated as a
+    deterministic protocol failure — no blind retry, see
+    ``_classify_turn_error``.
+    """
+
+
+class KanbanTransientTurnError(KanbanTurnError):
+    """A run_turn failure classified as transient (rate limit, timeout, ...)."""
+
+
+# Substring markers used to classify an *unclassified* exception (one that
+# isn't already a ``KanbanTurnError``) as transient infrastructure trouble
+# rather than a deterministic protocol failure. Best-effort only — callers
+# that can tell the difference authoritatively should raise
+# ``KanbanTransientTurnError`` / ``KanbanTurnError`` directly instead of
+# relying on message sniffing.
+_TRANSIENT_ERROR_MARKERS = (
+    "rate limit", "rate_limit", "ratelimit", "429", "502", "503", "504",
+    "timeout", "timed out", "temporarily unavailable", "connection reset",
+    "connection error", "overloaded", "cooldown", "quota",
+)
+
+
+def _failure_fingerprint(exc: BaseException) -> str:
+    """Bounded, content-free identifier for a run_turn failure.
+
+    Used to detect a second *identical* failure so the loop can stop
+    blind-retrying and escalate to triage instead of looping forever on the
+    same defect. Never carries raw content — only a hash of the exception's
+    class name and the first 200 characters of its message.
+    """
+    text = f"{type(exc).__name__}:{str(exc)[:200]}"
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _classify_turn_error(exc: BaseException) -> str:
+    """Return ``"transient"`` or ``"deterministic"`` for a run_turn failure."""
+    if isinstance(exc, KanbanTransientTurnError):
+        return "transient"
+    if isinstance(exc, KanbanTurnError):
+        return "deterministic"
+    text = str(exc).lower()
+    if any(marker in text for marker in _TRANSIENT_ERROR_MARKERS):
+        return "transient"
+    return "deterministic"
+
+
+def _response_fingerprint(response: str) -> str:
+    """Bounded, content-free fingerprint of a worker response."""
+    return hashlib.sha256((response or "").encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _valid_wait_directive(directive: Optional[Dict[str, Any]]) -> bool:
+    """Whether a judge-supplied wait directive names something concrete to
+    park on. Anything else (empty dict, non-positive pid/seconds, garbage
+    types) is invalid — the caller must fail safe rather than park forever.
+    """
+    if not isinstance(directive, dict):
+        return False
+    pid = directive.get("pid")
+    if pid is not None:
+        try:
+            return int(pid) > 0
+        except (TypeError, ValueError):
+            return False
+    seconds = directive.get("seconds")
+    if seconds is not None:
+        try:
+            return int(seconds) > 0
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def _park_on_wait_barrier(
+    directive: Dict[str, Any],
+    *,
+    heartbeat_fn: Optional[Callable[[], None]],
+    sleep_fn: Callable[[float], None],
+    monotonic_fn: Callable[[], float],
+    poll_seconds: float,
+    max_wait_seconds: float,
+    log: Callable[[str], None],
+) -> None:
+    """Block (via ``sleep_fn``) until a valid wait barrier clears.
+
+    Polls at ``poll_seconds`` intervals and calls ``heartbeat_fn`` on every
+    poll so a caller can keep a kanban claim TTL alive while parked. Bounded
+    by ``max_wait_seconds`` overall — a barrier that never clears (a pid that
+    never dies, a clock that never advances in a broken test) still returns
+    instead of hanging the loop forever; the caller resumes normal judging
+    one turn early, which is safe.
+    """
+    pid = directive.get("pid")
+    seconds = directive.get("seconds")
+    start = monotonic_fn()
+    deadline = start + int(seconds) if seconds else None
+    ceiling = start + max_wait_seconds
+    while True:
+        now = monotonic_fn()
+        if pid is not None and not _pid_alive(int(pid)):
+            return
+        if deadline is not None and now >= deadline:
+            return
+        if now >= ceiling:
+            log(
+                f"kanban goal loop: wait barrier exceeded max_wait_seconds "
+                f"({max_wait_seconds}s); resuming"
+            )
+            return
+        if heartbeat_fn is not None:
+            try:
+                heartbeat_fn()
+            except Exception as exc:
+                log(f"kanban goal loop: heartbeat_fn failed while waiting ({exc})")
+        sleep_fn(poll_seconds)
 
 
 def run_kanban_goal_loop(
@@ -1640,6 +1804,16 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    reserved_closeout_turns: int = DEFAULT_RESERVED_CLOSEOUT_TURNS,
+    no_progress_limit: int = DEFAULT_NO_PROGRESS_LIMIT,
+    max_transient_retries: int = DEFAULT_MAX_TRANSIENT_RETRIES,
+    progress_fn: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
+    emit_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    heartbeat_fn: Optional[Callable[[], None]] = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+    wait_poll_seconds: float = DEFAULT_WAIT_POLL_SECONDS,
+    max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -1654,19 +1828,43 @@ def run_kanban_goal_loop(
        title + body). ``continue`` → feed a continuation prompt and run
        another turn IN THE SAME SESSION via ``run_turn``. ``done`` but the
        task is still open → one explicit "call kanban_complete" nudge.
-    3. When the turn budget is exhausted and the worker still hasn't
+       ``wait`` with a concrete pid/seconds directive → park without
+       spending a turn until the barrier clears; an invalid directive
+       degrades to ``continue`` instead of parking forever.
+    3. The last ``reserved_closeout_turns`` of the budget (default 1) are
+       set aside for lifecycle-only wrap-up: once ordinary work turns run
+       out (or the judge says "done"), the loop stops feeding ordinary
+       continuation prompts and instead demands a ``kanban_complete`` /
+       ``kanban_block`` call. Ordinary work never gets to spend that turn.
+    4. Repeated, indistinguishable turns (same response, same verdict, no
+       task/event/workspace/test delta reported via ``progress_fn``) are
+       recognized as ``no_progress`` and blocked early — burning the rest
+       of the budget on identical prose helps no one.
+    5. ``run_turn`` failures are classified transient (retried, bounded) vs
+       deterministic (retried once, not blindly). A second occurrence of the
+       *same* failure fingerprint escalates straight to triage instead of
+       retrying again.
+    6. When the turn budget is exhausted and the worker still hasn't
        terminated the task, ``block_fn`` is invoked so the card lands in a
        sticky ``blocked`` state for human review (NOT a silent exit).
 
     This function performs NO SessionDB persistence — a worker process is
     ephemeral, so the turn budget lives in a local counter. It is fully
     decoupled from the CLI for testability: callers inject ``run_turn``
-    (str -> str), ``task_status_fn`` (() -> str|None), and ``block_fn``
-    (reason: str -> None).
+    (str -> str, may raise ``KanbanTurnError``/``KanbanTransientTurnError``
+    or any exception), ``task_status_fn`` (() -> str|None), and ``block_fn``
+    (reason: str -> None). ``progress_fn``, ``emit_progress``,
+    ``heartbeat_fn``, ``sleep_fn``, and ``monotonic_fn`` are optional
+    injection points with safe no-op / real-clock defaults; callers that
+    want dispatcher-visible budget/progress telemetry or claim-TTL renewal
+    while parked wire them in (see ``cli._run_kanban_goal_loop_q``).
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
-    outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    outcome is one of ``"completed_by_worker"``, ``"blocked_by_worker"``,
+    ``"blocked_budget"`` (exhausted before a closeout turn could even be
+    attempted — a reserved_closeout_turns/max_turns misconfiguration),
+    ``"blocked_no_progress"``, ``"blocked_terminal_step_not_taken"``,
+    ``"blocked_resume_closeout"``, ``"blocked_triage"``, or ``"stopped"``.
     """
 
     def _log(msg: str) -> None:
@@ -1679,11 +1877,168 @@ def run_kanban_goal_loop(
     max_turns = int(max_turns or DEFAULT_MAX_TURNS)
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
+    reserved_closeout_turns = int(reserved_closeout_turns or 0)
+    if reserved_closeout_turns < 0:
+        reserved_closeout_turns = DEFAULT_RESERVED_CLOSEOUT_TURNS
+    # Never reserve the entire budget — there must be at least one work turn
+    # slot (turn 1, already spent on ``first_response``) to reserve *from*.
+    reserved_closeout_turns = min(reserved_closeout_turns, max(0, max_turns - 1))
+    work_budget = max_turns - reserved_closeout_turns
+    no_progress_limit = max(1, int(no_progress_limit or DEFAULT_NO_PROGRESS_LIMIT))
+    max_transient_retries = max(0, int(max_transient_retries or 0))
 
     last_response = first_response or ""
     # The first turn already consumed one unit of budget.
     turns_used = 1
+    # Two independent one-shot/bounded mechanisms feed the same reserved
+    # corridor concept but must not contaminate each other:
+    #  - ``nudged_to_finalize``: the judge said "done" — always gets exactly
+    #    one nudge to actually call kanban_complete/kanban_block, regardless
+    #    of the forced-closeout corridor size (this is "free": the judge
+    #    already believes the work is finished).
+    #  - ``closeout_turns_used``: how many turns of the *forced* closeout
+    #    corridor (entered when ordinary work budget runs out while the
+    #    judge still says "continue") have been spent, bounded by
+    #    ``reserved_closeout_turns``.
     nudged_to_finalize = False
+    closeout_turns_used = 0
+    no_progress_count = 0
+    last_fingerprint: Optional[Tuple[Any, ...]] = None
+    last_failure_fingerprint: Optional[str] = None
+    transient_retry_count = 0
+    total_retry_attempts = 0
+    consecutive_parse_failures = 0
+    verdict_history: List[str] = []
+
+    def _emit(phase: str, *, reason: str = "", **extra: Any) -> None:
+        if emit_progress is None:
+            return
+        payload: Dict[str, Any] = {
+            "task_id": task_id,
+            "phase": phase,
+            "turns_used": turns_used,
+            "max_turns": max_turns,
+            "work_budget": work_budget,
+            "reserved_closeout_turns": reserved_closeout_turns,
+            "closeout_turns_used": closeout_turns_used,
+            "nudged_to_finalize": nudged_to_finalize,
+            "no_progress_count": no_progress_count,
+            "verdict_history": list(verdict_history),
+            "reason": _truncate(reason, _GOAL_PROGRESS_REASON_LIMIT),
+        }
+        payload.update(extra)
+        try:
+            emit_progress(payload)
+        except Exception as exc:
+            _log(f"kanban goal loop: emit_progress failed ({exc})")
+
+    def _block(message: str) -> None:
+        try:
+            block_fn(message)
+        except Exception as exc:
+            _log(f"kanban goal loop: block_fn failed ({exc})")
+
+    def _has_evidence() -> bool:
+        # Conservative default: something was actually produced, or the
+        # loop had already reached a closeout/finalize attempt at least
+        # once. Callers with real artifact/test-manifest visibility should
+        # prefer wiring that signal in via ``progress_fn`` instead — this is
+        # the fallback when they don't.
+        return bool(last_response.strip()) or nudged_to_finalize or closeout_turns_used > 0
+
+    def _run_turn_with_retries(prompt: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        nonlocal last_failure_fingerprint, transient_retry_count, total_retry_attempts
+        while True:
+            try:
+                return (run_turn(prompt) or ""), None
+            except Exception as exc:
+                fingerprint = _failure_fingerprint(exc)
+                kind = _classify_turn_error(exc)
+                _log(
+                    f"kanban goal loop: task {task_id} run_turn failed "
+                    f"kind={kind} fingerprint={fingerprint}: {exc}"
+                )
+                # A SECOND occurrence of the exact same failure — same
+                # exception class + message — is never blindly retried
+                # again, no matter its classification: it needs a human or
+                # a genuinely different strategy, not another attempt.
+                repeat = (
+                    last_failure_fingerprint is not None
+                    and fingerprint == last_failure_fingerprint
+                )
+                last_failure_fingerprint = fingerprint
+                _emit(
+                    "turn_error",
+                    reason=str(exc),
+                    failure_kind=kind,
+                    failure_fingerprint=fingerprint,
+                    repeated_fingerprint=repeat,
+                )
+
+                if repeat:
+                    _block(
+                        f"Goal-mode worker hit the same {kind} failure twice in a "
+                        f"row ({type(exc).__name__}: {_truncate(str(exc), 200)}); "
+                        f"needs triage/re-scoping rather than another blind retry."
+                    )
+                    return None, {
+                        "outcome": "blocked_triage",
+                        "turns_used": turns_used,
+                        "reason": f"repeated {kind} failure fingerprint",
+                    }
+
+                # A changed fingerprint (different message/class from the
+                # immediately preceding failure) is a genuinely new symptom
+                # — not a blind retry — so it earns its own attempt. The
+                # overall ceiling below is the backstop against a
+                # pathological "always slightly different error" loop.
+                total_retry_attempts += 1
+                if total_retry_attempts > _GOAL_MAX_TOTAL_TURN_RETRIES:
+                    evidence = _has_evidence()
+                    outcome = "blocked_resume_closeout" if evidence else "blocked_triage"
+                    _block(
+                        f"Goal-mode worker hit {total_retry_attempts} run_turn "
+                        f"failures in a row (latest {type(exc).__name__}); "
+                        + (
+                            "resume from existing evidence."
+                            if evidence
+                            else "needs triage — no usable evidence yet."
+                        )
+                    )
+                    return None, {
+                        "outcome": outcome,
+                        "turns_used": turns_used,
+                        "reason": "retry ceiling exhausted",
+                    }
+
+                if kind == "transient":
+                    transient_retry_count += 1
+                    if transient_retry_count > max_transient_retries:
+                        evidence = _has_evidence()
+                        outcome = "blocked_resume_closeout" if evidence else "blocked_triage"
+                        _block(
+                            f"Goal-mode worker hit {transient_retry_count} transient "
+                            f"failures in a row ({type(exc).__name__}); "
+                            + (
+                                "resume from existing evidence."
+                                if evidence
+                                else "needs triage — no usable evidence yet."
+                            )
+                        )
+                        return None, {
+                            "outcome": outcome,
+                            "turns_used": turns_used,
+                            "reason": "transient retries exhausted",
+                        }
+                    sleep_fn(min(2 ** transient_retry_count, 30))
+                    continue
+
+                # Deterministic (or unclassified) failure with a fresh
+                # fingerprint: one bounded retry, gated only by the repeat
+                # check and the overall ceiling above — never a blind loop
+                # on the *same* defect.
+                transient_retry_count = 0
+                continue
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -1705,51 +2060,170 @@ def run_kanban_goal_loop(
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
 
         # Still open — judge whether the latest response satisfies the card.
-        # The kanban worker loop has no wait-barrier concept (workers finish
-        # via kanban_complete / kanban_block, not by parking), so a WAIT
-        # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait = judge_goal(goal_text, last_response)
-        if verdict == "wait":
-            verdict = "continue"
+        verdict, reason, parse_failed, wait_directive = judge_goal(goal_text, last_response)
+        verdict_history.append(verdict)
+        del verdict_history[:-_GOAL_VERDICT_HISTORY_LIMIT]
+        consecutive_parse_failures = consecutive_parse_failures + 1 if parse_failed else 0
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
 
+        # ---- WAIT barrier: park without spending a turn -------------------
+        if verdict == "wait" and _valid_wait_directive(wait_directive):
+            _emit("wait", reason=reason, wait_directive=wait_directive)
+            _park_on_wait_barrier(
+                wait_directive,
+                heartbeat_fn=heartbeat_fn,
+                sleep_fn=sleep_fn,
+                monotonic_fn=monotonic_fn,
+                poll_seconds=wait_poll_seconds,
+                max_wait_seconds=max_wait_seconds,
+                log=_log,
+            )
+            _emit("wait_cleared", reason=reason)
+            continue
+        if verdict == "wait":
+            # Judge said WAIT but supplied nothing concrete to park on
+            # (or something malformed slipped past judge_goal's own
+            # parsing). Fail safe: degrade to a normal continue turn
+            # instead of looping forever on an unusable directive.
+            _log(f"kanban goal loop: task {task_id} invalid wait directive {wait_directive!r}; degrading to continue")
+            verdict = "continue"
+            reason = f"invalid wait directive ignored: {reason}"
+
+        # ---- judge model itself is unusable N turns in a row --------------
+        if consecutive_parse_failures >= DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES:
+            _emit("no_progress", reason="judge output unparseable")
+            _block(
+                f"Goal judge returned unparseable output "
+                f"{consecutive_parse_failures} turns in a row; needs a working "
+                f"judge model (auxiliary.goal_judge) or human review."
+            )
+            return {
+                "outcome": "blocked_no_progress",
+                "turns_used": turns_used,
+                "reason": "judge parse failures exhausted",
+            }
+
+        # ---- progress fingerprint / no_progress classification -------------
+        # Only meaningful while the judge still says "continue" — a "done"
+        # verdict is handled by the closeout branch below regardless of
+        # whether the text happens to repeat.
+        if verdict != "done":
+            extra: Dict[str, Any] = {}
+            if progress_fn is not None:
+                try:
+                    extra = progress_fn() or {}
+                except Exception as exc:
+                    _log(f"kanban goal loop: progress_fn failed ({exc})")
+                    extra = {}
+            fingerprint = (
+                _response_fingerprint(last_response),
+                extra.get("task_event_count"),
+                extra.get("workspace_fingerprint"),
+                extra.get("test_manifest_fingerprint"),
+                verdict,
+                _truncate(reason, 120),
+            )
+            if fingerprint == last_fingerprint:
+                no_progress_count += 1
+            else:
+                no_progress_count = 0
+            last_fingerprint = fingerprint
+
+            if no_progress_count >= no_progress_limit:
+                _emit("no_progress", reason=reason)
+                _block(
+                    f"Goal-mode worker produced {no_progress_count + 1} turns in a "
+                    f"row with no detectable state/artifact/test progress (last "
+                    f"judge reason: {_truncate(reason, 200)}). Needs human review "
+                    f"or re-scoping rather than more budget."
+                )
+                return {"outcome": "blocked_no_progress", "turns_used": turns_used, "reason": "no_progress"}
+
+        # ---- decide the next prompt: ordinary work, closeout, or terminal --
+        # ``closeout_kind`` marks what this iteration's prompt is, so the
+        # right counter gets bumped below AFTER the hard-budget check
+        # passes (never before — an attempt that never actually ran must
+        # not count as "spent").
+        closeout_kind: Optional[str] = None
         if verdict == "done":
             if nudged_to_finalize:
-                # Already asked once to call kanban_complete and it still
-                # didn't — block for review rather than spin.
-                _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
-                try:
-                    block_fn(
-                        f"Goal-mode worker's output looked complete but it never "
-                        f"called kanban_complete after a finalize nudge ({reason})."
-                    )
-                except Exception as exc:
-                    _log(f"kanban goal loop: block_fn failed ({exc})")
-                return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
+                _emit("terminal_step_not_taken", reason=reason)
+                _block(
+                    f"Goal-mode worker's output looked complete but it never "
+                    f"called kanban_complete/kanban_block after a finalize nudge "
+                    f"({reason})."
+                )
+                return {
+                    "outcome": "blocked_terminal_step_not_taken",
+                    "turns_used": turns_used,
+                    "reason": "judged done, lifecycle call never made",
+                }
+            closeout_kind = "finalize"
             prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
-            nudged_to_finalize = True
+        elif reserved_closeout_turns > 0 and turns_used >= work_budget:
+            if closeout_turns_used >= reserved_closeout_turns:
+                _emit("terminal_step_not_taken", reason=reason)
+                _block(
+                    f"Goal-mode worker exhausted its reserved closeout corridor "
+                    f"({closeout_turns_used}/{reserved_closeout_turns} turns) "
+                    f"without calling kanban_complete/kanban_block ({reason})."
+                )
+                return {
+                    "outcome": "blocked_terminal_step_not_taken",
+                    "turns_used": turns_used,
+                    "reason": "closeout corridor exhausted",
+                }
+            closeout_kind = "forced"
+            prompt = KANBAN_GOAL_CLOSEOUT_TEMPLATE.format(reason=_truncate(reason, 400))
         else:
             prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
+            if reserved_closeout_turns > 0:
+                remaining = work_budget - turns_used
+                if remaining <= max(1, work_budget // 4):
+                    prompt += KANBAN_GOAL_SOFT_LIMIT_SUFFIX.format(
+                        used=turns_used, max=max_turns, remaining=remaining
+                    )
+                    _emit("soft_limit", reason=reason, remaining_work_turns=remaining)
+                else:
+                    _emit("continue", reason=reason)
+            else:
+                _emit("continue", reason=reason)
 
-        # Budget check BEFORE spending another turn.
+        # ---- hard budget check BEFORE spending the turn --------------------
         if turns_used >= max_turns:
-            _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
-            try:
-                block_fn(
-                    f"Goal-mode worker exhausted its turn budget "
-                    f"({turns_used}/{max_turns}) without completing the task. "
-                    f"Last judge verdict: {_truncate(reason, 300)}"
-                )
-            except Exception as exc:
-                _log(f"kanban goal loop: block_fn failed ({exc})")
-            return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "turn budget exhausted"}
+            already_attempted_closeout = nudged_to_finalize or closeout_turns_used > 0
+            if already_attempted_closeout:
+                # A closeout/finalize attempt already ran in a prior
+                # iteration and the task is still open — terminal.
+                _emit("terminal_step_not_taken", reason=reason)
+                outcome = "blocked_terminal_step_not_taken"
+                detail = "turn budget exhausted after a closeout/finalize attempt"
+            else:
+                # Never even got to attempt a closeout/finalize turn — a
+                # max_turns/reserved_closeout_turns misconfiguration (or a
+                # max_turns=1 card), not the worker's fault.
+                _emit("blocked_budget", reason=reason)
+                outcome = "blocked_budget"
+                detail = "turn budget exhausted before any closeout attempt could be made"
+            _block(
+                f"Goal-mode worker exhausted its turn budget "
+                f"({turns_used}/{max_turns}) without completing the task. "
+                f"Last judge verdict: {_truncate(reason, 300)}"
+            )
+            return {"outcome": outcome, "turns_used": turns_used, "reason": detail}
 
-        # Run another turn in the same session.
-        try:
-            last_response = run_turn(prompt) or ""
-        except Exception as exc:
-            _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": f"run_turn error: {type(exc).__name__}"}
+        if closeout_kind == "finalize":
+            nudged_to_finalize = True
+            _emit("closeout", reason=reason, closeout_kind="finalize")
+        elif closeout_kind == "forced":
+            closeout_turns_used += 1
+            _emit("closeout", reason=reason, closeout_kind="forced")
+
+        # Run another turn in the same session, with classified retries.
+        new_response, failure_result = _run_turn_with_retries(prompt)
+        if failure_result is not None:
+            return failure_result
+        last_response = new_response or ""
         turns_used += 1
 
 
@@ -1767,8 +2241,17 @@ __all__ = [
     "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
     "DRAFT_CONTRACT_SYSTEM_PROMPT",
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
+    "KANBAN_GOAL_SOFT_LIMIT_SUFFIX",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
+    "KANBAN_GOAL_CLOSEOUT_TEMPLATE",
+    "KanbanTurnError",
+    "KanbanTransientTurnError",
     "DEFAULT_MAX_TURNS",
+    "DEFAULT_RESERVED_CLOSEOUT_TURNS",
+    "DEFAULT_NO_PROGRESS_LIMIT",
+    "DEFAULT_MAX_TRANSIENT_RETRIES",
+    "DEFAULT_WAIT_POLL_SECONDS",
+    "DEFAULT_MAX_WAIT_SECONDS",
     "load_goal",
     "save_goal",
     "clear_goal",
