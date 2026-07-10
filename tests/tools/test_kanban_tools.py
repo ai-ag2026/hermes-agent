@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -458,16 +459,25 @@ def test_complete_with_result_only(worker_env):
     assert d["ok"] is True
 
 
-def test_complete_with_artifacts_lands_in_event_payload(worker_env):
+def test_complete_with_artifacts_lands_in_event_payload(worker_env, tmp_path):
     """``artifacts=[...]`` rides into the completed event payload so the
     gateway notifier can upload them as native attachments. See the
     kanban notifier in gateway/run.py for the consumer side."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
+    chart = tmp_path / "q3-revenue.png"
+    report = tmp_path / "q3-report.pdf"
+    chart.write_bytes(b"chart")
+    report.write_bytes(b"report")
+    conn = kb.connect()
+    try:
+        kb.set_workspace_path(conn, worker_env, tmp_path)
+    finally:
+        conn.close()
     out = kt._handle_complete({
         "summary": "rendered the chart",
-        "artifacts": ["/tmp/q3-revenue.png", "/tmp/q3-report.pdf"],
+        "artifacts": [str(chart), str(report)],
     })
     assert json.loads(out)["ok"] is True
 
@@ -478,57 +488,81 @@ def test_complete_with_artifacts_lands_in_event_payload(worker_env):
         completed = [e for e in events if e.kind == "completed"]
         assert len(completed) == 1
         payload = completed[0].payload or {}
-        assert payload.get("artifacts") == [
-            "/tmp/q3-revenue.png",
-            "/tmp/q3-report.pdf",
+        durable_paths = payload.get("artifacts")
+        assert isinstance(durable_paths, list)
+        assert [Path(path).name.split("-", 1)[1] for path in durable_paths] == [
+            "q3-revenue.png", "q3-report.pdf"
         ]
+        assert all(Path(path).is_file() for path in durable_paths)
         # And the artifacts also live on metadata for downstream workers
         run = kb.latest_run(conn, worker_env)
-        assert run.metadata.get("artifacts") == [
-            "/tmp/q3-revenue.png",
-            "/tmp/q3-report.pdf",
-        ]
+        assert run is not None
+        assert run.metadata is not None
+        assert run.metadata.get("artifacts") == durable_paths
     finally:
         conn.close()
 
 
-def test_complete_artifacts_accepts_single_string(worker_env):
+def test_complete_artifacts_accepts_single_string(worker_env, tmp_path):
     """A bare string is auto-promoted to a single-element list for convenience."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
+    chart = tmp_path / "chart.png"
+    chart.write_bytes(b"chart")
+    conn = kb.connect()
+    try:
+        kb.set_workspace_path(conn, worker_env, tmp_path)
+    finally:
+        conn.close()
     out = kt._handle_complete({
         "summary": "one chart",
-        "artifacts": "/tmp/chart.png",
+        "artifacts": str(chart),
     })
     assert json.loads(out)["ok"] is True
 
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, worker_env)
-        assert run.metadata.get("artifacts") == ["/tmp/chart.png"]
+        assert run is not None
+        assert run.metadata is not None
+        assert Path(run.metadata["artifacts"][0]).name.endswith("-chart.png")
     finally:
         conn.close()
 
 
-def test_complete_artifacts_merges_with_explicit_metadata_field(worker_env):
+def test_complete_artifacts_merges_with_explicit_metadata_field(worker_env, tmp_path):
     """If the worker passes metadata.artifacts AND the top-level artifacts
     param, merge the two without duplicates."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
+    image = tmp_path / "a.png"
+    report = tmp_path / "b.pdf"
+    image.write_bytes(b"image")
+    report.write_bytes(b"report")
+    conn = kb.connect()
+    try:
+        kb.set_workspace_path(conn, worker_env, tmp_path)
+    finally:
+        conn.close()
     out = kt._handle_complete({
         "summary": "merged",
-        "metadata": {"artifacts": ["/tmp/a.png"], "other": "fact"},
-        "artifacts": ["/tmp/b.pdf", "/tmp/a.png"],
+        "metadata": {"artifacts": [str(image)], "other": "fact"},
+        "artifacts": [str(report), str(image)],
     })
     assert json.loads(out)["ok"] is True
 
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.metadata is not None
         # Order: existing entries first, then new ones, deduplicated.
-        assert run.metadata.get("artifacts") == ["/tmp/a.png", "/tmp/b.pdf"]
+        assert [
+            Path(path).name.split("-", 1)[1]
+            for path in run.metadata.get("artifacts")
+        ] == ["a.png", "b.pdf"]
         assert run.metadata.get("other") == "fact"
     finally:
         conn.close()

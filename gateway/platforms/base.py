@@ -1072,10 +1072,35 @@ def _profile_cache_roots() -> List[Path]:
     return roots
 
 
+def _kanban_completion_artifact_roots() -> List[Path]:
+    """Return durable Kanban evidence roots, including named boards."""
+    try:
+        from hermes_cli import kanban_db as _kanban_db
+
+        override = os.environ.get("HERMES_KANBAN_ARTIFACTS_ROOT", "").strip()
+        if override:
+            return [Path(os.path.expanduser(override))]
+        home = _kanban_db.kanban_home()
+        roots = [home / "kanban" / "artifacts"]
+        boards_dir = home / "kanban" / "boards"
+        try:
+            roots.extend(
+                child / "artifacts"
+                for child in boards_dir.iterdir()
+                if child.is_dir() and not child.is_symlink()
+            )
+        except OSError:
+            pass
+        return roots
+    except Exception:
+        return []
+
+
 def _media_delivery_allowed_roots() -> List[Path]:
     """Return roots from which model-emitted local media may be delivered."""
     roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
     roots.extend(_profile_cache_roots())
+    roots.extend(_kanban_completion_artifact_roots())
     extra_roots = os.environ.get(MEDIA_DELIVERY_ALLOW_DIRS_ENV, "")
     for chunk in extra_roots.split(os.pathsep):
         for raw_root in chunk.split(","):

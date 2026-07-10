@@ -629,6 +629,19 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    board=board,
+                )
+            except kb.CompletionEvidenceError as evidence_err:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"kanban_complete blocked: {evidence_err}",
+                        "kind": evidence_err.kind,
+                        "details": evidence_err.details,
+                        "task_id": tid,
+                        "state_changed": False,
+                        "retryable": True,
+                    }
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -1039,6 +1052,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                completion_contract=args.get("completion_contract"),
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1703,6 +1717,20 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "completion_contract": {
+                "type": "object",
+                "properties": {
+                    "tests_or_smokes": {"type": "boolean"},
+                    "readback": {"type": "boolean"},
+                    "artifacts": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+                "description": (
+                    "Optional fail-closed evidence requirements. Required "
+                    "fields must be present in kanban_complete metadata; "
+                    "artifacts are validated and durably promoted before done."
                 ),
             },
             "board": _board_schema_prop(),

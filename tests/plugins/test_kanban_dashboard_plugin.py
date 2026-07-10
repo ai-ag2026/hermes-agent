@@ -317,6 +317,70 @@ def test_patch_status_complete(client):
     assert any(x["id"] == t["id"] for x in done["tasks"])
 
 
+def test_patch_done_uses_named_board_artifact_store(client):
+    board = "project-a"
+    kb.create_board(board)
+    workspace = kb.workspaces_root(board=board) / "dashboard-workspace"
+    workspace.mkdir(parents=True)
+    artifact = workspace / "proof.txt"
+    artifact.write_text("proof", encoding="utf-8")
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn, title="named", workspace_kind="dir", workspace_path=str(workspace)
+        )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}?board={board}",
+        json={
+            "status": "done",
+            "summary": "done",
+            "metadata": {"artifacts": [str(artifact)]},
+        },
+    )
+    assert response.status_code == 200
+    with kb.connect(board=board) as conn:
+        row = conn.execute(
+            "SELECT durable_path FROM task_artifacts WHERE task_id=?", (task_id,)
+        ).fetchone()
+    assert row is not None
+    assert Path(row[0]).is_relative_to(kb.completion_artifacts_root(board=board))
+
+
+def test_patch_done_returns_typed_evidence_rejection(client):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="contract",
+            completion_contract={"artifacts": True},
+        )
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done", "summary": "missing evidence"},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["kind"] == "evidence_missing"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "ready"
+
+
+def test_bulk_done_returns_typed_evidence_rejection(client):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="contract",
+            completion_contract={"artifacts": True},
+        )
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task_id], "status": "done", "summary": "missing evidence"},
+    )
+    assert response.status_code == 200
+    result = response.json()["results"][0]
+    assert result["ok"] is False
+    assert result["error_kind"] == "evidence_missing"
+
+
 def test_patch_block_then_unblock(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     r = client.patch(

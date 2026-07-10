@@ -73,12 +73,14 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -657,6 +659,19 @@ def attachments_root(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "attachments"
 
 
+def completion_artifacts_root(board: Optional[str] = None) -> Path:
+    """Return the board-scoped durable store for completion evidence."""
+    override = os.environ.get("HERMES_KANBAN_ARTIFACTS_ROOT", "").strip()
+    if override:
+        return Path(override).expanduser()
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban" / "artifacts"
+    return board_dir(slug) / "artifacts"
+
+
 def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
     """Return the per-task attachment directory ``<root>/<task_id>/``."""
     return attachments_root(board=board) / task_id
@@ -996,6 +1011,7 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    completion_contract: Optional[dict] = None
     # Event-sourcing resume (#2), in-memory only — NOT persisted columns and NOT
     # read by from_row. Populated by claim_task/claim_review_task so the spawn
     # path knows which resumable session id to pin for this run and whether this
@@ -1015,6 +1031,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        completion_contract: Optional[dict] = None
+        if "completion_contract" in keys and row["completion_contract"]:
+            try:
+                parsed_contract = json.loads(row["completion_contract"])
+                if isinstance(parsed_contract, dict):
+                    completion_contract = parsed_contract
+            except Exception:
+                completion_contract = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1088,6 +1112,7 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            completion_contract=completion_contract,
         )
 
 
@@ -1273,7 +1298,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    completion_contract  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1345,6 +1371,21 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     created_at   INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_artifacts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             TEXT NOT NULL,
+    producer_run_id     INTEGER NOT NULL DEFAULT 0,
+    original_path       TEXT NOT NULL,
+    durable_path        TEXT NOT NULL,
+    sha256              TEXT NOT NULL,
+    size                INTEGER NOT NULL,
+    content_type        TEXT,
+    validated_at        INTEGER NOT NULL,
+    retention_class     TEXT NOT NULL,
+    UNIQUE(task_id, producer_run_id, original_path, sha256),
+    UNIQUE(durable_path)
+);
+
 -- Subscription from a gateway source (platform + chat + thread) to a
 -- task. The gateway's kanban-notifier watcher tails task_events and
 -- pushes ``completed`` / ``blocked`` / ``spawn_auto_blocked`` events to
@@ -1367,6 +1408,7 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_artifacts_task         ON task_artifacts(task_id, producer_run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
@@ -1812,6 +1854,53 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
+def _scavenge_completion_artifacts(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str],
+    grace_seconds: int = 3600,
+    now: Optional[float] = None,
+) -> int:
+    """Remove stale files that no committed manifest references.
+
+    The grace window prevents a concurrent completion in another process from
+    losing a file between filesystem promotion and its SQLite commit.
+    """
+    root = completion_artifacts_root(board=board)
+    if not root.exists():
+        return 0
+    referenced = {
+        str(row[0]) for row in conn.execute("SELECT durable_path FROM task_artifacts")
+    }
+    cutoff = (time.time() if now is None else now) - max(0, grace_seconds)
+    removed = 0
+    for directory_path, directory_names, file_names in os.walk(root, followlinks=False):
+        directory = Path(directory_path)
+        directory_names[:] = [
+            name for name in directory_names if not (directory / name).is_symlink()
+        ]
+        changed = False
+        for name in file_names:
+            candidate = directory / name
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if info.st_mtime > cutoff or str(candidate) in referenced:
+                continue
+            if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                candidate.unlink(missing_ok=True)
+                removed += 1
+                changed = True
+        if changed and getattr(os, "O_DIRECTORY", 0):
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    return removed
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -1919,6 +2008,11 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    if db_path is None:
+                        try:
+                            _scavenge_completion_artifacts(conn, board=board)
+                        except Exception as exc:
+                            _log.warning("kanban artifact scavenger failed: %s", exc)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -2141,6 +2235,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "completion_contract" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "completion_contract", "completion_contract TEXT"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -2605,6 +2704,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    completion_contract: Optional[dict] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2635,6 +2735,20 @@ def create_task(
     behaviour.
     """
     assignee = _canonical_assignee(assignee)
+    if completion_contract is not None:
+        if not isinstance(completion_contract, dict):
+            raise ValueError("completion_contract must be an object/dict")
+        unknown_contract_keys = set(completion_contract) - {
+            "tests_or_smokes", "readback", "artifacts"
+        }
+        if unknown_contract_keys:
+            raise ValueError(
+                "unknown completion_contract field(s): "
+                + ", ".join(sorted(unknown_contract_keys))
+            )
+        completion_contract = {
+            key: True for key, value in completion_contract.items() if value
+        } or None
     if task_class is not None:
         task_class = str(task_class).strip() or None
     if not title or not title.strip():
@@ -2841,8 +2955,8 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        task_class
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        task_class, completion_contract
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2866,6 +2980,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         task_class,
+                        json.dumps(completion_contract, sort_keys=True) if completion_contract else None,
                     ),
                 )
                 for pid in parents:
@@ -2886,6 +3001,7 @@ def create_task(
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "task_class": task_class,
+                        "completion_contract": completion_contract,
                     },
                 )
             return task_id
@@ -4536,6 +4652,518 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class CompletionEvidenceError(ValueError):
+    """Typed fail-closed rejection raised by the completion evidence gate."""
+
+    def __init__(self, kind: str, message: str, **details: Any) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.details = details
+
+
+def _record_completion_rejection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    error: CompletionEvidenceError,
+    *,
+    run_id: Optional[int],
+) -> None:
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            error.kind,
+            {"error": str(error), **error.details},
+            run_id=run_id,
+        )
+
+
+def _validate_completion_contract(task: Task, metadata: dict) -> None:
+    contract = task.completion_contract or {}
+    missing = [
+        key for key in ("tests_or_smokes", "readback", "artifacts")
+        if contract.get(key) and not metadata.get(key)
+    ]
+    if missing:
+        raise CompletionEvidenceError(
+            "evidence_missing",
+            "completion contract is missing required evidence: " + ", ".join(missing),
+            missing=missing,
+        )
+
+
+def _artifact_source_root(
+    source: Path, task: Task, board: Optional[str]
+) -> Optional[Path]:
+    roots = [
+        workspaces_root(board=board),
+        attachments_root(board=board),
+        completion_artifacts_root(board=board),
+    ]
+    if task.workspace_path:
+        roots.append(Path(task.workspace_path).expanduser())
+    resolved_roots = [root.resolve(strict=False) for root in roots]
+    matches = [root for root in resolved_roots if source.is_relative_to(root)]
+    return max(matches, key=lambda root: len(root.parts), default=None)
+
+
+def _artifact_path_looks_secret(source: Path) -> bool:
+    lowered_parts = {part.casefold() for part in source.parts}
+    if lowered_parts & {
+        ".git",
+        ".ssh",
+        ".gnupg",
+        ".aws",
+        ".kube",
+        ".docker",
+        ".config",
+        ".azure",
+        ".gcloud",
+        "pairing",
+    }:
+        return True
+    name = source.name.casefold()
+    if name.startswith(".env") or name in {
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        "credentials.json",
+        "auth.json",
+        "google_token.json",
+        ".anthropic_oauth.json",
+    }:
+        return True
+    if source.suffix.casefold() in {".pem", ".key", ".p12", ".pfx"}:
+        return True
+    return any(marker in name for marker in ("credential", "private-key", "secret", "token"))
+
+
+_OS_OPEN_SUPPORTS_DIR_FD = os.open in getattr(os, "supports_dir_fd", set())
+_OS_MKDIR_SUPPORTS_DIR_FD = os.mkdir in getattr(os, "supports_dir_fd", set())
+
+
+def _open_directory_path_nofollow(path: Path, *, create: bool) -> int:
+    """Open an absolute directory by walking every component from its anchor."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if not (
+        path.is_absolute()
+        and nofollow
+        and directory
+        and _OS_OPEN_SUPPORTS_DIR_FD
+        and (not create or _OS_MKDIR_SUPPORTS_DIR_FD)
+    ):
+        if create:
+            path.mkdir(parents=True, exist_ok=True)
+        return os.open(path, os.O_RDONLY | directory | nofollow | cloexec)
+
+    flags = os.O_RDONLY | directory | nofollow | cloexec
+    current_fd = os.open(path.anchor, flags)
+    try:
+        for component in path.parts[1:]:
+            if create:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _open_artifact_source(source: Path, root: Path) -> int:
+    """Open *source* beneath *root* without following path-component symlinks."""
+    relative = source.relative_to(root)
+    if not relative.parts:
+        raise CompletionEvidenceError(
+            "artifact_not_durable",
+            f"artifact path names a directory root: {source}",
+            path=str(source),
+        )
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    supports_secure_walk = bool(nofollow and directory and _OS_OPEN_SUPPORTS_DIR_FD)
+    if not supports_secure_walk:
+        before = source.stat(follow_symlinks=False)
+        fd = os.open(source, os.O_RDONLY | cloexec | getattr(os, "O_BINARY", 0))
+        after = os.fstat(fd)
+        if not os.path.samestat(before, after) or not stat.S_ISREG(after.st_mode):
+            os.close(fd)
+            raise CompletionEvidenceError(
+                "artifact_promotion_failed",
+                f"artifact changed while being opened: {source}",
+                path=str(source),
+            )
+        return fd
+
+    current_fd = _open_directory_path_nofollow(root, create=False)
+    try:
+        for component in relative.parts[:-1]:
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | directory | nofollow | cloexec,
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        fd = os.open(
+            relative.parts[-1],
+            os.O_RDONLY | nofollow | cloexec | getattr(os, "O_BINARY", 0),
+            dir_fd=current_fd,
+        )
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise CompletionEvidenceError(
+                "artifact_not_durable",
+                f"artifact is not a regular file: {source}",
+                path=str(source),
+            )
+        return fd
+    finally:
+        os.close(current_fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a directory entry update on platforms that support it."""
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    if not directory_flag:
+        return
+    fd = os.open(path, os.O_RDONLY | directory_flag)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _open_artifact_destination(root: Path, components: Iterable[str]) -> tuple[Path, int]:
+    """Create and open a board-owned artifact directory without symlink traversal."""
+    destination = root.absolute()
+    for component in components:
+        if not component or component in {".", ".."} or "/" in component or "\\" in component:
+            raise CompletionEvidenceError(
+                "artifact_promotion_failed",
+                f"invalid artifact destination component: {component!r}",
+            )
+        destination /= component
+    try:
+        destination_fd = _open_directory_path_nofollow(destination, create=True)
+    except OSError as exc:
+        raise CompletionEvidenceError(
+            "artifact_promotion_failed",
+            f"artifact destination changed while being opened: {destination}",
+            path=str(destination),
+        ) from exc
+    return destination, destination_fd
+
+
+def _open_artifact_destination_child(
+    parent: Path, parent_fd: int, component: str
+) -> tuple[Path, int]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        os.mkdir(component, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    try:
+        child_fd = os.open(component, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise CompletionEvidenceError(
+            "artifact_promotion_failed",
+            f"artifact destination changed while being opened: {parent / component}",
+            path=str(parent / component),
+        ) from exc
+    return parent / component, child_fd
+
+
+def _copy_artifact_atomically(
+    source: Path, source_root: Path, destination_dir: Path, destination_fd: int
+) -> tuple[Path, str, int, bool]:
+    temporary_name = f".promoting-{secrets.token_hex(8)}"
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        source_fd = _open_artifact_source(source, source_root)
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=destination_fd,
+        )
+        with os.fdopen(source_fd, "rb") as src, os.fdopen(temporary_fd, "wb") as dst:
+            if not stat.S_ISREG(os.fstat(src.fileno()).st_mode):
+                raise CompletionEvidenceError(
+                    "artifact_not_durable",
+                    f"artifact is not a regular file: {source}",
+                    path=str(source),
+                )
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+                dst.write(chunk)
+            dst.flush()
+            os.fsync(dst.fileno())
+        sha256 = digest.hexdigest()
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", source.name).strip("._") or "artifact"
+        destination_name = f"{sha256}-{safe_name}"
+        destination = destination_dir / destination_name
+        try:
+            existing_fd = os.open(destination_name, source_flags, dir_fd=destination_fd)
+        except FileNotFoundError:
+            existing_fd = None
+        if existing_fd is not None:
+            existing_digest = hashlib.sha256()
+            with os.fdopen(existing_fd, "rb") as existing:
+                if not stat.S_ISREG(os.fstat(existing.fileno()).st_mode):
+                    raise CompletionEvidenceError(
+                        "artifact_promotion_failed",
+                        f"durable artifact collision for {source}",
+                        path=str(source),
+                    )
+                while True:
+                    chunk = existing.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    existing_digest.update(chunk)
+            if existing_digest.hexdigest() != sha256:
+                raise CompletionEvidenceError(
+                    "artifact_promotion_failed",
+                    f"durable artifact collision for {source}",
+                    path=str(source),
+                )
+            os.unlink(temporary_name, dir_fd=destination_fd)
+            return destination, sha256, size, False
+        os.replace(
+            temporary_name,
+            destination_name,
+            src_dir_fd=destination_fd,
+            dst_dir_fd=destination_fd,
+        )
+        try:
+            os.fsync(destination_fd)
+        except Exception:
+            os.unlink(destination_name, dir_fd=destination_fd)
+            raise
+        return destination, sha256, size, True
+    finally:
+        try:
+            os.unlink(temporary_name, dir_fd=destination_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _promote_completion_artifacts(
+    task: Task, metadata: dict, *, board: Optional[str]
+) -> tuple[list[dict], list[Path]]:
+    raw_paths = metadata.get("artifacts") or []
+    if not isinstance(raw_paths, (list, tuple)):
+        raise CompletionEvidenceError(
+            "evidence_missing", "metadata.artifacts must be a list of paths"
+        )
+    producer_run_id = int(task.current_run_id or 0)
+    if not raw_paths:
+        return [], []
+    destination_dir, destination_fd = _open_artifact_destination(
+        completion_artifacts_root(board=board), (task.id, str(producer_run_id))
+    )
+    manifests: list[dict] = []
+    seen: set[str] = set()
+    created_paths: list[Path] = []
+    try:
+        for raw_path in raw_paths:
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                raise CompletionEvidenceError(
+                    "evidence_missing", "artifact path must be a non-empty string"
+                )
+            source_input = Path(raw_path).expanduser()
+            if not source_input.is_absolute():
+                raise CompletionEvidenceError(
+                    "artifact_not_durable",
+                    f"artifact path must be absolute: {raw_path}",
+                    path=raw_path,
+                )
+            try:
+                source = source_input.resolve(strict=True)
+            except (FileNotFoundError, RuntimeError):
+                raise CompletionEvidenceError(
+                    "evidence_missing",
+                    f"artifact does not exist: {raw_path}",
+                    path=raw_path,
+                )
+            if str(source) in seen:
+                continue
+            seen.add(str(source))
+            source_root = _artifact_source_root(source, task, board)
+            if source_root is None or _artifact_path_looks_secret(source):
+                raise CompletionEvidenceError(
+                    "artifact_not_durable",
+                    f"artifact is outside allowed roots or is secret-like: {raw_path}",
+                    path=raw_path,
+                )
+            if not source.is_file() or not os.access(source, os.R_OK):
+                raise CompletionEvidenceError(
+                    "evidence_missing",
+                    f"artifact is not a readable regular file: {raw_path}",
+                    path=raw_path,
+                )
+            source_id = hashlib.sha256(str(source).encode("utf-8")).hexdigest()[:12]
+            source_destination, source_destination_fd = _open_artifact_destination_child(
+                destination_dir, destination_fd, source_id
+            )
+            try:
+                durable, sha256, size, created = _copy_artifact_atomically(
+                    source, source_root, source_destination, source_destination_fd
+                )
+            except CompletionEvidenceError:
+                raise
+            except Exception as exc:
+                raise CompletionEvidenceError(
+                    "artifact_promotion_failed",
+                    f"failed to promote artifact {source}: {exc}",
+                    path=str(source),
+                ) from exc
+            finally:
+                os.close(source_destination_fd)
+            if created:
+                created_paths.append(durable)
+            manifests.append(
+                {
+                    "task_id": task.id,
+                    "producer_run_id": producer_run_id,
+                    "original_path": raw_path,
+                    "durable_path": str(durable),
+                    "sha256": sha256,
+                    "size": size,
+                    "content_type": mimetypes.guess_type(source.name)[0] or "application/octet-stream",
+                    "validated_at": int(time.time()),
+                    "retention_class": "task_completion",
+                }
+            )
+        return manifests, created_paths
+    except Exception:
+        for created_path in created_paths:
+            _unlink_artifact_durably(created_path)
+        raise
+    finally:
+        os.close(destination_fd)
+
+
+def _unlink_artifact_durably(path: Path) -> None:
+    parent = path.parent
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(parent)
+    try:
+        parent.rmdir()
+    except OSError:
+        return
+    _fsync_directory(parent.parent)
+
+
+def _remove_unreferenced_artifacts(
+    conn: sqlite3.Connection, created_paths: Iterable[Path]
+) -> None:
+    for created_path in created_paths:
+        try:
+            referenced = conn.execute(
+                "SELECT 1 FROM task_artifacts WHERE durable_path = ? LIMIT 1",
+                (str(created_path),),
+            ).fetchone()
+        except sqlite3.Error:
+            # Preserve the file when the DB cannot prove it is unreferenced.
+            # A harmless orphan is safer than deleting another concurrent
+            # completion's committed artifact.
+            continue
+        if referenced is None:
+            _unlink_artifact_durably(created_path)
+
+
+@contextlib.contextmanager
+def _completion_artifact_txn(
+    conn: sqlite3.Connection, created_paths: Iterable[Path]
+):
+    """Roll back newly promoted files unless their manifest transaction commits."""
+    state = {"accepted": False}
+    try:
+        with write_txn(conn):
+            yield state
+    except Exception:
+        _remove_unreferenced_artifacts(conn, created_paths)
+        raise
+    if not state["accepted"]:
+        _remove_unreferenced_artifacts(conn, created_paths)
+
+
+def _persist_completion_artifact_manifest(
+    conn: sqlite3.Connection, manifest: dict
+) -> None:
+    """Insert one manifest row and preserve a typed failure boundary."""
+    try:
+        conn.execute(
+            """
+            INSERT INTO task_artifacts (
+                task_id, producer_run_id, original_path, durable_path,
+                sha256, size, content_type, validated_at, retention_class
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                manifest["task_id"],
+                manifest["producer_run_id"],
+                manifest["original_path"],
+                manifest["durable_path"],
+                manifest["sha256"],
+                manifest["size"],
+                manifest["content_type"],
+                manifest["validated_at"],
+                manifest["retention_class"],
+            ),
+        )
+    except sqlite3.Error as exc:
+        raise CompletionEvidenceError(
+            "artifact_promotion_failed",
+            f"failed to persist completion artifact manifest: {exc}",
+            path=manifest.get("original_path"),
+        ) from exc
+
+
+@contextlib.contextmanager
+def _completion_evidence_error_boundary(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+):
+    """Type and audit manifest persistence failures after rollback/cleanup.
+
+    This boundary must wrap :func:`_completion_artifact_txn`, rather than run
+    inside it: only after that inner context exits has SQLite rolled back the
+    task transition and removed newly promoted, unreferenced files. The
+    rejection event is then written in its own transaction.
+    """
+    try:
+        yield
+    except CompletionEvidenceError as exc:
+        _record_completion_rejection(conn, task_id, exc, run_id=run_id)
+        raise
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4545,6 +5173,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4582,6 +5211,12 @@ def complete_task(
     if _pending_review_request(conn, task_id) is not None:
         return False
 
+    # Validate and promote evidence before the done CAS and scratch cleanup.
+    task = get_task(conn, task_id)
+    if task is None or task.status not in {"running", "ready", "blocked"}:
+        return False
+    if expected_run_id is not None and task.current_run_id != int(expected_run_id):
+        return False
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for
@@ -4609,7 +5244,30 @@ def complete_task(
     else:
         verified_cards = []
 
-    with write_txn(conn):
+    completion_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    created_artifact_paths: list[Path] = []
+    try:
+        _validate_completion_contract(task, completion_metadata)
+        artifact_manifest, created_artifact_paths = _promote_completion_artifacts(
+            task, completion_metadata, board=board
+        )
+    except CompletionEvidenceError as exc:
+        _record_completion_rejection(
+            conn, task_id, exc, run_id=task.current_run_id
+        )
+        raise
+    if artifact_manifest:
+        completion_metadata["artifact_manifest"] = artifact_manifest
+        completion_metadata["artifacts"] = [
+            item["durable_path"] for item in artifact_manifest
+        ]
+    metadata = completion_metadata
+
+    with _completion_evidence_error_boundary(
+        conn,
+        task_id,
+        run_id=task.current_run_id,
+    ), _completion_artifact_txn(conn, created_artifact_paths) as promotion_state:
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4647,6 +5305,8 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        for manifest in artifact_manifest:
+            _persist_completion_artifact_manifest(conn, manifest)
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -4690,11 +5350,14 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
+        if artifact_manifest:
+            completed_payload["artifact_manifest"] = artifact_manifest
         _append_event(
             conn, task_id, "completed",
             completed_payload,
             run_id=run_id,
         )
+        promotion_state["accepted"] = True
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
