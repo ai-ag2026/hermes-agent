@@ -15619,7 +15619,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return
 
     from hermes_cli import kanban_db as _kb
-    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
+    from hermes_cli.goals import (
+        run_kanban_goal_loop as _run_loop,
+        DEFAULT_MAX_TURNS as _DEF_TURNS,
+        KanbanTurnError,
+        KanbanTransientTurnError,
+    )
 
     # Resolve goal text from the card (title + body = the acceptance
     # criteria the judge evaluates against).
@@ -15643,6 +15648,19 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
+    # Failure classifications from agent.error_classifier.FailoverReason
+    # that represent transient infrastructure / cooldown trouble — a run
+    # that failed for one of these should be retried by the goal loop
+    # (bounded, with backoff), not silently counted as an ordinary turn
+    # burning the worker's budget on an empty response (the exact defect
+    # S4 fixes: "externe Barrieren/Cooldowns verbrauchen Turns").
+    # Anything else (auth_permanent, format_error, content_policy_blocked,
+    # ssl_cert_verification, ...) is a deterministic protocol failure.
+    _TRANSIENT_FAILURE_REASONS = {
+        "billing", "rate_limit", "upstream_rate_limit", "overloaded",
+        "server_error", "timeout",
+    }
+
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(
             user_message=prompt,
@@ -15654,6 +15672,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             and cli.agent.session_id != cli.session_id
         ):
             cli.session_id = cli.agent.session_id
+        if isinstance(result, dict) and result.get("failed"):
+            reason = result.get("failure_reason") or "unknown"
+            message = result.get("error") or f"run_conversation failed ({reason})"
+            if reason in _TRANSIENT_FAILURE_REASONS:
+                raise KanbanTransientTurnError(f"{reason}: {message}")
+            raise KanbanTurnError(f"{reason}: {message}")
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
@@ -15680,6 +15704,37 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
+    def _heartbeat() -> None:
+        # Keep the dispatcher's claim TTL alive while the loop is parked on
+        # a WAIT barrier — without this, a long park could let
+        # release_stale_claims() reclaim the task out from under a worker
+        # that is behaving exactly as designed.
+        c = _kb.connect()
+        try:
+            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+            _kb.heartbeat_claim(c, task_id, claimer=claim_lock)
+            _kb.heartbeat_worker(c, task_id)
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    def _emit_progress(payload: dict) -> None:
+        # Best-effort, dispatcher-visible budget/progress telemetry (DoD 7).
+        # A failure here must never interrupt the goal loop itself.
+        c = _kb.connect()
+        try:
+            run = _kb.latest_run(c, task_id)
+            _kb.record_goal_progress_event(
+                c, task_id, payload, run_id=(run.id if run else None)
+            )
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
     _run_loop(
         task_id=task_id,
         goal_text=goal_text,
@@ -15689,6 +15744,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
+        heartbeat_fn=_heartbeat,
+        emit_progress=_emit_progress,
     )
 
 
