@@ -5339,7 +5339,9 @@ def test_review_decisions_are_atomic(
         assert latest is not None
         assert latest.outcome == decision.lower()
         events = kb.list_events(conn, tid)
-        assert events[-1].kind in {"review_decided", "completed"}
+        # BLOCK additionally appends a 'blocked' event so _has_sticky_block
+        # recognizes the review gate (S4d) — hence three accepted tail kinds.
+        assert events[-1].kind in {"review_decided", "completed", "blocked"}
 
 
 def test_stale_review_decision_is_rejected(kanban_home):
@@ -5431,3 +5433,119 @@ def test_archive_complete_race_leaves_one_consistent_terminal_state(kanban_home)
         assert task.status in {"done", "archived"}
         assert task.current_run_id is None
         assert task.claim_lock is None
+
+
+# ---------------------------------------------------------------------------
+# S4d: needs_input human-gate enforcement + unblock attribution +
+# forced-promote/claim consistency (Audit 2026-07-10)
+# ---------------------------------------------------------------------------
+
+def test_review_block_is_sticky_against_recompute_ready(kanban_home):
+    """A review BLOCK must emit a 'blocked' event so _has_sticky_block holds
+    and recompute_ready does NOT silently reopen the needs_input gate."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implement", assignee="backend-eng")
+        kb.claim_task(conn, tid)
+        assert _request_review(conn, tid)
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        assert kb.decide_task_review(
+            conn, tid, decision="BLOCK", summary="needs human approval",
+            expected_run_id=review.current_run_id,
+        ) is True
+        assert kb._has_sticky_block(conn, tid) is True
+        kb.recompute_ready(conn)
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+
+
+def test_review_block_increments_block_recurrences(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implement", assignee="backend-eng")
+        kb.claim_task(conn, tid)
+        assert _request_review(conn, tid)
+        review = kb.claim_review_task(conn, tid)
+        assert kb.decide_task_review(
+            conn, tid, decision="BLOCK", summary="round 1",
+            expected_run_id=review.current_run_id,
+        )
+        row = conn.execute(
+            "SELECT block_recurrences FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert int(row["block_recurrences"]) >= 1
+
+
+def test_unblock_event_carries_actor_and_reason(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gate", assignee="worker")
+        kb.block_task(conn, tid, reason="approval required", kind="needs_input")
+        assert kb.unblock_task(
+            conn, tid, actor="manfred", reason="approved via chat"
+        ) is True
+        events = kb.list_events(conn, tid)
+        unblocked = [e for e in events if e.kind == "unblocked"][-1]
+        assert unblocked.payload["actor"] == "manfred"
+        assert unblocked.payload["reason"] == "approved via chat"
+
+
+def test_claim_honors_forced_manual_promote(kanban_home):
+    """claim_task must not silently revert an operator's promote --force:
+    the forced promoted_manual event overrides the parent gate once."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="review subject", assignee="worker")
+        child = kb.create_task(
+            conn, title="quality gate", assignee="reviewer", parents=(parent,)
+        )
+        kb.block_task(conn, parent, reason="review-required", kind="needs_input")
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ?", (child,)
+        )
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, child, "promoted_manual",
+                {"actor": "operator", "forced": True},
+            )
+        claimed = kb.claim_task(conn, child)
+        assert claimed is not None, "forced promote must survive claim"
+        assert kb.get_task(conn, child).status == "running"
+
+
+def test_claim_still_demotes_without_forced_promote(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = kb.create_task(
+            conn, title="child", assignee="worker", parents=(parent,)
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ?", (child,)
+        )
+        assert kb.claim_task(conn, child) is None
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_cli_unblock_refused_in_worker_session(kanban_home, monkeypatch, capsys):
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_someworker")
+    rc = kanban_cli._cmd_unblock(argparse.Namespace(task_ids=["t_x"], reason=None))
+    assert rc == 1
+    assert "refused" in capsys.readouterr().err
+
+
+def test_cli_unblock_needs_input_requires_reason(kanban_home, monkeypatch, capsys):
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gate", assignee="worker")
+        kb.block_task(conn, tid, reason="approval required", kind="needs_input")
+    rc = kanban_cli._cmd_unblock(argparse.Namespace(task_ids=[tid], reason=None))
+    assert rc == 1
+    assert "requires" in capsys.readouterr().err
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+        rc2 = kanban_cli._cmd_unblock(
+            argparse.Namespace(task_ids=[tid], reason="approved by operator")
+        )
+        assert rc2 == 0

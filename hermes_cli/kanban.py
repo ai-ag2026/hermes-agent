@@ -2076,6 +2076,20 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
+    # Gate parity with the kanban_unblock TOOL (Audit 2026-07-10): a
+    # dispatcher-spawned board worker could previously lift any
+    # needs_input block via its terminal tool by shelling out to this CLI
+    # — bypassing the orchestrator-only guard the tool path enforces and
+    # thereby dissolving human-approval gates (belegt an t_c4616f12).
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        print(
+            "refused: 'kanban unblock' is not available from within a board "
+            "worker session (HERMES_KANBAN_TASK is set). A blocked card that "
+            "needs lifting must be unblocked by the operator or an "
+            "orchestrator session.",
+            file=sys.stderr,
+        )
+        return 1
     ids = list(args.task_ids or [])
     if not ids:
         print("at least one task_id is required", file=sys.stderr)
@@ -2083,13 +2097,30 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = getattr(args, "reason", None)
     if reason is not None:
         reason = reason.strip() or None
-    author = _profile_author() if reason else None
+    author = _profile_author()
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            # needs_input blocks are explicit human-decision gates; lifting
+            # one without a stated reason leaves no audit trail of WHO
+            # approved WHAT. Require --reason for those.
+            task = kb.get_task(conn, tid)
+            if (
+                task is not None
+                and task.status == "blocked"
+                and (task.block_kind or "") == "needs_input"
+                and not reason
+            ):
+                failed.append(tid)
+                print(
+                    f"cannot unblock {tid}: needs_input block requires "
+                    "--reason (who approved, what was decided)",
+                    file=sys.stderr,
+                )
+                continue
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
-            if not kb.unblock_task(conn, tid):
+            if not kb.unblock_task(conn, tid, actor=author, reason=reason):
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:

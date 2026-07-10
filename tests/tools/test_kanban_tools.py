@@ -2497,3 +2497,91 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     d = json.loads(out)
     assert d["ok"] is True, d
     assert d["subscribed"] is False, d
+
+
+# ---------------------------------------------------------------------------
+# S4d: needs_input human-gate enforcement at the tool layer (Audit 2026-07-10)
+# ---------------------------------------------------------------------------
+
+def test_complete_tool_refuses_needs_input_blocked(worker_env):
+    """An agent must not complete a needs_input-blocked card — that block is
+    a human-decision gate (live bypass belegt an t_614c91e9)."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    conn = kb.connect()
+    try:
+        kb.block_task(conn, worker_env, reason="approval required", kind="needs_input")
+    finally:
+        conn.close()
+    out = kt._handle_complete({"task_id": worker_env, "summary": "done anyway"})
+    d = json.loads(out)
+    assert d.get("error")
+    assert "needs_input" in d["error"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_complete_tool_allows_non_needs_input_blocked(worker_env):
+    """Un-typed blocks stay completable (existing operator affordance)."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    conn = kb.connect()
+    try:
+        kb.block_task(conn, worker_env, reason="transient hiccup")
+    finally:
+        conn.close()
+    out = kt._handle_complete({"task_id": worker_env, "summary": "recovered"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+
+def test_unblock_tool_requires_reason_for_needs_input(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    conn = kb.connect()
+    try:
+        kb.block_task(conn, worker_env, reason="approval required", kind="needs_input")
+    finally:
+        conn.close()
+    out = kt._handle_unblock({"task_id": worker_env})
+    assert json.loads(out).get("error")
+    out2 = kt._handle_unblock(
+        {"task_id": worker_env, "reason": "operator approved in chat"}
+    )
+    assert json.loads(out2).get("ok") is True
+    conn = kb.connect()
+    try:
+        events = kb.list_events(conn, worker_env)
+        unblocked = [e for e in events if e.kind == "unblocked"][-1]
+        assert unblocked.payload["reason"] == "operator approved in chat"
+        assert unblocked.payload["actor"]
+    finally:
+        conn.close()
+
+
+def test_create_tool_passes_task_class_and_max_retries(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "routed child",
+        "assignee": "test-worker",
+        "task_class": "hard",
+        "max_retries": 4,
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True
+    new_tid = d["task"]["id"] if isinstance(d.get("task"), dict) else d.get("task_id")
+    conn = kb.connect()
+    try:
+        row = conn.execute(
+            "SELECT task_class, max_retries FROM tasks WHERE id = ?",
+            (new_tid,),
+        ).fetchone()
+        assert row["task_class"] == "hard"
+        assert int(row["max_retries"]) == 4
+    finally:
+        conn.close()

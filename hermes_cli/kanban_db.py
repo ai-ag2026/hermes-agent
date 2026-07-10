@@ -3962,16 +3962,40 @@ def claim_task(
             (task_id,),
         ).fetchone()
         if undone:
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'",
+            # Honor an explicit operator override exactly once: when the most
+            # recent promote/claim-arbitration event is a forced manual
+            # promote, the operator has consciously bypassed the parent gate
+            # (e.g. a review card that must run WHILE its review subject is
+            # blocked). Without this, promote --force was silently reverted
+            # here on the next tick — two enforcement points for the same
+            # invariant, only one of which knew about the override
+            # (Audit 2026-07-10, live beobachtet an t_a8d9d631).
+            last_arbitration = conn.execute(
+                "SELECT kind, payload FROM task_events "
+                "WHERE task_id = ? AND kind IN "
+                "('promoted_manual', 'claim_rejected', 'promoted') "
+                "ORDER BY id DESC LIMIT 1",
                 (task_id,),
-            )
-            _append_event(
-                conn, task_id, "claim_rejected",
-                {"reason": "parents_not_done"},
-            )
-            return None
+            ).fetchone()
+            forced_override = False
+            if last_arbitration and last_arbitration["kind"] == "promoted_manual":
+                try:
+                    forced_override = bool(
+                        json.loads(last_arbitration["payload"] or "{}").get("forced")
+                    )
+                except (TypeError, ValueError):
+                    forced_override = False
+            if not forced_override:
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (task_id,),
+                )
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "parents_not_done"},
+                )
+                return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -4320,7 +4344,12 @@ def decide_task_review(
                SET status = ?, assignee = ?,
                    completed_at = CASE WHEN ? = 'done' THEN ? ELSE NULL END,
                    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
-                   block_kind = CASE WHEN ? = 'blocked' THEN 'needs_input' ELSE NULL END
+                   block_kind = CASE WHEN ? = 'blocked' THEN 'needs_input' ELSE NULL END,
+                   block_recurrences = CASE
+                       WHEN ? != 'blocked' THEN block_recurrences
+                       WHEN block_kind = 'needs_input' THEN block_recurrences + 1
+                       ELSE 1
+                   END
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
             (
@@ -4328,6 +4357,7 @@ def decide_task_review(
                 implementation_assignee,
                 target_status,
                 now,
+                target_status,
                 target_status,
                 task_id,
                 int(run_id),
@@ -4353,6 +4383,24 @@ def decide_task_review(
             },
             run_id=run_id,
         )
+        if decision == "BLOCK":
+            # A review BLOCK is a deliberate human-attention handoff. Without
+            # this event, _has_sticky_block() (which only looks at
+            # 'blocked'/'unblocked' events) classifies the task as
+            # circuit-breaker-blocked and recompute_ready() silently reopens
+            # it on the next dispatcher tick — the needs_input gate never
+            # actually held (Audit 2026-07-10, reproduziert).
+            _append_event(
+                conn,
+                task_id,
+                "blocked",
+                {
+                    "reason": (summary or "").strip().splitlines()[0][:400]
+                    or "review decision BLOCK",
+                    "kind": "needs_input",
+                },
+                run_id=run_id,
+            )
         if decision == "ACCEPT":
             _append_event(
                 conn,
@@ -6461,8 +6509,20 @@ def promote_task(
     return True, None
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
+
+    ``actor``/``reason`` are recorded in the ``unblocked`` event payload so
+    an unblock is attributable after the fact — the audit trail previously
+    showed only an empty event, making it impossible to distinguish a human
+    approval from an autonomous agent lifting its own gate
+    (Audit 2026-07-10: 22 nicht attribuierbare Unblocks an einem Tag).
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -6520,9 +6580,16 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        payload: dict = {}
+        if new_status != "ready":
+            payload["status"] = new_status
+        if actor:
+            payload["actor"] = str(actor)[:120]
+        if reason:
+            payload["reason"] = str(reason)[:400]
         _append_event(
             conn, task_id, "unblocked",
-            {"status": new_status} if new_status != "ready" else None,
+            payload or None,
         )
         return True
 

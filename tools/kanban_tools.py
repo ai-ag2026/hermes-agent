@@ -636,6 +636,33 @@ def _handle_complete(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    # needs_input is a human-decision gate. complete_task() itself accepts
+    # blocked tasks (a deliberate operator affordance via the CLI), but an
+    # AGENT completing a needs_input-blocked card dissolves the gate without
+    # any human in the loop — exactly what happened live on 2026-07-10
+    # (t_614c91e9: auto-blocked 22:02, worker-completed 22:04, no unblock).
+    # Agents must instead comment their evidence and leave the decision to
+    # the operator, who unblocks (with reason) or completes via CLI.
+    try:
+        from hermes_cli import kanban_db as _kb_gate
+        with _kb_gate.connect_closing() as _conn_gate:
+            _task_gate = _kb_gate.get_task(_conn_gate, tid)
+        if (
+            _task_gate is not None
+            and _task_gate.status == "blocked"
+            and (_task_gate.block_kind or "") == "needs_input"
+        ):
+            return tool_error(
+                f"{tid} is blocked with kind=needs_input — a human decision "
+                "gate. kanban_complete is refused here: post your evidence "
+                "as a comment and leave the card for the operator (who can "
+                "unblock with a reason or complete it via the CLI)."
+            )
+    except Exception:
+        # Fail open on gate-lookup errors: refusing ALL completions on a
+        # transient DB hiccup would strand healthy workers; the gate is a
+        # safety net, not the primary lifecycle path.
+        pass
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
@@ -1148,6 +1175,12 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    # task_class (quality-class model routing) and max_retries (per-card
+    # circuit-breaker limit) were previously CLI-only: agent-created cards
+    # could neither route to a stronger model nor bound their retries
+    # (Audit 2026-07-10 — 100 % der Problemkarten kamen über diesen Pfad).
+    task_class = str(args.get("task_class") or "").strip() or None
+    max_retries = args.get("max_retries")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -1197,6 +1230,10 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
                 completion_contract=args.get("completion_contract"),
+                task_class=task_class,
+                max_retries=(
+                    int(max_retries) if max_retries is not None else None
+                ),
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1328,10 +1365,26 @@ def _handle_unblock(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     board = args.get("board")
+    reason = str(args.get("reason") or "").strip() or None
+    actor = os.environ.get("HERMES_PROFILE") or "orchestrator"
     try:
         kb, conn = _connect(board=board)
         try:
-            ok = kb.unblock_task(conn, str(tid))
+            # needs_input gates require a stated reason so the unblock is
+            # attributable (who approved, what was decided) — parity with
+            # the CLI gate (Audit 2026-07-10).
+            task = kb.get_task(conn, str(tid))
+            if (
+                task is not None
+                and task.status == "blocked"
+                and (task.block_kind or "") == "needs_input"
+                and not reason
+            ):
+                return tool_error(
+                    f"{tid} is a needs_input block — pass reason= (who "
+                    "approved, what was decided) to lift it"
+                )
+            ok = kb.unblock_task(conn, str(tid), actor=actor, reason=reason)
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
             return _ok(task_id=str(tid), status="ready")
@@ -1880,6 +1933,22 @@ KANBAN_CREATE_SCHEMA = {
                     "artifacts are validated and durably promoted before done."
                 ),
             },
+            "task_class": {
+                "type": "string",
+                "description": (
+                    "Quality class for model routing (e.g. 'hard' routes "
+                    "the card to the planner-tier model). Omit for default "
+                    "routing."
+                ),
+            },
+            "max_retries": {
+                "type": "integer",
+                "description": (
+                    "Per-card circuit-breaker limit: consecutive "
+                    "crash/spawn failures before the card auto-blocks. "
+                    "Omit to use the board default."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": ["title", "assignee"],
@@ -1899,6 +1968,15 @@ KANBAN_UNBLOCK_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": "Blocked task id to return to ready.",
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Why the block is lifted (who approved, what was "
+                    "decided). REQUIRED for needs_input blocks — those are "
+                    "human-decision gates and every lift must be "
+                    "attributable."
+                ),
             },
             "board": _board_schema_prop(),
         },
