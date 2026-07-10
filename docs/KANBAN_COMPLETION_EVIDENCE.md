@@ -16,12 +16,27 @@ Der Review meldete sieben Klassen von Problemen:
 6. Stiller Manifestverlust durch `INSERT OR IGNORE` und kollidierende Durable-Pfade.
 7. Auslieferungsfilter, die gehärtete Completion-Artefakte verwerfen konnten.
 
+Ein zweiter unabhängiger Review des ersten Reparatur-Commits `ef125f5a7`
+lieferte erneut `NEEDS_REPAIR`: fehlende Parent-Directory-`fsync`s,
+pfadbasiertes Cleanup/Scavenging, ein `init_db()`-Bypass des Scavengers,
+maskierbare Domain-Fehler bei kaputtem Audit und falsche Board-Attribution im
+Lifecycle-Hook. Diese fünf Punkte wurden im Folge-Diff behoben und jeweils
+regressionsgetestet.
+
+Der Review des Folge-Commits `aa4a998e3` fand eine verbleibende Race Condition:
+Ein Scavenger konnte einen alten wiederverwendeten Artifact-Pfad oder ein noch
+leeres, bereits per FD geöffnetes Promotion-Verzeichnis entfernen. Der finale
+Folge-Diff serialisiert deshalb Scavenging und den gesamten
+Promotion-bis-Manifest-Commit-Pfad über einen board-/DB-spezifischen,
+prozessübergreifenden Lock. Leere Artifact-Verzeichnisse werden vom Scavenger
+nicht mehr entfernt.
+
 ## Sicherheitsinvarianten
 
 - Die Task-/Run-Transition bleibt CAS-geschützt. Ein konkurrierender oder veralteter Run darf keinen Task abschließen.
 - Ein Artifact wird aus einem erlaubten Root gelesen: Board-Workspace, Attachments, Completion-Root oder expliziter Task-Workspace.
 - Auf POSIX/Linux wird jede Pfadkomponente ab dem Dateisystem-Anchor per Directory-FD geöffnet. `O_DIRECTORY` und `O_NOFOLLOW` verhindern, dass ein zwischen Prüfung und Öffnen ausgetauschter Symlink verfolgt wird.
-- Der Zielbaum wird ebenfalls komponentenweise per `mkdir(..., dir_fd=...)` und `open(..., dir_fd=...)` erstellt/geöffnet. Temporärdatei, Kollisionstest, `replace`, `unlink` und Directory-`fsync` laufen relativ zum bereits geöffneten Ziel-Directory-FD.
+- Der Zielbaum wird ebenfalls komponentenweise per `mkdir(..., dir_fd=...)` und `open(..., dir_fd=...)` erstellt/geöffnet. Jede neue Verzeichnisebene wird durch `fsync` ihres Parent-Directory-FDs persistiert. Temporärdatei, Kollisionstest, `replace`, `unlink` und Directory-`fsync` laufen relativ zum bereits geöffneten Ziel-Directory-FD.
 - Nur reguläre Dateien werden akzeptiert.
 - Der Durable-Pfad enthält ein Unterverzeichnis aus dem Hash des kanonischen Quellpfads sowie einen Dateinamen aus Content-SHA-256 und bereinigtem Basename. Zwei verschiedene Quellen mit gleichem Namen und Inhalt behalten dadurch zwei Manifeste, während das etablierte Dateinamenformat kompatibel bleibt.
 - Manifestpersistierung verwendet kein `INSERT OR IGNORE`. Ein Konflikt ist ein Fehler, kein stiller Erfolg.
@@ -41,13 +56,15 @@ Der Review meldete sieben Klassen von Problemen:
 
 Dateisystem und SQLite bilden keine gemeinsame atomare Transaktion. Ein Prozessabbruch zwischen erfolgreichem Dateisystem-`fsync` und SQLite-Commit kann daher eine nicht referenzierte Datei hinterlassen. Das ist kein akzeptierter Dauerzustand.
 
-Beim ersten DB-Connect eines Prozesses läuft deshalb ein best-effort Scavenger:
+Beim ersten DB-Connect eines Prozesses – einschließlich des kanonischen `init_db()`-Pfads von CLI und Dashboard – läuft deshalb ein best-effort Scavenger:
 
+- Scavenger und `complete_task()` halten denselben DB-spezifischen Cross-Process-Lock. Damit kann kein Scan zwischen Promotion, CAS und Manifest-Commit eingreifen. Der Lock ist auf 30 Sekunden begrenzt; Completion schlägt bei Nichtverfügbarkeit typisiert fehl, der Startpfad protokolliert den best-effort Scavenger-Fehler.
 - Er liest alle committed `durable_path`-Werte aus `task_artifacts`.
-- Er folgt keinen Directory-Symlinks.
+- Er traversiert per `os.fwalk` und Directory-FDs, folgt keinen Directory-Symlinks und weist einen symlinkenden Top-Level-Root fail-closed ab.
 - Er entfernt nur reguläre Dateien oder Symlinks, die älter als eine Stunde und nicht manifestiert sind.
-- Nach Löschungen wird das jeweilige Verzeichnis synchronisiert.
-- Die Stunde Grace schützt eine parallel laufende Completion in einem anderen Prozess zwischen Promotion und Commit.
+- Er entfernt keine regulären Verzeichnisse; ein offenes, noch leeres Promotion-Verzeichnis darf nicht aus dem Namespace gelöst werden.
+- `stat`, `unlink` und `fsync` bleiben FD-relativ.
+- Die Stunde Grace schützt Crash-Orphans und der Cross-Process-Lock schützt den vollständigen parallelen Promotion-bis-Commit-Zeitraum.
 - Ein Scavenger-Fehler verhindert nicht den DB-Start, wird aber als Warnung geloggt.
 
 ## Secret-Pfade
@@ -65,7 +82,7 @@ Das ist keine Inhaltsklassifizierung. Ein harmlos benannter Text mit eingebettet
 
 ## Named Boards und Delivery
 
-Dashboard-Single-Update und Bulk-Update reichen `board` bis `complete_task()` durch. Damit werden Quelle, Durable-Root, Manifest und Cleanup gegen dieselbe Board-DB aufgelöst.
+Dashboard-Single-Update und Bulk-Update reichen `board` bis `complete_task()` durch. Damit werden Quelle, Durable-Root, Manifest, Cleanup und der Completion-Lifecycle-Hook gegen dasselbe Board aufgelöst.
 
 Der Gateway-Medienfilter nimmt zusätzlich auf:
 
@@ -85,6 +102,10 @@ Behandelte Entry-Points:
 - CLI `kanban complete`: knappe Fehlermeldung ohne Traceback und Nonzero-Resultat.
 - Dashboard Single-Update: HTTP 409 mit `detail.kind`, `detail.message` und Details.
 - Dashboard Bulk-Update: per Task `ok=false`, `error_kind` und `error_details`; andere Tasks laufen unabhängig weiter.
+
+Das Rejection-Audit ist best-effort. Schlägt nur das Schreiben des Audit-Events
+fehl, wird dies geloggt, aber der ursprüngliche `CompletionEvidenceError` bleibt
+für Model-Tool, CLI und Dashboard erhalten.
 
 Relevante Fehlerarten sind unter anderem `evidence_missing`, `artifact_not_durable` und `artifact_promotion_failed`.
 
@@ -121,15 +142,20 @@ Die Regressionen decken ab:
 - Secret-Pfadklassen,
 - identischen Inhalt/Basename aus verschiedenen Quellen,
 - stale Orphan-Cleanup bei Erhalt manifestierter Dateien,
-- Named-Board-Durable-Root im Dashboard,
+- Cross-Process-Serialisierung von Scavenger und Completion sowie Erhalt leerer Promotion-Verzeichnisse,
+- Scavenger-Aufruf über `init_db()` und fail-closed Verhalten bei symlinkendem Top-Level-Root,
+- FD-relatives Rollback-Cleanup bei ausgetauschtem Ancestor,
+- Parent-Directory-`fsync` für Task-, Run- und Source-Verzeichnisse,
+- Named-Board-Durable-Root und Lifecycle-Attribution im Dashboard,
+- Erhalt des typisierten Fehlers bei Audit-Schreibfehlern,
 - strukturierte Single-/Bulk-/CLI-Fehler,
 - Strict-Notifier-Zustellung aus dem Durable-Root.
 
 ### Ausgeführte Evidenz am 2026-07-10
 
-- Completion-Evidence-Suite: **30/30 bestanden**.
-- Completion-Evidence plus Kanban-Tool-Suite: **129/129 bestanden**.
-- Breite Kanban-/Tool-/Dashboard-/Gateway-Gruppe: **1041 bestanden, 2 fehlgeschlagen**.
+- Completion-Evidence-Suite: **37/37 bestanden**.
+- Completion-Evidence plus Kanban-Tool- und Dashboard-Suite: **235/235 bestanden**.
+- Breite Kanban-/Tool-/Dashboard-/Gateway-Gruppe: **1048 bestanden, 2 fehlgeschlagen**.
 - Die beiden verbleibenden Fehler wurden in einem frischen Detached-Worktree auf dem Parent `0af4ec0de` mit denselben Tests und denselben Failure-Signaturen reproduziert: **5 bestanden, 2 fehlgeschlagen**. Betroffen sind `test_rebuilt_schema_matches_fresh_db` und `test_first_init_connect_is_bounded_when_lock_held`; beide sind damit vorbestehend und nicht durch S3R verursacht.
 - Ruff für alle geänderten Python-Dateien: bestanden.
 - `compileall` für alle geänderten Python-Dateien: bestanden.

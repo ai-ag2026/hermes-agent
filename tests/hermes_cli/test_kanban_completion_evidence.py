@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 import threading
 import time
@@ -157,12 +157,12 @@ def test_artifact_promotion_fsyncs_destination_directory(
     artifact = workspace / "proof.txt"
     artifact.write_text("proof", encoding="utf-8")
     real_fsync = os.fsync
-    fsynced_directory = False
+    fsynced_directories: set[tuple[int, int]] = set()
 
     def observe_fsync(fd: int) -> None:
-        nonlocal fsynced_directory
-        if stat.S_ISDIR(os.fstat(fd).st_mode):
-            fsynced_directory = True
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode):
+            fsynced_directories.add((info.st_dev, info.st_ino))
         real_fsync(fd)
 
     monkeypatch.setattr(kb.os, "fsync", observe_fsync)
@@ -179,7 +179,12 @@ def test_artifact_promotion_fsyncs_destination_directory(
             summary="durable",
             metadata={"artifacts": [str(artifact)]},
         )
-    assert fsynced_directory is True
+        durable = Path(_artifact_rows(conn, task_id)[0]["durable_path"])
+    created_directories = [durable.parent, durable.parent.parent, durable.parent.parent.parent]
+    assert {
+        (directory.stat().st_dev, directory.stat().st_ino)
+        for directory in created_directories
+    }.issubset(fsynced_directories)
 
 
 def test_scratch_artifact_is_promoted_before_cleanup_and_manifest_survives(
@@ -351,7 +356,7 @@ def test_named_board_completion_uses_named_board_artifact_store(kanban_home: Pat
 
 
 def test_concurrent_completion_cas_loser_preserves_committed_artifact(
-    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+    kanban_home: Path,
 ):
     workspace = kanban_home / "concurrent-workspace"
     workspace.mkdir()
@@ -362,26 +367,14 @@ def test_concurrent_completion_cas_loser_preserves_committed_artifact(
             conn, title="concurrent", workspace_kind="dir", workspace_path=str(workspace)
         )
 
-    original_txn = kb._completion_artifact_txn
     ready = threading.Barrier(2)
-
-    @contextlib.contextmanager
-    def ordered_txn(conn, created_paths):
-        paths = list(created_paths)
-        ready.wait(timeout=5)
-        if paths:
-            # Make the creator of the shared destination lose the done CAS.
-            time.sleep(0.1)
-        with original_txn(conn, paths) as state:
-            yield state
-
-    monkeypatch.setattr(kb, "_completion_artifact_txn", ordered_txn)
     outcomes: list[bool] = []
     errors: list[Exception] = []
 
     def complete() -> None:
         try:
             with kb.connect() as conn:
+                ready.wait(timeout=5)
                 outcomes.append(
                     kb.complete_task(
                         conn,
@@ -648,6 +641,203 @@ def test_startup_scavenger_removes_only_stale_unreferenced_files(kanban_home: Pa
         ) == 1
     assert durable.exists()
     assert not orphan.exists()
+
+
+def test_scavenger_waits_until_reused_artifact_manifest_commits(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace = kanban_home / "reuse-race-workspace"
+    workspace.mkdir()
+    artifact = workspace / "proof.txt"
+    artifact.write_text("proof", encoding="utf-8")
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="reuse race", workspace_kind="dir", workspace_path=str(workspace)
+        )
+
+    source_id = hashlib.sha256(str(artifact.resolve()).encode("utf-8")).hexdigest()[:12]
+    content_hash = hashlib.sha256(b"proof").hexdigest()
+    durable = (
+        kb.completion_artifacts_root()
+        / task_id
+        / "0"
+        / source_id
+        / f"{content_hash}-proof.txt"
+    )
+    durable.parent.mkdir(parents=True)
+    durable.write_text("proof", encoding="utf-8")
+    old = time.time() - 7200
+    os.utime(durable, (old, old))
+
+    persist_entered = threading.Event()
+    release_persist = threading.Event()
+    scavenger_started = threading.Event()
+    scavenger_finished = threading.Event()
+    completion_outcomes: list[bool] = []
+    scavenger_results: list[int] = []
+    errors: list[Exception] = []
+    original_persist = kb._persist_completion_artifact_manifest
+
+    def paused_persist(conn, manifest) -> None:
+        persist_entered.set()
+        if not release_persist.wait(timeout=5):
+            raise TimeoutError("test did not release manifest persistence")
+        original_persist(conn, manifest)
+
+    monkeypatch.setattr(kb, "_persist_completion_artifact_manifest", paused_persist)
+
+    def complete() -> None:
+        try:
+            with kb.connect() as conn:
+                completion_outcomes.append(
+                    kb.complete_task(
+                        conn,
+                        task_id,
+                        summary="done",
+                        metadata={"artifacts": [str(artifact)]},
+                    )
+                )
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def scavenge() -> None:
+        try:
+            with kb.connect() as conn:
+                scavenger_started.set()
+                scavenger_results.append(
+                    kb._scavenge_completion_artifacts(
+                        conn, board=None, grace_seconds=3600, now=time.time()
+                    )
+                )
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            scavenger_finished.set()
+
+    completion_thread = threading.Thread(target=complete)
+    completion_thread.start()
+    assert persist_entered.wait(timeout=2)
+    scavenger_thread = threading.Thread(target=scavenge)
+    scavenger_thread.start()
+    try:
+        assert scavenger_started.wait(timeout=2)
+        time.sleep(0.1)
+        assert not scavenger_finished.is_set()
+        assert durable.exists()
+    finally:
+        release_persist.set()
+    completion_thread.join(timeout=5)
+    scavenger_thread.join(timeout=5)
+
+    assert not completion_thread.is_alive()
+    assert not scavenger_thread.is_alive()
+    assert not errors
+    assert completion_outcomes == [True]
+    assert scavenger_results == [0]
+    assert durable.exists()
+    with kb.connect() as conn:
+        assert Path(_artifact_rows(conn, task_id)[0]["durable_path"]) == durable
+
+
+def test_scavenger_preserves_empty_artifact_directories(kanban_home: Path):
+    empty = kb.completion_artifacts_root() / "task" / "1" / "source"
+    empty.mkdir(parents=True)
+    old = time.time() - 7200
+    os.utime(empty, (old, old))
+    with kb.connect() as conn:
+        assert kb._scavenge_completion_artifacts(
+            conn, board=None, grace_seconds=3600, now=time.time()
+        ) == 0
+    assert empty.is_dir()
+
+
+def test_init_db_runs_stale_orphan_scavenger(kanban_home: Path):
+    with kb.connect() as conn:
+        root = kb.completion_artifacts_root()
+        orphan = root / "task" / "1" / "source" / ".promoting-orphan"
+        orphan.parent.mkdir(parents=True)
+        orphan.write_text("orphan", encoding="utf-8")
+        old = time.time() - 7200
+        os.utime(orphan, (old, old))
+    kb.init_db()
+    assert not orphan.exists()
+
+
+def test_rejection_audit_failure_preserves_typed_error(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="audit failure",
+            completion_contract={"artifacts": True},
+        )
+
+        def fail_audit(*args, **kwargs):
+            raise sqlite3.OperationalError("audit locked")
+
+        monkeypatch.setattr(kb, "_append_event", fail_audit)
+        with pytest.raises(kb.CompletionEvidenceError) as exc:
+            kb.complete_task(conn, task_id, summary="missing artifact")
+        assert exc.value.kind == "evidence_missing"
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+
+
+def test_unreferenced_cleanup_rejects_swapped_symlink_ancestor(kanban_home: Path):
+    root = kb.completion_artifacts_root()
+    artifact = root / "task" / "1" / "source" / "hash-proof.txt"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("original", encoding="utf-8")
+    outside = kanban_home / "outside-cleanup"
+    outside_artifact = outside / "1" / "source" / artifact.name
+    outside_artifact.parent.mkdir(parents=True)
+    outside_artifact.write_text("must survive", encoding="utf-8")
+    original_task_dir = root / "task"
+    preserved_task_dir = root / "task-preserved"
+    original_task_dir.rename(preserved_task_dir)
+    original_task_dir.symlink_to(outside, target_is_directory=True)
+
+    with kb.connect() as conn:
+        kb._remove_unreferenced_artifacts(conn, [artifact])
+    assert outside_artifact.read_text(encoding="utf-8") == "must survive"
+    assert (preserved_task_dir / "1" / "source" / artifact.name).exists()
+
+
+def test_scavenger_rejects_symlinked_top_level_root(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    outside = kanban_home / "outside-scavenger"
+    outside.mkdir()
+    orphan = outside / ".promoting-orphan"
+    orphan.write_text("must survive", encoding="utf-8")
+    root_link = kanban_home / "artifact-root-link"
+    root_link.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HERMES_KANBAN_ARTIFACTS_ROOT", str(root_link))
+    with kb.connect() as conn:
+        with pytest.raises(OSError):
+            kb._scavenge_completion_artifacts(
+                conn, board=None, grace_seconds=0, now=time.time() + 1
+            )
+    assert orphan.exists()
+
+
+def test_named_board_completion_labels_lifecycle_hook(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    board = "lifecycle-board"
+    kb.create_board(board)
+    observed: list[dict] = []
+
+    def capture_hook(event_name, task_id, **payload):
+        observed.append({"event": event_name, "task_id": task_id, **payload})
+
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", capture_hook)
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="named lifecycle")
+        assert kb.complete_task(conn, task_id, summary="done", board=board)
+    assert observed[-1]["event"] == "kanban_task_completed"
+    assert observed[-1]["board"] == board
 
 
 def test_strict_notifier_accepts_durable_completion_artifact(

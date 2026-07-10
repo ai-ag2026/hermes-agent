@@ -1432,6 +1432,7 @@ DEFAULT_BUSY_TIMEOUT_MS = 120_000
 # lock (the in-process _INIT_LOCK + idempotent init remain the backstop).
 _INIT_LOCK_TIMEOUT_SECONDS = 10.0
 _INIT_LOCK_POLL_SECONDS = 0.05
+_ARTIFACT_LOCK_TIMEOUT_SECONDS = 30.0
 
 
 def _resolve_busy_timeout_ms() -> int:
@@ -1854,6 +1855,80 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
+class _CompletionArtifactLockError(RuntimeError):
+    pass
+
+
+@contextlib.contextmanager
+def _completion_artifact_lock(conn: sqlite3.Connection):
+    """Serialize scavenging with artifact promotion through manifest commit."""
+    row = conn.execute("PRAGMA database_list").fetchone()
+    database_path = Path(row[2]) if row and row[2] else kanban_db_path()
+    lock_path = database_path.with_name(database_path.name + ".completion-artifacts.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise _CompletionArtifactLockError(
+            f"cannot open completion artifact lock {lock_path}: {exc}"
+        ) from exc
+    handle = os.fdopen(lock_fd, "a+b")
+    acquired = False
+    try:
+        deadline = time.monotonic() + _ARTIFACT_LOCK_TIMEOUT_SECONDS
+        if _IS_WINDOWS:
+            import msvcrt
+
+            locking = getattr(msvcrt, "locking")
+            nb_lock = getattr(msvcrt, "LK_NBLCK")
+            while True:
+                try:
+                    handle.seek(0)
+                    locking(handle.fileno(), nb_lock, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(_INIT_LOCK_POLL_SECONDS)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except (BlockingIOError, OSError):
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(_INIT_LOCK_POLL_SECONDS)
+        if not acquired:
+            raise _CompletionArtifactLockError(
+                f"completion artifact lock for {lock_path} was not acquired within "
+                f"{_ARTIFACT_LOCK_TIMEOUT_SECONDS:.0f}s"
+            )
+        yield
+    finally:
+        try:
+            if acquired:
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    locking = getattr(msvcrt, "locking")
+                    unlock_mode = getattr(msvcrt, "LK_UNLCK")
+                    locking(handle.fileno(), unlock_mode, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def _scavenge_completion_artifacts(
     conn: sqlite3.Connection,
     *,
@@ -1861,43 +1936,61 @@ def _scavenge_completion_artifacts(
     grace_seconds: int = 3600,
     now: Optional[float] = None,
 ) -> int:
-    """Remove stale files that no committed manifest references.
+    with _completion_artifact_lock(conn):
+        return _scavenge_completion_artifacts_locked(
+            conn, board=board, grace_seconds=grace_seconds, now=now
+        )
 
-    The grace window prevents a concurrent completion in another process from
-    losing a file between filesystem promotion and its SQLite commit.
-    """
-    root = completion_artifacts_root(board=board)
-    if not root.exists():
+
+def _scavenge_completion_artifacts_locked(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str],
+    grace_seconds: int = 3600,
+    now: Optional[float] = None,
+) -> int:
+    """Remove stale files that no committed manifest references."""
+    root = completion_artifacts_root(board=board).absolute()
+    if not root.exists() or not hasattr(os, "fwalk"):
         return 0
     referenced = {
         str(row[0]) for row in conn.execute("SELECT durable_path FROM task_artifacts")
     }
     cutoff = (time.time() if now is None else now) - max(0, grace_seconds)
     removed = 0
-    for directory_path, directory_names, file_names in os.walk(root, followlinks=False):
-        directory = Path(directory_path)
-        directory_names[:] = [
-            name for name in directory_names if not (directory / name).is_symlink()
-        ]
-        changed = False
-        for name in file_names:
-            candidate = directory / name
-            try:
-                info = candidate.lstat()
-            except FileNotFoundError:
-                continue
-            if info.st_mtime > cutoff or str(candidate) in referenced:
-                continue
-            if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                candidate.unlink(missing_ok=True)
-                removed += 1
-                changed = True
-        if changed and getattr(os, "O_DIRECTORY", 0):
-            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-            try:
+    root_fd = _open_directory_path_nofollow(root, create=False)
+    try:
+        for relative_dir, directory_names, file_names, directory_fd in os.fwalk(
+            ".", topdown=False, follow_symlinks=False, dir_fd=root_fd
+        ):
+            changed = False
+            for name in file_names:
+                candidate = root / relative_dir / name
+                try:
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if info.st_mtime > cutoff or str(candidate) in referenced:
+                    continue
+                if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    os.unlink(name, dir_fd=directory_fd)
+                    removed += 1
+                    changed = True
+            for name in directory_names:
+                candidate = root / relative_dir / name
+                try:
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    if info.st_mtime <= cutoff and str(candidate) not in referenced:
+                        os.unlink(name, dir_fd=directory_fd)
+                        removed += 1
+                        changed = True
+            if changed:
                 os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+    finally:
+        os.close(root_fd)
     return removed
 
 
@@ -2008,7 +2101,8 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
-                    if db_path is None:
+                    canonical_board_path = str(kanban_db_path(board=board).resolve())
+                    if db_path is None or resolved == canonical_board_path:
                         try:
                             _scavenge_completion_artifacts(conn, board=board)
                         except Exception as exc:
@@ -2080,7 +2174,7 @@ def init_db(
     # schema + migration pass unconditionally.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(resolved)
-    with contextlib.closing(connect(path)):
+    with contextlib.closing(connect(path, board=board)):
         pass
     return path
 
@@ -4667,15 +4761,25 @@ def _record_completion_rejection(
     error: CompletionEvidenceError,
     *,
     run_id: Optional[int],
-) -> None:
-    with write_txn(conn):
-        _append_event(
-            conn,
+) -> bool:
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                error.kind,
+                {"error": str(error), **error.details},
+                run_id=run_id,
+            )
+    except Exception as audit_error:
+        _log.warning(
+            "completion rejection audit failed for task %s (%s): %s",
             task_id,
             error.kind,
-            {"error": str(error), **error.details},
-            run_id=run_id,
+            audit_error,
         )
+        return False
+    return True
 
 
 def _validate_completion_contract(task: Task, metadata: dict) -> None:
@@ -4763,10 +4867,14 @@ def _open_directory_path_nofollow(path: Path, *, create: bool) -> int:
     try:
         for component in path.parts[1:]:
             if create:
+                created = False
                 try:
                     os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                    created = True
                 except FileExistsError:
                     pass
+                if created:
+                    os.fsync(current_fd)
             next_fd = os.open(component, flags, dir_fd=current_fd)
             os.close(current_fd)
             current_fd = next_fd
@@ -4872,10 +4980,14 @@ def _open_artifact_destination_child(
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0)
     )
+    created = False
     try:
         os.mkdir(component, mode=0o700, dir_fd=parent_fd)
+        created = True
     except FileExistsError:
         pass
+    if created:
+        os.fsync(parent_fd)
     try:
         child_fd = os.open(component, flags, dir_fd=parent_fd)
     except OSError as exc:
@@ -5064,17 +5176,33 @@ def _promote_completion_artifacts(
 
 
 def _unlink_artifact_durably(path: Path) -> None:
-    parent = path.parent
+    parent = path.parent.absolute()
     try:
-        path.unlink()
-    except FileNotFoundError:
+        parent_fd = _open_directory_path_nofollow(parent, create=False)
+    except OSError as exc:
+        _log.warning("refusing unsafe artifact cleanup for %s: %s", path, exc)
         return
-    _fsync_directory(parent)
     try:
-        parent.rmdir()
+        try:
+            os.unlink(path.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+    try:
+        grandparent_fd = _open_directory_path_nofollow(parent.parent, create=False)
     except OSError:
         return
-    _fsync_directory(parent.parent)
+    try:
+        try:
+            os.rmdir(parent.name, dir_fd=grandparent_fd)
+        except OSError:
+            return
+        os.fsync(grandparent_fd)
+    finally:
+        os.close(grandparent_fd)
 
 
 def _remove_unreferenced_artifacts(
@@ -5165,6 +5293,45 @@ def _completion_evidence_error_boundary(
 
 
 def complete_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+    board: Optional[str] = None,
+) -> bool:
+    """Complete a task while excluding concurrent artifact scavenging."""
+    try:
+        with _completion_artifact_lock(conn):
+            return _complete_task_locked(
+                conn,
+                task_id,
+                result=result,
+                summary=summary,
+                metadata=metadata,
+                created_cards=created_cards,
+                expected_run_id=expected_run_id,
+                board=board,
+            )
+    except _CompletionArtifactLockError as exc:
+        error = CompletionEvidenceError(
+            "artifact_promotion_failed",
+            f"completion artifact lock failed: {exc}",
+        )
+        task = get_task(conn, task_id)
+        _record_completion_rejection(
+            conn,
+            task_id,
+            error,
+            run_id=task.current_run_id if task is not None else None,
+        )
+        raise error from exc
+
+
+def _complete_task_locked(
     conn: sqlite3.Connection,
     task_id: str,
     *,
@@ -5392,7 +5559,7 @@ def complete_task(
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
         task_id,
-        board=get_current_board(),
+        board=board if board is not None else get_current_board(),
         assignee=_done_task.assignee if _done_task else None,
         run_id=run_id,
         summary=(summary if summary is not None else result),
