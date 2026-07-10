@@ -2679,8 +2679,18 @@ DEFAULT_CONFIG = {
         "dispatch_stale_timeout_seconds": 14400,
         # Linux-only worker resource-stall detection. Unsupported/missing
         # procfs or cgroup-v2 signals degrade to no-op probes.
+        # Opt-in (enabled=False) until live-validated: spawned workers share
+        # the gateway's cgroup (Popen(start_new_session=True) inherits it
+        # rather than getting its own), so the memory/PSI reading is a
+        # cross-task AGGREGATE across every worker plus the gateway itself,
+        # not per-worker. A busy neighbour can push a healthy task's cgroup
+        # reading past threshold; the sustained-D-state conjunction on that
+        # task's own PID limits but doesn't eliminate the false-positive
+        # risk. Flip to True only after watching it run for a while against
+        # real worker load. See kanban_resource_monitor.probe_cgroup and
+        # kanban_db.detect_resource_stalls for the full rationale.
         "resource_monitor": {
-            "enabled": True,
+            "enabled": False,
             "d_state_seconds": 120,
             "memory_high_ratio": 0.98,
             "psi_some_avg10": 1.0,

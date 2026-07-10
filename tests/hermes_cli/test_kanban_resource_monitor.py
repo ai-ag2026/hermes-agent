@@ -91,7 +91,10 @@ def test_sustained_memcg_d_state_blocks_fail_closed(kanban_home, monkeypatch):
         conn.commit()
 
         monkeypatch.setattr(rm, "probe_process", lambda *a, **k: {"supported": True, "identity_matches": True, "state": "D", "wchan": "__mem_cgroup_handle_over_high", "start_ticks": 900})
-        monkeypatch.setattr(rm, "probe_cgroup", lambda *a, **k: {"supported": True, "current": 1000, "high": 1000, "high_ratio": 1.0, "events": {"high": 9}, "events_delta": {"high": 2}, "pressure": {"some_avg10": 2.0, "some_total": 20}, "pressure_delta": {"some_total": 10}, "swap_current": 0})
+        # detect_resource_stalls reads the cgroup snapshot once per tick (not
+        # per row) and computes deltas locally, so tests mock
+        # read_cgroup_snapshot with absolute counters rather than probe_cgroup.
+        monkeypatch.setattr(rm, "read_cgroup_snapshot", lambda *a, **k: {"supported": True, "current": 1000, "high": 1000, "high_ratio": 1.0, "events": {"high": 9}, "pressure": {"some_avg10": 2.0, "some_total": 20}, "swap_current": 0})
         monkeypatch.setattr(kb.time, "time", lambda: 100)
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
 
@@ -125,7 +128,7 @@ def test_surviving_kill_is_typed_termination_pending(kanban_home, monkeypatch):
         conn.execute("UPDATE task_runs SET d_state_since=10 WHERE id=?", (run_id,))
         conn.commit()
         monkeypatch.setattr(rm, "probe_process", lambda *a, **k: {"supported": True, "identity_matches": True, "state": "D"})
-        monkeypatch.setattr(rm, "probe_cgroup", lambda *a, **k: {"supported": True, "high_ratio": 1.0, "events_delta": {"high": 1}, "pressure": {}})
+        monkeypatch.setattr(rm, "read_cgroup_snapshot", lambda *a, **k: {"supported": True, "high_ratio": 1.0, "events": {"high": 1}, "pressure": {}})
         monkeypatch.setattr(kb.time, "time", lambda: 100)
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
 
@@ -151,7 +154,7 @@ def test_monitor_errors_are_sampled_into_events_and_logs(kanban_home, monkeypatc
         kb.claim_task(conn, tid)
         kb._set_worker_pid(conn, tid, 42, start_ticks=900)
         monkeypatch.setattr(rm, "probe_process", lambda *a, **k: {"supported": True, "identity_matches": True, "state": "S", "errors": ["status:PermissionError"]})
-        monkeypatch.setattr(rm, "probe_cgroup", lambda *a, **k: {"supported": True, "events_delta": {}, "pressure": {}, "errors": ["memory.events:PermissionError"]})
+        monkeypatch.setattr(rm, "read_cgroup_snapshot", lambda *a, **k: {"supported": True, "events": {}, "pressure": {}, "errors": ["memory.events:PermissionError"]})
 
         for _ in range(3):
             assert kb.detect_resource_stalls(conn, cgroup_path="/unused") == []
@@ -161,6 +164,59 @@ def test_monitor_errors_are_sampled_into_events_and_logs(kanban_home, monkeypatc
         ).fetchall()
         assert [json.loads(row["payload"])["count"] for row in events] == [1, 2]
         assert caplog.text.count("kanban resource monitor error") == 2
+
+
+def test_null_start_ticks_never_auto_blocks(kanban_home, monkeypatch, caplog):
+    """A run row with no worker_start_ticks can't be identity-verified against
+    its PID (a reused PID could belong to an unrelated process), so it must
+    never be auto-blocked -- even if probe_process/probe_cgroup would
+    otherwise report a sustained stall. Fund 5 repair."""
+    import hermes_cli.kanban_resource_monitor as rm
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="no start ticks", assignee="worker")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        kb.claim_task(conn, tid)
+        # _set_worker_pid without start_ticks, and force worker_start_ticks
+        # back to NULL to simulate a spawn that raced or predates the column.
+        kb._set_worker_pid(conn, tid, 42, start_ticks=None)
+        run_id = kb.latest_run(conn, tid).id
+        conn.execute(
+            "UPDATE task_runs SET worker_start_ticks=NULL, d_state_since=10 WHERE id=?",
+            (run_id,),
+        )
+        conn.commit()
+
+        # Even if the process/cgroup probes would otherwise scream "stalled",
+        # identity is unverifiable so detect_resource_stalls must skip it.
+        called = {"probe_process": False}
+
+        def _probe_process(*a, **k):
+            called["probe_process"] = True
+            return {"supported": True, "identity_matches": True, "state": "D"}
+
+        monkeypatch.setattr(rm, "probe_process", _probe_process)
+        monkeypatch.setattr(rm, "read_cgroup_snapshot", lambda *a, **k: {"supported": True, "high_ratio": 1.0, "events": {}, "pressure": {"some_avg10": 5.0}})
+        monkeypatch.setattr(kb.time, "time", lambda: 200)
+
+        for _ in range(3):
+            assert kb.detect_resource_stalls(conn, cgroup_path="/unused", d_state_seconds=60) == []
+
+        assert called["probe_process"] is False, (
+            "identity is unverifiable without worker_start_ticks -- probe_process "
+            "must not even be called, let alone used to justify a block"
+        )
+        assert kb.get_task(conn, tid).status == "running"
+
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='monitoring_error' ORDER BY id",
+            (tid,),
+        ).fetchall()
+        assert [json.loads(row["payload"])["count"] for row in events] == [1, 2]
+        assert [json.loads(row["payload"])["errors"] for row in events] == [
+            ["worker_start_ticks:missing"]
+        ] * 2
+        assert caplog.text.count("worker_start_ticks") >= 2
 
 
 def test_resource_monitor_recovers_from_transient_d_state(kanban_home, monkeypatch):
@@ -175,7 +231,7 @@ def test_resource_monitor_recovers_from_transient_d_state(kanban_home, monkeypat
         conn.execute("UPDATE task_runs SET d_state_since=10 WHERE id=?", (run_id,))
         conn.commit()
         monkeypatch.setattr(rm, "probe_process", lambda *a, **k: {"supported": True, "identity_matches": True, "state": "S", "wchan": "ep_poll", "start_ticks": 900})
-        monkeypatch.setattr(rm, "probe_cgroup", lambda *a, **k: {"supported": True, "events": {}, "events_delta": {}, "pressure": {}, "pressure_delta": {}, "high_ratio": 0.1})
+        monkeypatch.setattr(rm, "read_cgroup_snapshot", lambda *a, **k: {"supported": True, "events": {}, "pressure": {}, "high_ratio": 0.1})
         assert kb.detect_resource_stalls(conn, cgroup_path="/unused", d_state_seconds=60) == []
         row = conn.execute("SELECT d_state_since FROM task_runs WHERE id=?", (run_id,)).fetchone()
         assert row[0] is None

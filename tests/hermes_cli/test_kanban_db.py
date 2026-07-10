@@ -4112,11 +4112,56 @@ def test_detect_stale_returns_running_task_with_no_heartbeat(kanban_home, monkey
 
 
 def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch):
-    """A task running > timeout with a heartbeat older than 1h gets reclaimed."""
+    """A task running > timeout with a heartbeat older than the SAME timeout
+    window gets reclaimed.
+
+    Fund 1/7 repair: staleness now uses one unified window
+    (stale_timeout_seconds) for liveness, not the old separate hardcoded
+    _STALE_HEARTBEAT_GAP_SECONDS (1h) gate that used to fire independently
+    of the configured timeout. A heartbeat merely older than 1h but still
+    within the 4h timeout window is NOT stale (see
+    test_detect_stale_skips_task_with_recent_heartbeat's sibling below) --
+    only a heartbeat older than the timeout itself is.
+    """
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="stale-hb", assignee="worker")
+        kb.claim_task(conn, t)
+        kb._set_worker_pid(conn, t, os.getpid())
+
+        five_hours_ago = int(time.time()) - (5 * 3600)
+        heartbeat_4_5h_ago = int(time.time()) - int(4.5 * 3600)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ?, last_heartbeat_at = ? "
+                "WHERE id = ?",
+                (five_hours_ago, heartbeat_4_5h_ago, t),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (five_hours_ago, t),
+            )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        stale = kb.detect_stale_running(
+            conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
+        )
+        assert t in stale, (
+            "Task with heartbeat older than the 4h timeout window should be stale"
+        )
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_detect_stale_skips_heartbeat_older_than_gap_but_within_timeout(kanban_home, monkeypatch):
+    """A heartbeat 2h old is NOT stale when stale_timeout_seconds is 4h --
+    proves the old hardcoded 1h _STALE_HEARTBEAT_GAP_SECONDS gate is gone
+    and staleness uses ONE window (stale_timeout_seconds) throughout."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="hb-2h-old", assignee="worker")
         kb.claim_task(conn, t)
         kb._set_worker_pid(conn, t, os.getpid())
 
@@ -4134,18 +4179,29 @@ def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch
                 (five_hours_ago, t),
             )
 
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
         stale = kb.detect_stale_running(
             conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
         )
-        assert t in stale, (
-            "Task with heartbeat >1h old and started >4h ago should be stale"
+        assert stale == [], (
+            "heartbeat 2h old is within the 4h timeout window -- not stale"
         )
-        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).status == "running"
 
 
 def test_detect_stale_skips_task_with_recent_heartbeat(kanban_home, monkeypatch):
-    """A task running > timeout but with a recent heartbeat is NOT reclaimed."""
+    """A task running > timeout but with a recent heartbeat is NOT reclaimed.
+
+    Fund 2 repair: this must prove the real "recent heartbeat -> skip" path
+    -- i.e. the liveness check short-circuits BEFORE any termination attempt
+    is made -- not just that the end result happens to be status='running'.
+    Before the fix, a recent last_heartbeat_at alone did not stop
+    detect_stale_running from treating the task as stale (staleness was
+    gated on last_semantic_progress_at only), so this test only passed
+    because it fell into the "worker survived termination -> defer" path,
+    which calls _terminate_reclaimed_worker and (with _pid_alive patched to
+    True and a no-op signal_fn) burns ~5s retrying SIGTERM before giving up.
+    """
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
@@ -4168,11 +4224,108 @@ def test_detect_stale_skips_task_with_recent_heartbeat(kanban_home, monkeypatch)
             )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        terminate_calls = []
+        real_terminate = _kb._terminate_reclaimed_worker
+        monkeypatch.setattr(
+            _kb, "_terminate_reclaimed_worker",
+            lambda *a, **k: terminate_calls.append((a, k)) or real_terminate(*a, **k),
+        )
+
+        started = time.monotonic()
         stale = kb.detect_stale_running(
             conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
         )
+        elapsed = time.monotonic() - started
+
         assert stale == [], "Task with recent heartbeat should not be reclaimed"
         assert kb.get_task(conn, t).status == "running"
+        assert terminate_calls == [], (
+            "recent last_heartbeat_at must short-circuit the liveness check "
+            "before any termination is attempted"
+        )
+        assert elapsed < 1.0, (
+            f"took {elapsed:.2f}s -- recent-heartbeat skip must be immediate, "
+            "not fall through to the 5s SIGTERM-retry/defer path"
+        )
+
+
+def test_detect_stale_skips_task_with_only_auto_activity(kanban_home, monkeypatch):
+    """A task running > timeout with ONLY automatic activity heartbeats
+    (last_heartbeat_at/last_activity_at fresh, last_semantic_progress_at
+    NULL) is NOT reclaimed. This is the exact scenario that made d7d5b3dae's
+    semantic-progress-only staleness gate dangerous: almost no worker calls
+    the explicit kanban_heartbeat tool, so last_semantic_progress_at stays
+    NULL for a healthy multi-hour worker and it would be killed the instant
+    dispatch_stale_timeout_seconds elapsed. Fund 1 repair."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="auto-activity-only", assignee="worker")
+        kb.claim_task(conn, t)
+        run_id = kb.latest_run(conn, t).id
+
+        five_hours_ago = int(time.time()) - (5 * 3600)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?", (five_hours_ago, t)
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?",
+                (five_hours_ago, run_id),
+            )
+
+        # Simulate the runtime's auto-heartbeat: semantic=False, sent on
+        # essentially every tool call. last_semantic_progress_at stays NULL.
+        assert kb.heartbeat_worker(conn, t, expected_run_id=run_id, semantic=False)
+        row = conn.execute(
+            "SELECT last_heartbeat_at, last_activity_at, last_semantic_progress_at "
+            "FROM tasks WHERE id=?", (t,),
+        ).fetchone()
+        assert row["last_heartbeat_at"] is not None
+        assert row["last_activity_at"] is not None
+        assert row["last_semantic_progress_at"] is None
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        stale = kb.detect_stale_running(
+            conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
+        )
+        assert stale == [], (
+            "worker with only auto-activity heartbeats (no semantic progress) "
+            "must NOT be reclaimed -- it's still alive"
+        )
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_detect_stale_reclaims_task_with_no_activity_at_all(kanban_home, monkeypatch):
+    """Gegenprobe: a task with NO fresh activity of any kind (no heartbeat,
+    no auto-activity, no semantic progress) is still reclaimed as stale.
+    Fund 1 repair -- confirms the liveness relaxation didn't also disable
+    the original no-heartbeat-ever reclaim path."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="truly-idle", assignee="worker")
+        kb.claim_task(conn, t)
+        kb._set_worker_pid(conn, t, os.getpid())
+
+        five_hours_ago = int(time.time()) - (5 * 3600)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?", (five_hours_ago, t)
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                (five_hours_ago, t),
+            )
+        # No heartbeat, no activity, no semantic progress set at all.
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        stale = kb.detect_stale_running(
+            conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
+        )
+        assert stale == [t], "Task with zero liveness signals for >4h should be reclaimed"
+        assert kb.get_task(conn, t).status == "ready"
 
 
 def test_detect_stale_skips_recently_started_task(kanban_home, monkeypatch):

@@ -7869,7 +7869,28 @@ def detect_resource_stalls(
     high_event_delta: int = 1,
     signal_fn=None,
 ) -> list[str]:
-    """Fail closed when an identity-bound worker is resource-stalled."""
+    """Fail closed when an identity-bound worker is resource-stalled.
+
+    CROSS-TASK AGGREGATE CGROUP (see also ``kanban_resource_monitor
+    .probe_cgroup``): spawned workers share the gateway's cgroup
+    (``Popen(start_new_session=True)`` inherits it rather than getting its
+    own), so the cgroup reading below reflects memory pressure for ALL
+    workers plus the gateway process itself -- not just the one task being
+    evaluated. A memory-hungry neighbour can push another, healthy task's
+    cgroup reading past threshold. This is only safe to act on because the
+    block decision requires a SUSTAINED ``D``-state (uninterruptible sleep)
+    observed on THAT task's own worker PID via ``probe_process`` in
+    addition to the aggregate cgroup signal -- cgroup pressure alone never
+    blocks a task. Real per-task isolation needs per-worker systemd scopes
+    (one cgroup per spawned worker); that is future work, not implemented
+    here.
+
+    IDENTITY: a run row with no recorded ``worker_start_ticks`` (spawn
+    raced, or predates this column) cannot be identity-verified against its
+    PID -- a reused PID could belong to an unrelated process. Such tasks
+    are skipped and never auto-blocked; a sampled ``monitoring_error``
+    event/log records the gap instead.
+    """
     from hermes_cli import kanban_resource_monitor as monitor
 
     if sys.platform != "linux":
@@ -7885,19 +7906,49 @@ def detect_resource_stalls(
         "JOIN task_runs r ON r.id=t.current_run_id "
         "WHERE t.status='running' AND t.worker_pid IS NOT NULL"
     ).fetchall()
+    # The cgroup counters are the same filesystem read for every row this
+    # tick (one shared cgroup, see docstring above) -- read once rather than
+    # once per row, then fold in each row's own previous-sample baseline.
+    try:
+        cgroup_snapshot = monitor.read_cgroup_snapshot(resolved_cgroup)
+    except Exception as exc:
+        cgroup_snapshot = {"supported": False, "errors": [f"cgroup:{type(exc).__name__}"]}
     for row in rows:
         try:
             previous = json.loads(row["resource_sample"] or "{}")
         except (TypeError, ValueError):
             previous = {}
+
+        if row["worker_start_ticks"] is None:
+            error_count = int(previous.get("monitoring_error_count", 0)) + 1
+            sample = {"supported": False, "monitoring_error_count": error_count}
+            if error_count & (error_count - 1) == 0:
+                error_payload = {"count": error_count, "errors": ["worker_start_ticks:missing"]}
+                _log.warning(
+                    "kanban resource monitor: task %s has no worker_start_ticks; "
+                    "skipping resource-stall check, PID identity unverifiable (sample %d)",
+                    row["id"], error_count,
+                )
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "monitoring_error", error_payload,
+                        run_id=int(row["current_run_id"]),
+                    )
+            encoded = json.dumps(sample, sort_keys=True, separators=(",", ":"))[:8192]
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE task_runs SET resource_sample=? WHERE id=?",
+                    (encoded, int(row["current_run_id"])),
+                )
+            continue
+
         try:
             process = monitor.probe_process(
                 int(row["worker_pid"]), expected_start_ticks=row["worker_start_ticks"]
             )
-            sample = monitor.probe_cgroup(resolved_cgroup, previous=previous)
         except Exception as exc:
             process = {"supported": True, "errors": [f"probe:{type(exc).__name__}"]}
-            sample = {"supported": False, "errors": []}
+        sample = monitor.cgroup_deltas_since(cgroup_snapshot, previous)
         errors = list(process.get("errors") or []) + list(sample.get("errors") or [])
         error_count = int(previous.get("monitoring_error_count", 0))
         if errors:
@@ -8099,29 +8150,37 @@ def enforce_max_runtime(
     return timed_out
 
 
-# Heartbeat staleness heartbeat gap — if a running task hasn't sent a
-# heartbeat in this many seconds it's considered inactive regardless of
-# the ``dispatch_stale_timeout_seconds`` threshold.  Hardcoded at 1 hour
-# to match the original spec (">4h started + no commits in 1h").
-_STALE_HEARTBEAT_GAP_SECONDS = 3600
-
-
 def detect_stale_running(
     conn: sqlite3.Connection,
     *,
     stale_timeout_seconds: int = 0,
     signal_fn=None,
 ) -> list[str]:
-    """Reclaim ``running`` tasks that show no semantic progress within the
-    staleness window.
+    """Reclaim ``running`` tasks that show no liveness within the staleness
+    window.
 
     A task is considered stale when BOTH of these hold:
 
     1. It has been running for longer than ``stale_timeout_seconds``
        (measured from the active run's ``started_at``, falling back to
        ``tasks.started_at`` on older runs).
-    2. Its ``last_semantic_progress_at`` is older than the same window.
-       Automatic liveness heartbeats deliberately do not reset this clock.
+    2. Its most recent LIVENESS signal -- ``max(last_heartbeat_at,
+       last_activity_at, last_semantic_progress_at)`` -- is older than the
+       same window.
+
+    Liveness and progress are deliberately kept separate columns but this
+    reclaim decision uses the freshest of all three: a worker that is still
+    emitting automatic activity heartbeats (``semantic=False``, sent by the
+    runtime on essentially every tool call / stream chunk -- see
+    ``tools/kanban_tools.py::heartbeat_current_worker_from_env``) is alive
+    and must NOT be reclaimed, even if it never once made explicit semantic
+    progress. Reclaiming on ``last_semantic_progress_at`` alone would kill
+    a healthy multi-hour worker the instant ``dispatch_stale_timeout_seconds``
+    elapses, because almost nothing calls the explicit ``kanban_heartbeat``
+    tool. ``last_semantic_progress_at`` remains the signal used by
+    ``detect_resource_stalls``' telemetry and by goal-loop no-progress
+    detection -- those care about "did real work happen", this cares about
+    "is anyone home".
 
     On reclaim the task is reset to ``ready``, the run is closed with
     ``outcome='stale'``, and the host-local worker (if still running) is
@@ -8143,7 +8202,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, "
+        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.last_activity_at, "
         "       t.last_semantic_progress_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
@@ -8160,13 +8219,22 @@ def detect_stale_running(
         if elapsed < stale_timeout_seconds:
             continue  # not old enough to check
 
+        last_hb = row["last_heartbeat_at"]
+        last_activity = row["last_activity_at"]
         last_progress = row["last_semantic_progress_at"]
+        liveness_candidates = [
+            v for v in (last_hb, last_activity, last_progress) if v is not None
+        ]
+        last_liveness = max(liveness_candidates) if liveness_candidates else None
+        liveness_age = (
+            now - int(last_liveness) if last_liveness is not None else elapsed
+        )
+        if liveness_age < stale_timeout_seconds:
+            continue  # recent heartbeat/activity/progress → still alive
+
         progress_age = (
             now - int(last_progress) if last_progress is not None else elapsed
         )
-        if progress_age < stale_timeout_seconds:
-            continue
-        last_hb = row["last_heartbeat_at"]
         hb_age = (now - int(last_hb)) if last_hb is not None else None
 
         pid = row["worker_pid"]
@@ -8207,10 +8275,14 @@ def detect_stale_running(
                 "heartbeat_age_seconds": (
                     int(hb_age) if hb_age is not None else None
                 ),
+                "last_activity_at": (
+                    int(last_activity) if last_activity is not None else None
+                ),
                 "last_semantic_progress_at": (
                     int(last_progress) if last_progress is not None else None
                 ),
                 "semantic_progress_age_seconds": int(progress_age),
+                "liveness_age_seconds": int(liveness_age),
                 "timeout_seconds": stale_timeout_seconds,
                 "pid": int(pid) if pid else None,
             }
@@ -8904,6 +8976,16 @@ def dispatch_once(
     The lock is keyed off the board's resolved DB path, so unrelated
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
+
+    ``resource_monitor`` is opt-in per caller, not a global default: only
+    the gateway's own dispatcher tick (``gateway/kanban_watchers.py``)
+    reads ``kanban.resource_monitor`` from config and passes it through.
+    The CLI dispatch path (``hermes kanban dispatch`` /
+    ``hermes_cli/kanban.py``) and the dashboard's quick-dispatch endpoint
+    (``plugins/kanban/dashboard/plugin_api.py``) call this with
+    ``resource_monitor=None`` and therefore run WITHOUT the resource-stall
+    check, by design -- they're short-lived, human-triggered ticks, not the
+    long-running loop the D-state/cgroup heuristic is built for.
     """
     try:
         db_path = kanban_db_path(board=board)
@@ -8960,6 +9042,10 @@ def _dispatch_once_locked(
     resource_monitor: Optional[dict[str, Any]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
+
+    ``resource_monitor`` is opt-in and caller-supplied -- see the note on
+    :func:`dispatch_once` (only the gateway's tick passes it; CLI and
+    dashboard dispatch run without the resource-stall check).
 
     Steps:
       1. Reclaim stale running tasks (TTL expired).

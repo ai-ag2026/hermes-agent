@@ -120,13 +120,17 @@ def _parse_pressure(path: Path) -> dict[str, float | int]:
     return values
 
 
-def probe_cgroup(
-    cgroup_path: str | Path,
-    *,
-    previous: Optional[Mapping[str, Any]] = None,
-    platform: Optional[str] = None,
+def read_cgroup_snapshot(
+    cgroup_path: str | Path, *, platform: Optional[str] = None
 ) -> dict[str, Any]:
-    """Read bounded cgroup-v2 memory counters and monotonic deltas."""
+    """Read absolute cgroup-v2 memory/pressure counters (no delta calc).
+
+    Split out of ``probe_cgroup`` so a dispatcher tick that checks many
+    tasks against the SAME cgroup (see the aggregate-cgroup note on
+    ``probe_cgroup``) can do the filesystem reads once and reuse the
+    snapshot; call ``cgroup_deltas_since`` per task to fold in that task's
+    own previous-sample baseline.
+    """
     if (platform or sys.platform) != "linux":
         return {"supported": False, "reason": "unsupported_platform"}
     base = Path(cgroup_path)
@@ -139,17 +143,6 @@ def probe_cgroup(
     swap_max = _read_int(base / "memory.swap.max")
     events = _parse_events(base / "memory.events")
     pressure = _parse_pressure(base / "memory.pressure")
-    prev_events = dict((previous or {}).get("events") or {})
-    prev_pressure = dict((previous or {}).get("pressure") or {})
-    events_delta = {
-        key: max(0, value - int(prev_events.get(key, value)))
-        for key, value in events.items()
-    }
-    pressure_delta = {
-        key: max(0, int(value) - int(prev_pressure.get(key, value)))
-        for key, value in pressure.items()
-        if key.endswith("_total")
-    }
     ratio = None
     if current is not None and high not in (None, 0):
         ratio = min(1000.0, current / high)
@@ -166,7 +159,62 @@ def probe_cgroup(
         "swap_max": swap_max,
         "swap_ratio": swap_ratio,
         "events": events,
-        "events_delta": events_delta,
         "pressure": pressure,
-        "pressure_delta": pressure_delta,
     }
+
+
+def cgroup_deltas_since(
+    snapshot: Mapping[str, Any], previous: Optional[Mapping[str, Any]] = None
+) -> dict[str, Any]:
+    """Fold a stored ``previous`` sample into monotonic deltas over ``snapshot``.
+
+    ``snapshot`` is the shared, tick-level absolute reading from
+    ``read_cgroup_snapshot``; ``previous`` is the per-task baseline (this
+    task's own last recorded sample), so the resulting deltas stay
+    per-task even though the underlying counters are cgroup-wide.
+    """
+    if not snapshot.get("supported"):
+        return dict(snapshot)
+    events = snapshot.get("events") or {}
+    pressure = snapshot.get("pressure") or {}
+    prev_events = dict((previous or {}).get("events") or {})
+    prev_pressure = dict((previous or {}).get("pressure") or {})
+    events_delta = {
+        key: max(0, value - int(prev_events.get(key, value)))
+        for key, value in events.items()
+    }
+    pressure_delta = {
+        key: max(0, int(value) - int(prev_pressure.get(key, value)))
+        for key, value in pressure.items()
+        if key.endswith("_total")
+    }
+    return {**snapshot, "events_delta": events_delta, "pressure_delta": pressure_delta}
+
+
+def probe_cgroup(
+    cgroup_path: str | Path,
+    *,
+    previous: Optional[Mapping[str, Any]] = None,
+    platform: Optional[str] = None,
+) -> dict[str, Any]:
+    """Read bounded cgroup-v2 memory counters and monotonic deltas.
+
+    CROSS-TASK AGGREGATE, NOT PER-WORKER: kanban workers are spawned via
+    ``Popen(start_new_session=True)`` and inherit the caller's cgroup, so in
+    the live gateway deployment ``cgroup_path`` is ``hermes-gateway.service``
+    — the SAME cgroup for the gateway process itself and every worker it has
+    spawned. A sample from this function therefore measures memory pressure
+    for the whole fleet, not the one task whose PID triggered the probe. A
+    memory-hungry neighbour task (or the gateway) can push another task's
+    ``resource_stalled`` reading past threshold even though that task's own
+    process is healthy — a cross-task false positive.
+
+    Mitigation in ``detect_resource_stalls``: this reading is only ever ANDed
+    with a sustained ``D`` (uninterruptible sleep) state observed on the
+    SPECIFIC worker PID via ``probe_process`` — a neighbour's memory pressure
+    alone never blocks a task. The real fix is per-worker systemd scopes (one
+    cgroup per spawned worker) so this function can attribute pressure to a
+    single task; that is future work, not implemented here.
+    """
+    snapshot = read_cgroup_snapshot(cgroup_path, platform=platform)
+    return cgroup_deltas_since(snapshot, previous)
