@@ -15602,6 +15602,145 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 # Main Entry Point
 # ============================================================================
 
+# ---- kanban goal-loop progress fingerprint (S4 review: "progress_fn
+# anschließen") --------------------------------------------------------------
+# Without these three signals, goals.run_kanban_goal_loop's no_progress
+# detector only sees the response hash + judge verdict — a worker doing real
+# work but writing uniform prose could be false-positive blocked, while a
+# worker stuck repeating itself could hide behind an unrelated event/diff.
+# extra.get("task_event_count") / "workspace_fingerprint" /
+# "test_manifest_fingerprint" in goals.py's fingerprint tuple are exactly
+# these three keys.
+
+# Cap how many tests/ files feed the manifest fingerprint, and how many
+# directory entries we're willing to walk to find them — this must stay
+# "leichtgewichtig": mtime+size of the N most-recently-touched files is
+# enough to detect churn without hashing file contents or letting a
+# pathological tests/ tree turn a per-turn check into a multi-second stall.
+_KANBAN_TEST_MANIFEST_SAMPLE_LIMIT = 200
+_KANBAN_TEST_MANIFEST_WALK_LIMIT = 5000
+
+
+def _kanban_workspace_git_fingerprint(workspace: str) -> "str | None":
+    """Hash of HEAD + working-tree status/diffstat for ``workspace``, or
+    None if it isn't a git repo or anything fails. Bounded to
+    ``git diff --stat`` (never a full diff — that can be multi-MB mid-edit)."""
+    import hashlib
+    import subprocess
+
+    if not (Path(workspace) / ".git").exists():
+        return None
+
+    def _git(args: list):
+        return subprocess.run(
+            ["git", *args],
+            capture_output=True, text=True, timeout=10, cwd=workspace,
+        )
+
+    try:
+        head = _git(["rev-parse", "HEAD"])
+        if head.returncode != 0:
+            return None
+        status = _git(["status", "--porcelain"])
+        diffstat = _git(["diff", "--stat"])
+        raw = "\x00".join([
+            head.stdout.strip(),
+            status.stdout if status.returncode == 0 else "",
+            diffstat.stdout if diffstat.returncode == 0 else "",
+        ])
+        return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
+    except Exception:
+        return None
+
+
+def _kanban_test_manifest_fingerprint(workspace: str) -> "str | None":
+    """Hash of mtime+size for the most-recently-touched files under
+    ``tests/`` in ``workspace``, or None if there's no tests/ dir or
+    anything fails. This is a churn signal, not a precise test-suite state
+    hash, so both the walk and the sample are bounded."""
+    import hashlib
+
+    tests_dir = Path(workspace) / "tests"
+    if not tests_dir.is_dir():
+        return None
+    try:
+        entries: list = []
+        visited = 0
+        for root, _dirs, files in os.walk(tests_dir):
+            for name in files:
+                visited += 1
+                if visited > _KANBAN_TEST_MANIFEST_WALK_LIMIT:
+                    break
+                fp = Path(root) / name
+                try:
+                    st = fp.stat()
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, str(fp.relative_to(tests_dir)), st.st_size))
+            if visited > _KANBAN_TEST_MANIFEST_WALK_LIMIT:
+                break
+        if not entries:
+            return None
+        # Tie-break on path: mtime resolution on fast filesystems can collide
+        # for files written in the same test setup, and an unstable order
+        # would make the fingerprint flap without any real churn.
+        entries.sort(key=lambda e: (-e[0], e[1]))
+        sample = entries[:_KANBAN_TEST_MANIFEST_SAMPLE_LIMIT]
+        raw = "\x00".join(f"{rel}:{mtime}:{size}" for mtime, rel, size in sample)
+        return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
+    except Exception:
+        return None
+
+
+def _kanban_progress_snapshot(task_id: str, workspace: "str | None") -> dict:
+    """Build the ``progress_fn`` payload ``goals.run_kanban_goal_loop`` folds
+    into its no_progress fingerprint.
+
+    Returns a dict with ``task_event_count`` (new comments / status changes
+    on the card since the DB was last read), ``workspace_fingerprint`` (git
+    HEAD + working-tree delta of the worker's workspace), and
+    ``test_manifest_fingerprint`` (tests/ file churn). Extracted from
+    ``_run_kanban_goal_loop_q`` as a module-level function so it's testable
+    without a HermesCLI instance.
+
+    Every part fails independently to None — this must never raise, the
+    goal loop treats a missing signal as "no evidence" rather than "worker
+    broken".
+    """
+    snapshot: dict = {
+        "task_event_count": None,
+        "workspace_fingerprint": None,
+        "test_manifest_fingerprint": None,
+    }
+
+    try:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            snapshot["task_event_count"] = int(row["n"]) if row is not None else None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if workspace:
+        try:
+            if Path(workspace).is_dir():
+                snapshot["workspace_fingerprint"] = _kanban_workspace_git_fingerprint(workspace)
+                snapshot["test_manifest_fingerprint"] = _kanban_test_manifest_fingerprint(workspace)
+        except Exception:
+            pass
+
+    return snapshot
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -15735,6 +15874,16 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
+    def _progress() -> dict:
+        # Feeds the no_progress fingerprint (S4 review finding: this was
+        # unwired, so it only ever saw response-hash + judge verdict). See
+        # _kanban_progress_snapshot for the three signals it returns.
+        try:
+            workspace = _os.environ.get("HERMES_KANBAN_WORKSPACE") or None
+            return _kanban_progress_snapshot(task_id, workspace)
+        except Exception:
+            return {}
+
     _run_loop(
         task_id=task_id,
         goal_text=goal_text,
@@ -15746,6 +15895,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         log=lambda m: logger.info("%s", m),
         heartbeat_fn=_heartbeat,
         emit_progress=_emit_progress,
+        progress_fn=_progress,
     )
 
 

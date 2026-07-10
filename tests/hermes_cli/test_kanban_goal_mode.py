@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -785,3 +786,191 @@ def test_emit_progress_events_are_bounded_and_secret_free(monkeypatch):
         assert "turns_used" in ev and "max_turns" in ev
         assert "verdict_history" in ev
         assert len(ev["verdict_history"]) <= 5
+
+
+# ---------------------------------------------------------------------------
+# S4 review: "progress_fn anschließen" — cli._kanban_progress_snapshot feeds
+# goals.run_kanban_goal_loop's no_progress fingerprint with task_event_count
+# / workspace_fingerprint / test_manifest_fingerprint. Before this, the
+# no_progress detector only ever saw response-hash + judge verdict.
+# ---------------------------------------------------------------------------
+
+def test_progress_snapshot_task_event_count_increases_with_new_event(kanban_home):
+    from cli import _kanban_progress_snapshot
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", body="b", assignee="default")
+
+    before = _kanban_progress_snapshot(tid, None)["task_event_count"]
+    assert before is not None
+
+    with kb.connect() as conn:
+        kb.add_comment(conn, tid, "worker", "did some work")
+
+    after = _kanban_progress_snapshot(tid, None)["task_event_count"]
+    assert after == before + 1
+
+
+def test_progress_snapshot_missing_workspace_gives_none_keys_no_crash(kanban_home):
+    from cli import _kanban_progress_snapshot
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", body="b", assignee="default")
+
+    # workspace=None mirrors a missing HERMES_KANBAN_WORKSPACE env var.
+    snap = _kanban_progress_snapshot(tid, None)
+    assert snap["workspace_fingerprint"] is None
+    assert snap["test_manifest_fingerprint"] is None
+    # task_event_count is resolved independently of the workspace.
+    assert snap["task_event_count"] is not None
+
+
+def test_progress_snapshot_nonexistent_workspace_path_no_crash(kanban_home, tmp_path):
+    from cli import _kanban_progress_snapshot
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", body="b", assignee="default")
+
+    missing = str(tmp_path / "does-not-exist")
+    snap = _kanban_progress_snapshot(tid, missing)
+    assert snap["workspace_fingerprint"] is None
+    assert snap["test_manifest_fingerprint"] is None
+
+
+def test_progress_snapshot_git_fingerprint_changes_with_commit(kanban_home, tmp_path):
+    import subprocess
+
+    from cli import _kanban_progress_snapshot
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", body="b", assignee="default")
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+
+    def _git(*args):
+        subprocess.run(["git", *args], cwd=ws, check=True, capture_output=True)
+
+    _git("init", "-q")
+    _git("config", "user.email", "test@example.com")
+    _git("config", "user.name", "Test")
+    (ws / "a.txt").write_text("one")
+    _git("add", "a.txt")
+    _git("commit", "-q", "-m", "first")
+
+    snap1 = _kanban_progress_snapshot(tid, str(ws))
+    assert snap1["workspace_fingerprint"] is not None
+
+    (ws / "a.txt").write_text("two")
+    _git("add", "a.txt")
+    _git("commit", "-q", "-m", "second")
+
+    snap2 = _kanban_progress_snapshot(tid, str(ws))
+    assert snap2["workspace_fingerprint"] is not None
+    assert snap2["workspace_fingerprint"] != snap1["workspace_fingerprint"]
+
+
+def test_progress_snapshot_git_fingerprint_changes_with_dirty_worktree(kanban_home, tmp_path):
+    """A commit isn't the only source of progress — uncommitted edits (the
+    common case while a worker is mid-task) must also move the fingerprint,
+    since ``git status --porcelain`` / ``git diff --stat`` feed it too."""
+    import subprocess
+
+    from cli import _kanban_progress_snapshot
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", body="b", assignee="default")
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+
+    def _git(*args):
+        subprocess.run(["git", *args], cwd=ws, check=True, capture_output=True)
+
+    _git("init", "-q")
+    _git("config", "user.email", "test@example.com")
+    _git("config", "user.name", "Test")
+    (ws / "a.txt").write_text("one\n")
+    _git("add", "a.txt")
+    _git("commit", "-q", "-m", "first")
+
+    snap1 = _kanban_progress_snapshot(tid, str(ws))
+
+    (ws / "a.txt").write_text("one\ntwo\n")  # uncommitted edit
+
+    snap2 = _kanban_progress_snapshot(tid, str(ws))
+    assert snap2["workspace_fingerprint"] != snap1["workspace_fingerprint"]
+
+
+def test_progress_snapshot_test_manifest_fingerprint_changes_with_new_test_file(kanban_home, tmp_path):
+    from cli import _kanban_progress_snapshot
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", body="b", assignee="default")
+
+    ws = tmp_path / "workspace"
+    (ws / "tests").mkdir(parents=True)
+    (ws / "tests" / "test_a.py").write_text("def test_a(): pass\n")
+
+    snap1 = _kanban_progress_snapshot(tid, str(ws))
+    assert snap1["test_manifest_fingerprint"] is not None
+
+    (ws / "tests" / "test_b.py").write_text("def test_b(): pass\n")
+
+    snap2 = _kanban_progress_snapshot(tid, str(ws))
+    assert snap2["test_manifest_fingerprint"] != snap1["test_manifest_fingerprint"]
+
+
+def test_progress_snapshot_no_tests_dir_gives_none_manifest(kanban_home, tmp_path):
+    from cli import _kanban_progress_snapshot
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", body="b", assignee="default")
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+
+    snap = _kanban_progress_snapshot(tid, str(ws))
+    assert snap["test_manifest_fingerprint"] is None
+
+
+def test_run_kanban_goal_loop_q_wires_progress_fn(monkeypatch, kanban_home):
+    """The actual S4 fix: cli._run_kanban_goal_loop_q must hand a working
+    progress_fn to goals.run_kanban_goal_loop, not leave it unwired."""
+    import cli as cli_mod
+    from hermes_cli import goals as goals_mod
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="goal task", body="do it", assignee="default",
+            goal_mode=True, goal_max_turns=5,
+        )
+        kb.claim_task(conn, tid)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACE", raising=False)
+
+    captured = {}
+
+    def _fake_loop(**kwargs):
+        captured.update(kwargs)
+        return {"outcome": "stopped", "turns_used": 1, "reason": "test stub"}
+
+    monkeypatch.setattr(goals_mod, "run_kanban_goal_loop", _fake_loop)
+
+    fake_cli = SimpleNamespace(
+        agent=SimpleNamespace(session_id="s"),
+        conversation_history=[],
+        session_id="s",
+    )
+    cli_mod._run_kanban_goal_loop_q(fake_cli, "first turn response")
+
+    assert captured.get("progress_fn") is not None
+    snap = captured["progress_fn"]()
+    assert set(snap) == {
+        "task_event_count", "workspace_fingerprint", "test_manifest_fingerprint",
+    }
+    assert snap["task_event_count"] is not None
+    # No HERMES_KANBAN_WORKSPACE set → workspace-derived keys stay None.
+    assert snap["workspace_fingerprint"] is None
+    assert snap["test_manifest_fingerprint"] is None
