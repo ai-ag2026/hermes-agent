@@ -742,7 +742,26 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     We only inject a path when we have a concrete absolute directory. This avoids
     teaching subagents a fake container path while still helping them avoid
     guessing `/workspace/...` for local repo tasks.
+
+    Suppressed entirely when the delegating agent is a dispatcher-spawned
+    kanban board worker (``HERMES_KANBAN_TASK`` set) — repair point 7
+    (Kanban-Krise 2026-07-10). Every candidate below resolves to the
+    worker's own shared worktree in that case, and pre-filling "Use this
+    exact path for local repository/workdir operations" in a delegate_task
+    subagent's system prompt invites it to write into that shared worktree
+    directly — independent of the terminal-env strip above (S4b /
+    ``_strip_delegated_subagent_kanban_env``), which only closes the raw
+    env-var leak, not this prompt-text invitation. A subagent that
+    genuinely needs the workspace path can still be told explicitly via
+    delegate_task's ``context`` argument, or discover it itself per the
+    existing fallback instruction in ``_build_child_system_prompt``
+    ("discover it first before issuing git/workdir-specific commands").
+    ``HERMES_KANBAN_TASK`` stays set process-wide for the lifetime of a
+    kanban worker (including inside nested delegate_task chains), so this
+    single check covers both direct and nested subagent spawns.
     """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return None
     candidates = [
         os.getenv("TERMINAL_CWD"),
         getattr(

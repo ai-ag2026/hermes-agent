@@ -761,3 +761,91 @@ class TestHermesInternalDynamicSecrets:
         assert "GATEWAY_RELAY_SECRET" in _HERMES_PROVIDER_ENV_BLOCKLIST
         assert "GATEWAY_RELAY_DELIVERY_KEY" in _HERMES_PROVIDER_ENV_BLOCKLIST
         assert "GATEWAY_RELAY_ID" in _HERMES_PROVIDER_ENV_BLOCKLIST
+
+
+class TestDelegatedSubagentKanbanEnvStrip:
+    """Repair-Punkt 7 (Kanban-Krise 2026-07-10), S4b-Nachzügler.
+
+    A delegate_task subagent runs as a thread in the same process as its
+    kanban-board-worker parent, so os.environ (including whatever
+    HERMES_KANBAN_WORKSPACE/_BRANCH/_RUN_ID/_CLAIM_LOCK the dispatcher set
+    on the worker process) is shared process-wide and reaches every
+    subprocess a subagent's terminal_tool call spawns -- independent of
+    tools.kanban_tools's Python-level board-lifecycle guard (S4b,
+    d14ebcb47), which only covers kanban_* tool calls. HERMES_KANBAN_TASK/
+    _DB/_BOARD must stay reachable (kanban comment/complete CLI calls);
+    WORKSPACE/BRANCH/RUN_ID/CLAIM_LOCK must not.
+    """
+
+    KANBAN_ENV = {
+        "HERMES_KANBAN_TASK": "t_parent123",
+        "HERMES_KANBAN_DB": "/home/user/.hermes/kanban.db",
+        "HERMES_KANBAN_BOARD": "default",
+        "HERMES_KANBAN_WORKSPACE": "/home/user/.hermes/workspace/worktrees/t_parent123",
+        "HERMES_KANBAN_BRANCH": "wt/t_parent123",
+        "HERMES_KANBAN_RUN_ID": "42",
+        "HERMES_KANBAN_CLAIM_LOCK": "lock-abc",
+    }
+
+    @pytest.fixture
+    def delegated_subagent_ctx(self):
+        """Mark the current test like a delegate_task subagent's run thread.
+
+        Mirrors tests/tools/test_kanban_tools.py's fixture of the same name
+        (the S4b reference tests) -- marks via the real
+        mark_delegated_subagent_context() entry point, not by poking the
+        private contextvar directly, and resets in a finally block so it
+        can't leak into unrelated tests sharing this worker's Context.
+        """
+        from tools import kanban_tools as kt
+
+        kt.mark_delegated_subagent_context()
+        try:
+            yield
+        finally:
+            kt._delegated_subagent_ctx.set(False)
+
+    def test_make_run_env_strips_workspace_branch_for_delegated_subagent(
+        self, delegated_subagent_ctx
+    ):
+        env = _run_with_env(extra_os_env=self.KANBAN_ENV)
+        assert env.get("HERMES_KANBAN_TASK") == "t_parent123"
+        assert env.get("HERMES_KANBAN_DB") == self.KANBAN_ENV["HERMES_KANBAN_DB"]
+        assert env.get("HERMES_KANBAN_BOARD") == "default"
+        assert "HERMES_KANBAN_WORKSPACE" not in env
+        assert "HERMES_KANBAN_BRANCH" not in env
+        assert "HERMES_KANBAN_RUN_ID" not in env
+        assert "HERMES_KANBAN_CLAIM_LOCK" not in env
+
+    def test_make_run_env_keeps_all_vars_for_normal_worker(self):
+        """No subagent marking -- the worker's own terminal keeps everything,
+        including WORKSPACE/BRANCH (it legitimately operates there)."""
+        env = _run_with_env(extra_os_env=self.KANBAN_ENV)
+        assert env.get("HERMES_KANBAN_WORKSPACE") == self.KANBAN_ENV["HERMES_KANBAN_WORKSPACE"]
+        assert env.get("HERMES_KANBAN_BRANCH") == self.KANBAN_ENV["HERMES_KANBAN_BRANCH"]
+        assert env.get("HERMES_KANBAN_RUN_ID") == "42"
+        assert env.get("HERMES_KANBAN_CLAIM_LOCK") == "lock-abc"
+
+    def test_sanitize_subprocess_env_strips_for_delegated_subagent(
+        self, delegated_subagent_ctx
+    ):
+        """Background/PTY spawn path (process_registry.spawn_local) gets the
+        same treatment as the login-shell path above."""
+        from tools.environments.local import _sanitize_subprocess_env
+
+        result = _sanitize_subprocess_env(dict(self.KANBAN_ENV))
+        assert result.get("HERMES_KANBAN_TASK") == "t_parent123"
+        assert result.get("HERMES_KANBAN_DB") == self.KANBAN_ENV["HERMES_KANBAN_DB"]
+        assert result.get("HERMES_KANBAN_BOARD") == "default"
+        assert "HERMES_KANBAN_WORKSPACE" not in result
+        assert "HERMES_KANBAN_BRANCH" not in result
+        assert "HERMES_KANBAN_RUN_ID" not in result
+        assert "HERMES_KANBAN_CLAIM_LOCK" not in result
+
+    def test_sanitize_subprocess_env_keeps_all_vars_when_not_delegated(self):
+        from tools.environments.local import _sanitize_subprocess_env
+
+        result = _sanitize_subprocess_env(dict(self.KANBAN_ENV))
+        assert result.get("HERMES_KANBAN_WORKSPACE") == self.KANBAN_ENV["HERMES_KANBAN_WORKSPACE"]
+        assert result.get("HERMES_KANBAN_BRANCH") == self.KANBAN_ENV["HERMES_KANBAN_BRANCH"]
+        assert result.get("HERMES_KANBAN_CLAIM_LOCK") == "lock-abc"

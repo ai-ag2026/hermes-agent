@@ -239,6 +239,45 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
 
 
+def _strip_delegated_subagent_kanban_env(env: dict) -> None:
+    """Pop board-worker workspace/identity vars for a delegate_task subagent.
+
+    Repair-Punkt 7 (Kanban-Krise 2026-07-10), S4b-Nachzügler (see
+    ``tools.kanban_tools.BOARD_OWNERSHIP_ENV_KEYS`` /
+    ``mark_delegated_subagent_context`` for the original fix, d14ebcb47).
+    S4b stops a delegate_task subagent from calling kanban_complete/_block/
+    _heartbeat on its parent's board task via the Python tool layer — but a
+    delegated subagent runs as a thread in the SAME process as its board-
+    worker parent, so ``os.environ`` (including whatever
+    HERMES_KANBAN_WORKSPACE/_BRANCH/_RUN_ID/_CLAIM_LOCK the dispatcher set
+    when it spawned the parent) is shared process-wide and still reaches
+    every subprocess a subagent's own terminal_tool call spawns. Without
+    this filter, a subagent could ``cd $HERMES_KANBAN_WORKSPACE`` in a raw
+    shell child and write into the parent's shared worktree directly, or
+    re-run kanban lifecycle CLI commands with the parent's RUN_ID/
+    CLAIM_LOCK — bypassing the in-process guard entirely (it only covers
+    Python tool calls, not subprocesses).
+
+    HERMES_KANBAN_TASK is deliberately NOT stripped here: kanban_comment has
+    no ownership check by design (#19713, a deliberate cross-task handoff
+    channel) and a worker's own terminal — delegated or not — still needs
+    HERMES_KANBAN_TASK/_DB/_BOARD reachable to run ``kanban comment``/
+    ``kanban complete`` CLI invocations. The defect is the WORKSPACE/BRANCH
+    (and RUN_ID/CLAIM_LOCK worker-identity) leak, not task identity.
+    """
+    try:
+        from tools.kanban_tools import BOARD_OWNERSHIP_ENV_KEYS, _is_delegated_subagent
+    except Exception:
+        return
+    try:
+        if not _is_delegated_subagent():
+            return
+    except Exception:
+        return
+    for key in BOARD_OWNERSHIP_ENV_KEYS - {"HERMES_KANBAN_TASK"}:
+        env.pop(key, None)
+
+
 def _is_hermes_internal_secret(key: str) -> bool:
     """Return True for Hermes-internal secrets injected under *dynamic* names.
 
@@ -382,6 +421,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
+
+    _strip_delegated_subagent_kanban_env(sanitized)
 
     _apply_windows_msys_bash_env_defaults(sanitized)
 
@@ -830,6 +871,8 @@ def _make_run_env(env: dict) -> dict:
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
+
+    _strip_delegated_subagent_kanban_env(run_env)
 
     _apply_windows_msys_bash_env_defaults(run_env)
 

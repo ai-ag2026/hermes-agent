@@ -28,6 +28,7 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _resolve_workspace_hint,
     _extract_output_tail,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
@@ -152,6 +153,44 @@ class TestChildSystemPrompt(unittest.TestCase):
     def test_empty_context_ignored(self):
         prompt = _build_child_system_prompt("Do something", "  ")
         self.assertNotIn("CONTEXT", prompt)
+
+
+class TestResolveWorkspaceHintKanbanSuppression(unittest.TestCase):
+    """Repair-Punkt 7 (Kanban-Krise 2026-07-10): a delegate_task subagent's
+    system prompt must not be pre-filled with the delegating kanban
+    worker's shared worktree path ("Use this exact path for local
+    repository/workdir operations") — that invitation, independent of the
+    env-var leak fixed in tools/environments/local.py, is what let a
+    subagent write into the shared worktree directly.
+    """
+
+    def setUp(self):
+        # _hermetic_environment (tests/conftest.py) already clears
+        # HERMES_KANBAN_TASK per test; be explicit anyway.
+        os.environ.pop("HERMES_KANBAN_TASK", None)
+        os.environ.pop("TERMINAL_CWD", None)
+
+    def tearDown(self):
+        os.environ.pop("HERMES_KANBAN_TASK", None)
+        os.environ.pop("TERMINAL_CWD", None)
+
+    def test_hint_suppressed_when_delegating_agent_is_kanban_worker(self):
+        os.environ["HERMES_KANBAN_TASK"] = "t_worker123"
+        with patch.dict(os.environ, {"TERMINAL_CWD": os.getcwd()}):
+            hint = _resolve_workspace_hint(_make_mock_parent())
+        self.assertIsNone(hint)
+
+    def test_hint_returned_for_normal_non_kanban_delegation(self):
+        with patch.dict(os.environ, {"TERMINAL_CWD": os.getcwd()}):
+            hint = _resolve_workspace_hint(_make_mock_parent())
+        self.assertEqual(hint, os.path.abspath(os.getcwd()))
+
+    def test_child_prompt_omits_workspace_path_block_under_kanban_worker(self):
+        os.environ["HERMES_KANBAN_TASK"] = "t_worker123"
+        with patch.dict(os.environ, {"TERMINAL_CWD": os.getcwd()}):
+            hint = _resolve_workspace_hint(_make_mock_parent())
+        prompt = _build_child_system_prompt("Investigate the bug", workspace_path=hint)
+        self.assertNotIn("WORKSPACE PATH", prompt)
 
 
 class TestStripBlockedTools(unittest.TestCase):
