@@ -1,6 +1,7 @@
 """Tests for tools/skill_manager_tool.py — skill creation, editing, and deletion."""
 
 import json
+import subprocess
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -364,6 +365,146 @@ word word
         assert result["success"] is False
         assert "escapes" in result["error"].lower()
         assert outside_file.read_text() == "old text here"
+
+
+class TestSelfImprovementBackup:
+    """Repair-Punkt 3 (Kanban-Krise 2026-07-10): before a background-review
+    (autonomous self-improvement) patch is applied, back up the skill
+    catalog via backup-skills.sh and append a diff-log entry. Fail closed
+    if the backup fails — the patch must not be applied without a restore
+    point. Foreground (user-directed) patches are unaffected."""
+
+    def _hermes_home(self, tmp_path, *, script_exists=True):
+        home = tmp_path / "hermes_home"
+        script = home / "system" / "backup-skills.sh"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        if script_exists:
+            script.write_text("#!/usr/bin/env bash\nexit 0\n")
+        return home
+
+    def _patch_as_background_review(self, skills_root, home, mock_run):
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+        from tools.skill_manager_tool import mark_background_review_skill_read
+
+        with patch("tools.skill_manager_tool.get_hermes_home", return_value=home), \
+             patch("tools.skill_manager_tool.subprocess.run", mock_run):
+            with _skill_dir(skills_root):
+                _create_skill("my-skill", VALID_SKILL_CONTENT)
+                token = set_current_write_origin(BACKGROUND_REVIEW)
+                try:
+                    mark_background_review_skill_read(skills_root / "my-skill" / "SKILL.md")
+                    result = _patch_skill(
+                        "my-skill", "Do the thing.", "Do the new thing."
+                    )
+                finally:
+                    reset_current_write_origin(token)
+        return result
+
+    def test_background_review_patch_runs_backup_and_writes_diff_log(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+        home = self._hermes_home(tmp_path)
+        mock_run = patch.object(
+            subprocess, "run",
+            return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+        ).start()
+        try:
+            result = self._patch_as_background_review(skills_root, home, mock_run)
+        finally:
+            patch.stopall()
+
+        assert result["success"] is True, result
+        assert mock_run.call_count == 1
+        call_args = mock_run.call_args
+        assert str(home / "system" / "backup-skills.sh") in call_args.args[0]
+        assert call_args.kwargs.get("timeout") == 60
+
+        content = (skills_root / "my-skill" / "SKILL.md").read_text()
+        assert "Do the new thing." in content
+
+        log_path = home / "workspace" / "reports" / "skill-self-improvement" / "diffs.log"
+        assert log_path.exists()
+        log_text = log_path.read_text()
+        assert "author=background_review" in log_text
+        assert "skill=my-skill" in log_text
+        assert "-Step 1: Do the thing." in log_text
+        assert "+Step 1: Do the new thing." in log_text
+
+    def test_background_review_patch_aborts_when_backup_exits_nonzero(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+        home = self._hermes_home(tmp_path)
+        mock_run = patch.object(
+            subprocess, "run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="disk full"
+            ),
+        ).start()
+        try:
+            result = self._patch_as_background_review(skills_root, home, mock_run)
+        finally:
+            patch.stopall()
+
+        assert result["success"] is False
+        assert "backup-skills.sh" in result["error"]
+        content = (skills_root / "my-skill" / "SKILL.md").read_text()
+        assert "Do the thing." in content
+        assert "Do the new thing." not in content
+        log_path = home / "workspace" / "reports" / "skill-self-improvement" / "diffs.log"
+        assert not log_path.exists()
+
+    def test_background_review_patch_aborts_when_backup_times_out(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+        home = self._hermes_home(tmp_path)
+        mock_run = patch.object(
+            subprocess, "run",
+            side_effect=subprocess.TimeoutExpired(cmd="backup-skills.sh", timeout=60),
+        ).start()
+        try:
+            result = self._patch_as_background_review(skills_root, home, mock_run)
+        finally:
+            patch.stopall()
+
+        assert result["success"] is False
+        assert "timed out" in result["error"].lower()
+        content = (skills_root / "my-skill" / "SKILL.md").read_text()
+        assert "Do the new thing." not in content
+
+    def test_background_review_patch_aborts_when_script_missing(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+        home = self._hermes_home(tmp_path, script_exists=False)
+        mock_run = patch.object(subprocess, "run").start()
+        try:
+            result = self._patch_as_background_review(skills_root, home, mock_run)
+        finally:
+            patch.stopall()
+
+        assert result["success"] is False
+        assert "backup script not found" in result["error"].lower()
+        mock_run.assert_not_called()
+        content = (skills_root / "my-skill" / "SKILL.md").read_text()
+        assert "Do the new thing." not in content
+
+    def test_foreground_patch_does_not_call_backup(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+        home = self._hermes_home(tmp_path)
+        with patch("tools.skill_manager_tool.get_hermes_home", return_value=home), \
+             patch("tools.skill_manager_tool.subprocess.run") as mock_run:
+            with _skill_dir(skills_root):
+                _create_skill("my-skill", VALID_SKILL_CONTENT)
+                result = _patch_skill("my-skill", "Do the thing.", "Do the new thing.")
+
+        assert result["success"] is True, result
+        mock_run.assert_not_called()
+        log_path = home / "workspace" / "reports" / "skill-self-improvement" / "diffs.log"
+        assert not log_path.exists()
 
 
 class TestDeleteSkill:
@@ -1175,6 +1316,14 @@ def _curator_pass(tmp_path, *, monkeypatch):
     skills_root = hermes_home / "skills"
     skills_root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    # Stub backup-skills.sh so background-review patches clear the
+    # self-improvement backup gate (tools/skill_manager_tool.py) instead of
+    # fail-closing on a missing script — this fixture stands in for the real
+    # curator environment where the script is always present.
+    backup_script = hermes_home / "system" / "backup-skills.sh"
+    backup_script.parent.mkdir(parents=True, exist_ok=True)
+    backup_script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    backup_script.chmod(0o755)
     with patch("tools.skill_manager_tool.SKILLS_DIR", skills_root), \
          patch("tools.skills_tool.SKILLS_DIR", skills_root), \
          patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_root]), \

@@ -358,6 +358,17 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "cron").mkdir()
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
+    (fake_hermes_home / "system").mkdir()
+    # Stub backup-skills.sh: tools/skill_manager_tool.py fail-closes
+    # background-review skill patches when this script is missing or
+    # errors (self-improvement backup gate, Kanban-Krise 2026-07-10
+    # geparkter Repair-Punkt 3). A real ``~/.hermes/system/backup-skills.sh``
+    # always exists outside tests, so the default here is a fast no-op
+    # success; tests exercising the gate's failure path mock
+    # ``subprocess.run`` directly instead of relying on this stub.
+    backup_skills_stub = fake_hermes_home / "system" / "backup-skills.sh"
+    backup_skills_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+    backup_skills_stub.chmod(0o755)
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with

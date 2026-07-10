@@ -32,13 +32,16 @@ Directory layout for user skills:
             └── SKILL.md
 """
 
+import difflib
 import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import contextvars as _ctxvars
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -391,6 +394,98 @@ def _background_review_read_before_write_guard(
         ),
         "_read_before_write_required": True,
     }
+
+
+_SELF_IMPROVEMENT_BACKUP_SCRIPT = "system/backup-skills.sh"
+_SELF_IMPROVEMENT_DIFF_LOG = "workspace/reports/skill-self-improvement/diffs.log"
+_SELF_IMPROVEMENT_BACKUP_TIMEOUT_S = 60
+
+
+def _run_self_improvement_backup(reason: str) -> Optional[Dict[str, Any]]:
+    """Snapshot the skill catalog before an autonomous background-review write.
+
+    Fail closed: geparkter Repair-Punkt 3 (Kanban-Krise 2026-07-10) found
+    ``.curator_backups/`` silently empty since 2026-06-12 -- the review fork's
+    autonomous edits had no restore point. Any failure to run or a non-zero
+    exit from backup-skills.sh aborts the patch entirely; returns None on
+    success (caller proceeds), an error dict on failure (caller must abort).
+    """
+    script = get_hermes_home() / _SELF_IMPROVEMENT_BACKUP_SCRIPT
+    if not script.exists():
+        return {
+            "success": False,
+            "error": (
+                "Refusing background curator patch: backup script not found "
+                f"at {script}. Autonomous self-improvement writes require a "
+                "restore point first."
+            ),
+        }
+    try:
+        proc = subprocess.run(
+            [str(script), reason],
+            capture_output=True,
+            text=True,
+            timeout=_SELF_IMPROVEMENT_BACKUP_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "error": (
+                "Refusing background curator patch: backup-skills.sh timed "
+                f"out after {_SELF_IMPROVEMENT_BACKUP_TIMEOUT_S}s."
+            ),
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": (
+                f"Refusing background curator patch: backup-skills.sh could "
+                f"not be run ({exc})."
+            ),
+        }
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:500]
+        return {
+            "success": False,
+            "error": (
+                "Refusing background curator patch: backup-skills.sh exited "
+                f"non-zero (rc={proc.returncode}). {detail}"
+            ),
+        }
+    return None
+
+
+def _append_self_improvement_diff_log(
+    name: str,
+    target: Path,
+    original_content: str,
+    new_content: str,
+) -> None:
+    """Append a unified diff of an autonomous background-review patch.
+
+    Best-effort audit trail alongside the backup snapshot above; a logging
+    failure must not block a patch that already cleared the backup gate.
+    """
+    try:
+        log_path = get_hermes_home() / _SELF_IMPROVEMENT_DIFF_LOG
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        diff_text = "".join(
+            difflib.unified_diff(
+                original_content.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=str(target),
+                tofile=str(target),
+            )
+        )
+        ts = datetime.now(timezone.utc).isoformat()
+        entry = (
+            f"=== {ts} action=patch skill={name} author=background_review "
+            f"path={target} ===\n{diff_text}\n"
+        )
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(entry)
+    except Exception:
+        logger.debug("self-improvement diff log write failed for %s", name, exc_info=True)
 
 
 def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, Any]]:
@@ -987,6 +1082,19 @@ def _patch_skill(
             }
 
     original_content = content  # for rollback
+
+    try:
+        from tools.skill_provenance import is_background_review
+        review_write = is_background_review()
+    except Exception:
+        review_write = False
+
+    if review_write:
+        backup_failure = _run_self_improvement_backup(f"skill-patch-{name}")
+        if backup_failure:
+            return backup_failure
+        _append_self_improvement_diff_log(name, target, original_content, new_content)
+
     _atomic_write_text(target, new_content)
 
     # Security scan — roll back on block
