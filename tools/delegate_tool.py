@@ -1918,6 +1918,22 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
+            # Strip board-worker lifecycle ownership (t_591dd454) BEFORE the
+            # child's conversation starts. This is a delegate_task subagent —
+            # a fresh AIAgent running as a thread in the SAME process as its
+            # parent, not a separate OS process — so os.environ (including
+            # any HERMES_KANBAN_TASK/_RUN_ID/_CLAIM_LOCK the dispatcher set
+            # on this process when it spawned the parent as a board worker)
+            # is shared process-wide. Without this, a subagent delegated
+            # from inside a board worker implicitly inherits that worker's
+            # kanban identity and can complete/block/heartbeat/comment on
+            # the PARENT's own task. Marking the contextvars.Context here
+            # (not mutating os.environ) is safe under concurrency: it only
+            # affects this thread and the tool-worker threads
+            # tools.thread_context.propagate_context_to_thread spawns from
+            # it, never the parent thread or sibling subagents.
+            from tools.kanban_tools import mark_delegated_subagent_context
+            mark_delegated_subagent_context()
             return child.run_conversation(
                 user_message=goal,
                 task_id=child_task_id,

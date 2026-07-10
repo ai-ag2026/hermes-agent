@@ -1937,6 +1937,98 @@ class TestChildCredentialLeasing(unittest.TestCase):
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
 
 
+class TestDelegatedSubagentKanbanEnvStrip(unittest.TestCase):
+    """t_591dd454: delegate_task children must never carry board-worker
+    lifecycle ownership, even when spawned from inside a kanban worker
+    process that shares os.environ with the child's dedicated thread.
+
+    ``_run_single_child`` builds a fresh, dedicated worker thread per child
+    (via its own single-worker executor) and calls
+    ``kanban_tools.mark_delegated_subagent_context()`` on that thread before
+    ``child.run_conversation`` starts. These tests exercise the real
+    threading path (no mocking of ``_run_with_thread_capture`` itself) so a
+    regression that moves the marker call to the wrong thread, or drops it,
+    is caught here rather than only in the handler-level unit tests in
+    tests/tools/test_kanban_tools.py.
+    """
+
+    def test_run_single_child_marks_delegated_subagent_context(self):
+        from tools.delegate_tool import _run_single_child
+        from tools import kanban_tools as kt
+
+        seen = {}
+
+        def _capture(*args, **kwargs):
+            # Executes on the child's dedicated run thread, inside
+            # _run_with_thread_capture, AFTER the marker call.
+            seen["is_delegated"] = kt._is_delegated_subagent()
+            seen["kanban_complete_blocked"] = kt._handle_complete(
+                {"task_id": "t_591dd454", "summary": "sneaky completion"}
+            )
+            return {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        child = MagicMock()
+        child._credential_pool = None
+        child.run_conversation.side_effect = _capture
+
+        try:
+            _run_single_child(
+                task_index=0,
+                goal="Read-only analysis",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+        finally:
+            # Defensive: if a future refactor moves the marker call onto
+            # this (test) thread, don't let it leak into later tests.
+            kt._delegated_subagent_ctx.set(False)
+
+        self.assertTrue(
+            seen.get("is_delegated"),
+            "child's dedicated run thread was not marked as a delegated subagent",
+        )
+        blocked = json.loads(seen["kanban_complete_blocked"])
+        self.assertNotEqual(blocked.get("ok"), True)
+        self.assertIn("delegated subagent", blocked.get("error", ""))
+
+    def test_run_single_child_does_not_mark_calling_thread(self):
+        """The strip is scoped to the child's dedicated thread only — the
+        thread that CALLED _run_single_child (e.g. the parent's own tool
+        dispatch thread, or in a batch, the outer executor thread) must be
+        unaffected, so a concurrent sibling subagent or the parent board
+        worker itself never has its own kanban access stripped."""
+        from tools.delegate_tool import _run_single_child
+        from tools import kanban_tools as kt
+
+        self.assertFalse(kt._is_delegated_subagent())
+
+        child = MagicMock()
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        _run_single_child(
+            task_index=0,
+            goal="Read-only analysis",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        # Back on the calling thread — untouched by the child's marker.
+        self.assertFalse(kt._is_delegated_subagent())
+
+
 class TestDelegateHeartbeat(unittest.TestCase):
     """Heartbeat propagates child activity to parent during delegation.
 

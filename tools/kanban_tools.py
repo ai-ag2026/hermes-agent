@@ -28,6 +28,7 @@ through the board.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -39,6 +40,105 @@ from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Delegated-subagent scoping (t_591dd454)
+# ---------------------------------------------------------------------------
+# A ``delegate_task`` subagent runs as a fresh AIAgent inside the SAME OS
+# process as its parent (a thread from a dedicated per-child executor, see
+# ``tools.delegate_tool._run_single_child``), not a separate process. Because
+# ``os.environ`` is one process-wide dict, a subagent spawned from inside a
+# dispatcher-spawned board worker previously saw the exact same
+# ``HERMES_KANBAN_TASK`` / ``_RUN_ID`` / ``_CLAIM_LOCK`` the worker did, so
+# ``_enforce_worker_task_ownership`` treated the subagent as if it WERE that
+# worker: it could call ``kanban_complete`` / ``kanban_block`` /
+# ``kanban_heartbeat`` on the parent's own task and the ownership check
+# passed. On 2026-07-10 this let a read-only research subagent mark card S3
+# complete while the real worker was still running and writing uncommitted
+# changes to the shared worktree, which let the dispatcher promote S4 early
+# with a second writer active.
+#
+# Fix: ``tools.delegate_tool`` marks the child's dedicated run-thread via
+# ``mark_delegated_subagent_context()`` *before* the child's conversation
+# starts. Tool dispatch for that conversation — including tool calls the
+# agent loop offloads onto further worker threads via
+# ``tools.thread_context.propagate_context_to_thread`` — runs inside a
+# ``contextvars.Context`` descended from that thread, so the marker is a
+# ``contextvars.ContextVar`` (not ``threading.local``): it follows the
+# subagent's calls into those nested threads without mutating the real
+# process-wide ``os.environ`` and without affecting the parent thread or any
+# concurrent sibling subagent (each gets its own dedicated thread).
+#
+# We deliberately do NOT touch ``_check_kanban_mode`` /
+# ``_check_kanban_orchestrator_mode`` / ``_require_orchestrator_tool`` here:
+# those still read the real (unstripped) ``HERMES_KANBAN_TASK`` and correctly
+# keep classifying a delegated subagent as "worker-scoped" for the purpose of
+# hiding orchestrator-only tools (``kanban_list`` / ``kanban_unblock``) from
+# it. Stripping the env there too would flip that classification to
+# "orchestrator" and grant the subagent MORE board access, not less.
+BOARD_OWNERSHIP_ENV_KEYS = frozenset(
+    {
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_KANBAN_WORKSPACE",
+        "HERMES_KANBAN_BRANCH",
+    }
+)
+
+_delegated_subagent_ctx: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "kanban_delegated_subagent", default=False
+)
+
+
+def mark_delegated_subagent_context() -> None:
+    """Mark the current contextvars.Context as a delegated subagent.
+
+    Call once, on a delegate_task child's dedicated run thread, before its
+    conversation starts (see ``tools.delegate_tool._run_single_child``).
+    Logs the stripped key *names* only — never values — for auditability.
+    """
+    _delegated_subagent_ctx.set(True)
+    logger.info(
+        "kanban: delegated subagent context marked — board-ownership env "
+        "hidden for tool dispatch (%s)",
+        ", ".join(sorted(BOARD_OWNERSHIP_ENV_KEYS)),
+    )
+
+
+def _is_delegated_subagent() -> bool:
+    return _delegated_subagent_ctx.get()
+
+
+def _reject_if_delegated_subagent(tool_name: str) -> Optional[str]:
+    """Hard-deny board-lifecycle mutation from a delegate_task subagent.
+
+    Independent of any env value: a subagent never carries board-worker
+    lifecycle ownership, even if it guesses/echoes the parent's task id.
+    """
+    if _is_delegated_subagent():
+        return tool_error(
+            f"{tool_name} is unavailable to delegated subagents: agents "
+            "spawned via delegate_task never carry board-worker lifecycle "
+            "ownership, regardless of task_id. If a delegated worker "
+            "genuinely needs to drive board state, that requires an "
+            "explicit, validated delegation path — not implicit toolset/"
+            "env inheritance from the parent board worker."
+        )
+    return None
+
+
+def _board_env(name: str) -> Optional[str]:
+    """``os.environ.get`` for board-ownership keys, honoring the subagent strip.
+
+    Only use this for the keys in ``BOARD_OWNERSHIP_ENV_KEYS``. Other env
+    reads (``HERMES_SESSION_ID``, ``HERMES_PROFILE``, ...) are unaffected and
+    should keep using ``os.environ.get`` directly.
+    """
+    if _is_delegated_subagent() and name in BOARD_OWNERSHIP_ENV_KEYS:
+        return None
+    return os.environ.get(name)
 
 
 # ---------------------------------------------------------------------------
@@ -98,18 +198,23 @@ def _check_kanban_orchestrator_mode() -> bool:
 # ---------------------------------------------------------------------------
 
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
-    """Resolve ``task_id`` arg or fall back to the env var the dispatcher set."""
+    """Resolve ``task_id`` arg or fall back to the env var the dispatcher set.
+
+    Uses ``_board_env`` so a delegated subagent (see
+    ``mark_delegated_subagent_context``) never silently inherits the
+    parent board worker's task id as a default.
+    """
     if arg:
         return arg
-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    env_tid = _board_env("HERMES_KANBAN_TASK")
     return env_tid or None
 
 
 def _worker_run_id(task_id: str) -> Optional[int]:
     """Return this worker's dispatcher run id when it is scoped to task_id."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    if _board_env("HERMES_KANBAN_TASK") != task_id:
         return None
-    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+    raw = _board_env("HERMES_KANBAN_RUN_ID")
     if not raw:
         return None
     try:
@@ -122,7 +227,7 @@ def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    if _board_env("HERMES_KANBAN_TASK") != task_id:
         return metadata
     session_id = os.environ.get("HERMES_SESSION_ID")
     if not session_id:
@@ -147,11 +252,19 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     tasks or reopen blocked ones. Workers are narrowly scoped to their
     one task.
 
+    Note: every current caller of this function is a mutating handler
+    that calls ``_reject_if_delegated_subagent`` first (see below), so a
+    delegated subagent never reaches here at all — the ``not env_tid``
+    branch below would otherwise (wrongly) treat a stripped env as
+    "orchestrator, no restriction". This function's own env read is
+    stripped anyway for defense in depth, but the real guarantee is the
+    upfront reject in each handler.
+
     Returns ``None`` when the call is allowed, or a tool-error string
     when it must be rejected. Callers should ``return`` the error
     verbatim.
     """
-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    env_tid = _board_env("HERMES_KANBAN_TASK")
     if not env_tid:
         # Orchestrator or CLI context — no task-scope restriction.
         return None
@@ -248,8 +361,17 @@ def heartbeat_current_worker_from_env() -> bool:
     Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
     timestamp (monotonic clock); not thread-safe in the strict sense, but
     the worst case is one extra DB write per race, which is harmless.
+
+    No-op inside a delegated subagent context: ``AIAgent._touch_activity``
+    calls this unconditionally on every activity tick whenever
+    ``HERMES_KANBAN_TASK`` is set in the process env, so without this guard
+    a delegated subagent would silently extend the PARENT worker's claim
+    just by being busy on its own unrelated goal — no explicit tool call
+    required (see t_591dd454).
     """
     global _auto_heartbeat_last_attempt
+    if _is_delegated_subagent():
+        return False
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
         return False
@@ -503,6 +625,9 @@ def _handle_list(args: dict, **kw) -> str:
 
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
+    guard = _reject_if_delegated_subagent("kanban_complete")
+    if guard:
+        return guard
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -693,6 +818,9 @@ def _redact_review_payload(summary: Any, metadata: Any):
 
 
 def _handle_request_review(args: dict, **kw) -> str:
+    guard = _reject_if_delegated_subagent("kanban_request_review")
+    if guard:
+        return guard
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
@@ -736,6 +864,9 @@ def _handle_request_review(args: dict, **kw) -> str:
 
 
 def _handle_review_decide(args: dict, **kw) -> str:
+    guard = _reject_if_delegated_subagent("kanban_review_decide")
+    if guard:
+        return guard
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
@@ -786,6 +917,9 @@ def _handle_review_decide(args: dict, **kw) -> str:
 
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
+    guard = _reject_if_delegated_subagent("kanban_block")
+    if guard:
+        return guard
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -872,6 +1006,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     by ``release_stale_claims`` — which is exactly the trap that
     ``heartbeat_claim``'s docstring warns against.
     """
+    guard = _reject_if_delegated_subagent("kanban_heartbeat")
+    if guard:
+        return guard
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -915,6 +1052,13 @@ def _handle_heartbeat(args: dict, **kw) -> str:
 
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
+    # kanban_comment has no ownership check by design (#19713 — cross-task
+    # commenting is the deliberate handoff channel between legitimate
+    # workers), so the delegated-subagent reject must be explicit here;
+    # nothing else in this handler would otherwise stop it.
+    guard = _reject_if_delegated_subagent("kanban_comment")
+    if guard:
+        return guard
     tid = args.get("task_id")
     if not tid:
         return tool_error(
@@ -1171,6 +1315,9 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
 def _handle_unblock(args: dict, **kw) -> str:
     """Transition a blocked task back to ready."""
+    guard = _reject_if_delegated_subagent("kanban_unblock")
+    if guard:
+        return guard
     guard = _require_orchestrator_tool("kanban_unblock")
     if guard:
         return guard

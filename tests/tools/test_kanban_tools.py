@@ -1712,6 +1712,187 @@ def test_worker_complete_own_task_still_works(worker_env):
     assert d.get("ok") is True and d.get("task_id") == worker_env
 
 
+# ---------------------------------------------------------------------------
+# Delegated-subagent scoping (t_591dd454)
+#
+# A ``delegate_task`` subagent runs as a fresh AIAgent thread inside the SAME
+# OS process as the board worker that spawned it, so it previously shared
+# HERMES_KANBAN_TASK/_RUN_ID/_CLAIM_LOCK with the parent via os.environ. That
+# let a "read-only analysis" subagent mark the parent's own card complete
+# (S3, 2026-07-10) while the real worker was still running and writing to a
+# shared worktree, causing S4 to be promoted with a second writer active.
+#
+# tools.delegate_tool._run_single_child now calls
+# ``mark_delegated_subagent_context()`` on the child's dedicated run thread
+# before its conversation starts. These tests pin the resulting behavior
+# directly against the tool handlers, independent of the threading plumbing
+# (which is covered separately in tests/tools/test_delegate.py).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def delegated_subagent_ctx():
+    """Mark the current test like a delegate_task subagent's run thread.
+
+    Mirrors what ``tools.delegate_tool._run_single_child`` does inside
+    ``_run_with_thread_capture`` right before ``child.run_conversation``.
+    Reset in a finally block so the contextvars.ContextVar doesn't leak into
+    unrelated tests sharing this worker's default Context.
+    """
+    from tools import kanban_tools as kt
+
+    kt.mark_delegated_subagent_context()
+    try:
+        yield
+    finally:
+        kt._delegated_subagent_ctx.set(False)
+
+
+def test_delegated_subagent_context_defaults_false():
+    """A normal call site (no marking) must never look like a subagent."""
+    from tools import kanban_tools as kt
+    assert kt._is_delegated_subagent() is False
+
+
+def test_delegated_subagent_cannot_complete_parent_task(worker_env, delegated_subagent_ctx):
+    """A subagent that echoes the parent's own task_id must still be refused
+    — the guard is unconditional, not an ownership *mismatch* check."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"task_id": worker_env, "summary": "sneaky completion"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "delegated subagent" in d.get("error", "")
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_delegated_subagent_cannot_complete_without_task_id(worker_env, delegated_subagent_ctx):
+    """Even relying on the HERMES_KANBAN_TASK env default must not work —
+    the subagent's own env view is stripped, so no task_id resolves."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "implicit sneaky completion"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "delegated subagent" in d.get("error", "")
+
+
+def test_delegated_subagent_cannot_block_parent_task(worker_env, delegated_subagent_ctx):
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"task_id": worker_env, "reason": "sneaky block"})
+    d = json.loads(out)
+    assert "delegated subagent" in d.get("error", "")
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_delegated_subagent_cannot_heartbeat_parent_task(worker_env, delegated_subagent_ctx):
+    from tools import kanban_tools as kt
+    out = kt._handle_heartbeat({"task_id": worker_env})
+    d = json.loads(out)
+    assert "delegated subagent" in d.get("error", "")
+
+
+def test_delegated_subagent_cannot_comment_on_parent_task(worker_env, delegated_subagent_ctx):
+    """kanban_comment has no ownership check by policy (#19713 — see
+    test_worker_can_comment_on_foreign_task), so this guard is the ONLY
+    thing stopping a delegated subagent from writing into the board's
+    comment thread as if it were the worker."""
+    from tools import kanban_tools as kt
+    out = kt._handle_comment({"task_id": worker_env, "body": "sneaky comment"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "delegated subagent" in d.get("error", "")
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.list_comments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_delegated_subagent_cannot_request_review_or_decide(worker_env, delegated_subagent_ctx):
+    from tools import kanban_tools as kt
+    out = kt._handle_request_review(
+        {"task_id": worker_env, "reviewer": "peer", "summary": "sneaky handoff"}
+    )
+    assert "delegated subagent" in json.loads(out).get("error", "")
+
+    out = kt._handle_review_decide(
+        {"task_id": worker_env, "decision": "APPROVE", "summary": "sneaky decision"}
+    )
+    assert "delegated subagent" in json.loads(out).get("error", "")
+
+
+def test_delegated_subagent_cannot_unblock(monkeypatch, delegated_subagent_ctx):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="blocked task", assignee="peer")
+        kb.block_task(conn, other, reason="waiting")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_unblock({"task_id": other})
+    d = json.loads(out)
+    assert "delegated subagent" in d.get("error", "")
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_delegated_subagent_default_task_id_hidden(worker_env, delegated_subagent_ctx):
+    """``_default_task_id`` must not silently resolve to the parent's real
+    task id for a delegated subagent, even outside a specific handler."""
+    from tools import kanban_tools as kt
+    assert kt._default_task_id(None) is None
+    # Explicit task_id argument still passes through untouched — the strip
+    # only affects the *env fallback*, not caller-supplied ids.
+    assert kt._default_task_id("t_explicit") == "t_explicit"
+
+
+def test_delegated_subagent_auto_heartbeat_bridge_is_noop(worker_env, delegated_subagent_ctx):
+    """The AIAgent._touch_activity -> heartbeat bridge must not silently
+    extend the PARENT's claim just because the subagent thread is busy."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    # Force past the module-level rate limiter so a False return is
+    # attributable to the delegated-subagent guard, not to an unrelated
+    # 60s cooldown from a previous test/call in this process.
+    kt._auto_heartbeat_last_attempt = 0.0
+
+    conn = kb.connect()
+    try:
+        before = kb.get_task(conn, worker_env)
+    finally:
+        conn.close()
+
+    assert kt.heartbeat_current_worker_from_env() is False
+
+    conn = kb.connect()
+    try:
+        after = kb.get_task(conn, worker_env)
+    finally:
+        conn.close()
+    assert after.status == before.status == "running"
+
+
 def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     """A retried worker cannot complete the task using an old run token."""
     from hermes_cli import kanban_db as kb
