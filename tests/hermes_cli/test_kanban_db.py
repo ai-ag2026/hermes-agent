@@ -2188,6 +2188,81 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
     assert guarded_evt.payload.get("reason") == "recent_success"
 
 
+def _insert_guard_event(conn, task_id, created_at, kind="respawn_guarded"):
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES (?, ?, '{\"reason\": \"active_pr\"}', ?)",
+        (task_id, kind, created_at),
+    )
+
+
+def test_dispatch_active_pr_guard_escalates_to_block_after_window(
+    kanban_home, all_assignees_spawnable
+):
+    """An active_pr guard that has continuously deferred a ready task for
+    longer than _RESPAWN_GUARD_PR_ESCALATE_SECONDS escalates to an explicit
+    needs_input block instead of livelocking in ready forever."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="gate-livelock", assignee="alice")
+        kb.add_comment(
+            conn, t, "reviewer",
+            "verdict ACCEPT — https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        now = int(time.time())
+        _insert_guard_event(
+            conn, t, now - kb._RESPAWN_GUARD_PR_ESCALATE_SECONDS - 120
+        )
+        res = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        task = kb.get_task(conn, t)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t in res.auto_blocked
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+
+
+def test_dispatch_active_pr_guard_defers_before_escalate_window(
+    kanban_home, all_assignees_spawnable
+):
+    """Within the escalate window the guard defers only — task stays ready."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="gate-fresh", assignee="alice")
+        kb.add_comment(
+            conn, t, "reviewer",
+            "PR: https://github.com/totemx-AI/subsidysmart/pull/43",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        task = kb.get_task(conn, t)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t not in res.auto_blocked
+    assert task.status == "ready"
+
+
+def test_dispatch_active_pr_guard_escalate_clock_resets_on_promote(
+    kanban_home, all_assignees_spawnable
+):
+    """A promote/spawn/claim/unblock event resets the escalation clock: old
+    guard events before the marker do not count toward the window."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="gate-reset", assignee="alice")
+        kb.add_comment(
+            conn, t, "reviewer",
+            "PR: https://github.com/totemx-AI/subsidysmart/pull/44",
+        )
+        now = int(time.time())
+        _insert_guard_event(
+            conn, t, now - kb._RESPAWN_GUARD_PR_ESCALATE_SECONDS - 600
+        )
+        _insert_guard_event(conn, t, now - 100, kind="promoted")
+        res = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        task = kb.get_task(conn, t)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t not in res.auto_blocked
+    assert task.status == "ready"
+
+
 # ---------------------------------------------------------------------------
 # Workspace resolution
 # ---------------------------------------------------------------------------

@@ -7301,6 +7301,13 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
+# How long an ``active_pr`` respawn guard may continuously defer a ready task
+# before the dispatcher escalates it to an explicit ``blocked``/``needs_input``
+# card. The guard exists to prevent duplicate PRs, but for reviewer/gate tasks
+# the PR link in their OWN verdict comment re-triggers it every tick — without
+# escalation such a task livelocks invisibly in ``ready`` for the full
+# 24h window while the board shows nothing wrong.
+_RESPAWN_GUARD_PR_ESCALATE_SECONDS = 1800  # 30 minutes
 
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
@@ -8890,6 +8897,43 @@ def _dispatch_once_locked(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+                # Escalation: an ``active_pr`` guard cannot clear on its own
+                # while the triggering comment stays within the 24h window, so
+                # a ready task it defers would livelock invisibly (one guarded
+                # tick per minute, board shows a healthy "ready" card). After
+                # _RESPAWN_GUARD_PR_ESCALATE_SECONDS of continuous deferral,
+                # convert the livelock into an explicit needs_input block so a
+                # human (or reconciler) sees it. Any spawn/claim/promote/
+                # unblock resets the continuity clock.
+                if guard_reason == "active_pr":
+                    first_guarded = conn.execute(
+                        "SELECT MIN(created_at) FROM task_events "
+                        "WHERE task_id = ? AND kind = 'respawn_guarded' "
+                        "AND created_at > COALESCE((SELECT MAX(created_at) "
+                        "FROM task_events WHERE task_id = ? AND kind IN "
+                        "('unblocked', 'promoted', 'spawned', 'claimed')), 0)",
+                        (row["id"], row["id"]),
+                    ).fetchone()[0]
+                    if (
+                        first_guarded is not None
+                        and int(time.time()) - int(first_guarded)
+                        >= _RESPAWN_GUARD_PR_ESCALATE_SECONDS
+                    ):
+                        if block_task(
+                            conn,
+                            row["id"],
+                            reason=(
+                                "auto-block: respawn guard 'active_pr' has "
+                                "deferred this ready task for over "
+                                f"{_RESPAWN_GUARD_PR_ESCALATE_SECONDS // 60} "
+                                "minutes — a prior worker left a PR/verdict "
+                                "comment but never called kanban_complete. "
+                                "Verify the durable work, then complete or "
+                                "requeue this card."
+                            ),
+                            kind="needs_input",
+                        ):
+                            result.auto_blocked.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
