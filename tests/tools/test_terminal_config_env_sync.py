@@ -217,6 +217,13 @@ def test_docker_mount_cwd_to_workspace_is_bridged_everywhere():
     assert "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE" in _terminal_tool_env_var_names()
 
 
+def test_docker_mount_agent_assets_is_bridged_everywhere():
+    assert "docker_mount_agent_assets" in _cli_env_map_keys()
+    assert "docker_mount_agent_assets" in _gateway_env_map_keys()
+    assert "docker_mount_agent_assets" in _save_config_env_sync_keys()
+    assert "TERMINAL_DOCKER_MOUNT_AGENT_ASSETS" in _terminal_tool_env_var_names()
+
+
 def test_docker_env_is_bridged_everywhere():
     """Regression pin for docker_env config key being silently ignored.
 

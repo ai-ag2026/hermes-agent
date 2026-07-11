@@ -138,6 +138,21 @@ def _get_active_profile_name() -> str:
         return "default"
 
 
+def _worker_mount_is_control_plane(path: str) -> bool:
+    """Reject broad worker mounts that contain the Hermes control plane."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    try:
+        from hermes_constants import get_hermes_home
+
+        candidate = Path(path).resolve(strict=False)
+        control_plane = Path(get_hermes_home()).resolve(strict=False)
+        return candidate == control_plane or candidate in control_plane.parents
+    except Exception:
+        # Mount validation is a boundary: ambiguity must not expose host state.
+        return True
+
+
 def reap_orphan_containers(
     *,
     max_age_seconds: int = 600,
@@ -593,6 +608,7 @@ class DockerEnvironment(BaseEnvironment):
         network: bool = True,
         host_cwd: str = None,
         auto_mount_cwd: bool = False,
+        mount_agent_assets: bool = True,
         run_as_host_user: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
@@ -670,7 +686,12 @@ class DockerEnvironment(BaseEnvironment):
             and bool(host_cwd_abs)
             and os.path.isdir(host_cwd_abs)
             and not workspace_explicitly_mounted
+            and not _worker_mount_is_control_plane(host_cwd_abs)
         )
+        if auto_mount_cwd and host_cwd_abs and _worker_mount_is_control_plane(host_cwd_abs):
+            raise RuntimeError(
+                "Refusing to mount a Hermes control-plane ancestor into a worker container"
+            )
         if auto_mount_cwd and host_cwd and not os.path.isdir(host_cwd_abs):
             logger.debug(f"Skipping docker cwd mount: host_cwd is not a valid directory: {host_cwd}")
 
@@ -715,7 +736,7 @@ class DockerEnvironment(BaseEnvironment):
                 get_cache_directory_mounts,
             )
 
-            for mount_entry in get_credential_file_mounts():
+            for mount_entry in get_credential_file_mounts() if mount_agent_assets else []:
                 src = Path(mount_entry["host_path"])
                 if src.is_dir():
                     # Docker-in-Docker: Docker auto-created the source path as
@@ -744,7 +765,7 @@ class DockerEnvironment(BaseEnvironment):
 
             # Mount skill directories (local + external) so skill
             # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
+            for skills_mount in get_skills_directory_mount() if mount_agent_assets else []:
                 src = Path(skills_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -766,7 +787,7 @@ class DockerEnvironment(BaseEnvironment):
             # screenshots) so the agent can access uploaded files and other
             # cached media from inside the container.  Read-only — the
             # container reads these but the host gateway manages writes.
-            for cache_mount in get_cache_directory_mounts():
+            for cache_mount in get_cache_directory_mounts() if mount_agent_assets else []:
                 src = Path(cache_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(

@@ -1145,6 +1145,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "container_persistent": config.get("container_persistent", True),
                     "docker_volumes": config.get("docker_volumes", []),
                     "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+                    "docker_mount_agent_assets": config.get("docker_mount_agent_assets", True),
                     "docker_forward_env": config.get("docker_forward_env", []),
                     "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                     "docker_network": config.get("docker_network", True),
