@@ -139,15 +139,23 @@ def _get_active_profile_name() -> str:
 
 
 def _worker_mount_is_control_plane(path: str) -> bool:
-    """Reject broad worker mounts that contain the Hermes control plane."""
+    """Allow a Kanban worker to bind only its exact dispatcher workspace.
+
+    The agent process still runs as the host user, so a writable bind is a
+    capability boundary: parents, children, sibling workspaces and every other
+    Hermes control-plane path must remain outside the container.  Both paths
+    are resolved before comparison so a symlink cannot disguise a sensitive
+    descendant.  Interactive sessions keep the historical mount behaviour.
+    """
     if not os.environ.get("HERMES_KANBAN_TASK"):
         return False
     try:
-        from hermes_constants import get_hermes_home
-
+        workspace_raw = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+        if not workspace_raw:
+            return True
         candidate = Path(path).resolve(strict=False)
-        control_plane = Path(get_hermes_home()).resolve(strict=False)
-        return candidate == control_plane or candidate in control_plane.parents
+        workspace = Path(workspace_raw).resolve(strict=False)
+        return candidate != workspace
     except Exception:
         # Mount validation is a boundary: ambiguity must not expose host state.
         return True
