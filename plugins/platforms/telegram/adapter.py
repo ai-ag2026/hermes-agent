@@ -5343,7 +5343,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="⛔ Nicht autorisiert.")
                 return
             try:
-                from plugins.platforms.telegram import kanban_actions
+                try:
+                    from . import kanban_actions
+                except ImportError:
+                    from plugins.platforms.telegram import kanban_actions
                 handled = await kanban_actions.handle_callback(query, data)
             except Exception:
                 logger.exception("[%s] kanban action callback failed", self.name)
@@ -7551,7 +7554,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # normal conversation stays untouched.
         if self._kanban_actions_enabled:
             try:
-                from plugins.platforms.telegram import kanban_actions
+                try:
+                    from . import kanban_actions
+                except ImportError:
+                    from plugins.platforms.telegram import kanban_actions
                 if await kanban_actions.try_handle_text(msg):
                     return
             except Exception:
