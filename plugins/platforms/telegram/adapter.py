@@ -525,6 +525,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # can leave Bot API 10.1 rich draft frames visually overlaid until the
         # chat is redrawn, while final rich messages remain useful.
         self._rich_drafts_enabled: bool = self._coerce_bool_extra("rich_drafts", False)
+        # Kanban quick actions (buttons/short commands/ping replies) are
+        # opt-in: they let an authorized chat mutate the kanban board without
+        # the agent loop, which only makes sense for operator setups.
+        self._kanban_actions_enabled: bool = self._coerce_bool_extra("kanban_actions", False)
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.
@@ -5323,6 +5327,34 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._handle_model_picker_callback(query, data, chat_id)
             return
 
+        # --- Kanban quick actions (kb…: unblock/details/archive/gate) ---
+        if data.startswith("kb"):
+            if not self._kanban_actions_enabled:
+                await query.answer(text="Kanban-Aktionen sind deaktiviert.")
+                return
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Nicht autorisiert.")
+                return
+            try:
+                from plugins.platforms.telegram import kanban_actions
+                handled = await kanban_actions.handle_callback(query, data)
+            except Exception:
+                logger.exception("[%s] kanban action callback failed", self.name)
+                try:
+                    await query.answer(text="⚠ Aktion fehlgeschlagen — siehe Gateway-Log.")
+                except Exception:
+                    pass
+                handled = True
+            if handled:
+                return
+
         # --- Gmail-triage callbacks (gt:verb:arg) ---
         if data.startswith("gt:"):
             await self._handle_gmail_triage_callback(
@@ -7513,6 +7545,17 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
+        # Kanban quick actions: replies to a blocker ping and short commands
+        # ("unblock 1", "unblock alle", "details 2") are consumed here and
+        # never reach the agent loop. Everything else falls through so the
+        # normal conversation stays untouched.
+        if self._kanban_actions_enabled:
+            try:
+                from plugins.platforms.telegram import kanban_actions
+                if await kanban_actions.try_handle_text(msg):
+                    return
+            except Exception:
+                logger.exception("[%s] kanban action text handling failed", self.name)
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
