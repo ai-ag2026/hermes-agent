@@ -2857,6 +2857,54 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _reject_foreign_workspace_refs(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    title: str,
+    body: Optional[str],
+    board: Optional[str],
+) -> None:
+    """Reject handoffs that depend on another task's disposable workspace."""
+    root = str(workspaces_root(board=board)).rstrip("/")
+    if not root:
+        return
+    pattern = re.compile(
+        re.escape(root) + r"/(t_[A-Za-z0-9_-]+)(?=$|[/\s'\"`),.;:!?])"
+    )
+    referenced_ids = {
+        match.group(1)
+        for text in (title, body or "")
+        for match in pattern.finditer(text)
+        if match.group(1) != task_id
+    }
+    if not referenced_ids:
+        return
+
+    details: list[str] = []
+    for referenced_id in sorted(referenced_ids):
+        durable_paths = [
+            str(row["durable_path"])
+            for row in conn.execute(
+                "SELECT durable_path FROM task_artifacts "
+                "WHERE task_id = ? ORDER BY producer_run_id, id",
+                (referenced_id,),
+            ).fetchall()
+        ]
+        detail = f"{root}/{referenced_id}"
+        if durable_paths:
+            detail += "\n  durable artifact path(s):\n  - " + "\n  - ".join(durable_paths)
+        details.append(detail)
+
+    raise ValueError(
+        "task title/body references another task's scratch workspace, which may "
+        "be deleted after that task completes. Use the referenced task's durable "
+        "artifact path instead, or explicitly set allow_workspace_refs=True only "
+        "for an intentional live-workspace dependency:\n- "
+        + "\n- ".join(details)
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2883,6 +2931,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     completion_contract: Optional[dict] = None,
+    allow_workspace_refs: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3075,6 +3124,14 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                if not allow_workspace_refs:
+                    _reject_foreign_workspace_refs(
+                        conn,
+                        task_id=task_id,
+                        title=title,
+                        body=body,
+                        board=board,
+                    )
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.

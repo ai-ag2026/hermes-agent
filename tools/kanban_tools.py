@@ -1176,6 +1176,11 @@ def _handle_create(args: dict, **kw) -> str:
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
+    allow_workspace_refs, workspace_refs_bool_error = _parse_bool_arg(
+        args, "allow_workspace_refs"
+    )
+    if workspace_refs_bool_error:
+        return tool_error(workspace_refs_bool_error)
     goal_max_turns = args.get("goal_max_turns")
     # task_class (quality-class model routing) and max_retries (per-card
     # circuit-breaker limit) were previously CLI-only: agent-created cards
@@ -1236,6 +1241,7 @@ def _handle_create(args: dict, **kw) -> str:
                 max_retries=(
                     int(max_retries) if max_retries is not None else None
                 ),
+                allow_workspace_refs=allow_workspace_refs,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1848,6 +1854,13 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Absolute path for 'dir' or 'worktree' workspace. "
                     "Relative paths are rejected at dispatch."
+                ),
+            },
+            "allow_workspace_refs": {
+                "type": "boolean",
+                "description": (
+                    "Explicit opt-out from the disposable-workspace handoff guard. "
+                    "Use only for an intentional dependency on a concurrently running task."
                 ),
             },
             "project": {

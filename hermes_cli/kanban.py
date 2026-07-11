@@ -311,6 +311,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
+    p_create.add_argument(
+        "--allow-workspace-refs",
+        action="store_true",
+        help="Allow intentional references to another task's disposable scratch workspace",
+    )
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -1494,6 +1499,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            allow_workspace_refs=bool(getattr(args, "allow_workspace_refs", False)),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
