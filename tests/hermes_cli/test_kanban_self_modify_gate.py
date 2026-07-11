@@ -138,3 +138,42 @@ def test_gate_can_be_disabled_by_config(isolated_kanban_home, monkeypatch):
         res = kb.dispatch_once(conn, spawn_fn=_spawn)
     assert not res.self_modify_gated
     assert tid in [s[0] for s in res.spawned]
+
+
+# ---------------------------------------------------------------------------
+# CAS guard: dispatcher-initiated blocks must not de-claim a card that was
+# claimed between the ready snapshot and the block (require_unclaimed=True).
+# ---------------------------------------------------------------------------
+
+def test_require_unclaimed_refuses_to_declaim_claimed_card(isolated_kanban_home):
+    kb, _ = isolated_kanban_home
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="Edit ~/.hermes/config.yaml", assignee="backend-eng")
+        # Simulate the race: an external actor claims the ready card before
+        # the dispatcher hook fires its block.
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert not kb.block_task(
+            conn, tid, require_unclaimed=True,
+            reason="self-modification gate: test", kind="needs_input",
+            human_gate=True,
+        )
+        task = kb.get_task(conn, tid)
+        # The running claim survives untouched — no de-claim, no double-spawn stage.
+        assert task.status == "running"
+        assert task.claim_lock
+
+
+def test_require_unclaimed_blocks_unclaimed_ready_card(isolated_kanban_home):
+    kb, _ = isolated_kanban_home
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="Edit ~/.hermes/config.yaml", assignee="backend-eng")
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kb.block_task(
+            conn, tid, require_unclaimed=True,
+            reason="self-modification gate: test", kind="needs_input",
+            human_gate=True,
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.human_gate

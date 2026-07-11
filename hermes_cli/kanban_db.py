@@ -6898,6 +6898,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    require_unclaimed: bool = False,
     human_gate: Optional[bool] = None,
     human_summary: Optional[str] = None,
     human_action: Optional[str] = None,
@@ -6942,6 +6943,15 @@ def block_task(
     supply them lives in the ``kanban_block`` tool handler, not here — the
     kernel accepts blocks without them (CLI/legacy callers).
 
+    ``require_unclaimed=True`` restricts the transition to a card that is
+    still unclaimed (``claim_lock IS NULL``). This is the CAS guard for
+    dispatcher-initiated blocks of *ready* cards (self-modify gate,
+    active_pr escalation): a never-run ready card has ``current_run_id``
+    NULL, so ``expected_run_id`` cannot express "nobody claimed it since my
+    snapshot" — but any claim always sets ``claim_lock``, so this guard
+    atomically refuses to de-claim a card that was claimed between snapshot
+    and block.
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -6949,6 +6959,7 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    unclaimed_guard = " AND claim_lock IS NULL" if require_unclaimed else ""
 
     def _with_human_fields(payload: dict) -> dict:
         if human_summary and str(human_summary).strip():
@@ -6973,7 +6984,7 @@ def block_task(
                    SET status = 'todo', claim_lock = NULL,
                        claim_expires = NULL, worker_pid = NULL, block_kind = ?
                  WHERE id = ? AND status IN ('running', 'ready')
-                """ + run_guard,
+                """ + run_guard + unclaimed_guard,
                 params,
             )
             if cur.rowcount != 1:
@@ -7047,7 +7058,8 @@ def block_task(
                        block_recurrences = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?")
+                + unclaimed_guard,
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
             )
@@ -7091,7 +7103,7 @@ def block_task(
                            human_gate    = COALESCE(?, human_gate)
                      WHERE id = ?
                        AND status IN ('running', 'ready')
-                    """,
+                    """ + unclaimed_guard,
                     (kind, recurrences, gate_param, task_id),
                 )
             else:
@@ -7108,7 +7120,7 @@ def block_task(
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
-                    """,
+                    """ + unclaimed_guard,
                     (kind, recurrences, gate_param, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
@@ -9588,7 +9600,9 @@ def _self_modify_patterns() -> list[tuple[Any, str]]:
     return compiled
 
 
-def classify_self_modification(task) -> Optional[str]:
+def classify_self_modification(
+    task, patterns: Optional[list[tuple[Any, str]]] = None
+) -> Optional[str]:
     """Return a short reason label if *task* would modify the Hermes runtime,
     else None.
 
@@ -9613,7 +9627,9 @@ def classify_self_modification(task) -> Optional[str]:
         haystack = "\n".join(parts)
         if not haystack.strip():
             return None
-        for rx, label in _self_modify_patterns():
+        for rx, label in (
+            patterns if patterns is not None else _self_modify_patterns()
+        ):
             if rx.search(haystack):
                 return label
     except Exception:
@@ -10037,6 +10053,11 @@ def _dispatch_once_locked(
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
     _default_assignee = (default_assignee or "").strip() or None
+    # Self-modify gate: resolve config + compile patterns ONCE per tick, not
+    # per ready card (load_config + re.compile in the hot loop was measurable
+    # on large ready queues).
+    _sm_gate_on = (not dry_run) and _self_modify_gate_enabled()
+    _sm_patterns = _self_modify_patterns() if _sm_gate_on else None
     _default_assignee_resolved = False
     if _default_assignee:
         try:
@@ -10177,6 +10198,7 @@ def _dispatch_once_locked(
                         if block_task(
                             conn,
                             row["id"],
+                            require_unclaimed=True,
                             reason=(
                                 "auto-block: respawn guard 'active_pr' has "
                                 "deferred this ready task for over "
@@ -10198,14 +10220,17 @@ def _dispatch_once_locked(
         # falls through and dispatches normally (approve-once-per-card).
         # Reuses Human-Gate v1: the block surfaces in the cockpit / Telegram
         # with the plain-language reason and a one-tap approve.
-        if not dry_run and _self_modify_gate_enabled():
+        if _sm_gate_on:
             _sm_task = get_task(conn, row["id"])
             if _sm_task is not None and not getattr(_sm_task, "human_gate", 0):
-                _sm_reason = classify_self_modification(_sm_task)
+                _sm_reason = classify_self_modification(
+                    _sm_task, patterns=_sm_patterns
+                )
                 if _sm_reason:
                     if block_task(
                         conn,
                         row["id"],
+                        require_unclaimed=True,
                         reason="self-modification gate: " + _sm_reason,
                         kind="needs_input",
                         human_gate=True,
