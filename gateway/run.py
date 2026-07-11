@@ -18321,7 +18321,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
-            agent.request_overrides = turn_route.get("request_overrides") or {}
+            # Per-turn reset; re-apply config-driven model.extra_body
+            # (agent_init) as the base so it survives cached-agent reuse.
+            # Route re-check: a fallback/model switch on this agent must
+            # not drag the main model's extra_body onto another provider.
+            _turn_overrides = turn_route.get("request_overrides") or {}
+            _cfg_overrides = getattr(agent, "_config_request_overrides", None) or {}
+            _cfg_route = getattr(agent, "_config_request_overrides_route", None)
+            if _cfg_overrides and _cfg_route == (agent.model, agent.provider):
+                agent.request_overrides = {**_cfg_overrides, **_turn_overrides}
+            else:
+                agent.request_overrides = _turn_overrides
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []

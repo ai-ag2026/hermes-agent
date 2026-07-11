@@ -1436,6 +1436,48 @@ def init_agent(
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+    # Config-driven request-body extras for the MAIN model route.
+    # ``model.extra_body`` in config.yaml is forwarded verbatim as request
+    # body fields — the same contract as ``custom_providers[].extra_body`` /
+    # ``providers.<id>.extra_body``, but for built-in OAuth routes
+    # (openai-codex, …) that never pass through the custom-provider
+    # resolver.  Example: ``model.extra_body: {text: {verbosity: high}}``
+    # to raise Responses-API output verbosity on Codex-backed models.
+    # Scoped to agents that actually run the configured default
+    # model+provider so auxiliary/worker agents on other routes are
+    # untouched.  Runtime overrides (fast mode) win on key collisions.
+    # The gateway's per-turn ``request_overrides`` reset re-applies this
+    # via ``agent._config_request_overrides`` (route re-checked there).
+    agent._config_request_overrides = {}
+    agent._config_request_overrides_route = None
+    try:
+        _model_section = _agent_cfg.get("model", {})
+        if not isinstance(_model_section, dict):
+            _model_section = {}
+        _cfg_extra_body = _model_section.get("extra_body")
+        _cfg_default_model = str(_model_section.get("default", "") or "").strip()
+        _cfg_provider = str(_model_section.get("provider", "") or "").strip().lower()
+        if (
+            isinstance(_cfg_extra_body, dict)
+            and _cfg_extra_body
+            and _cfg_default_model
+            and _cfg_default_model == str(agent.model or "").strip()
+            and _cfg_provider == str(agent.provider or "").strip().lower()
+        ):
+            agent._config_request_overrides = {"extra_body": dict(_cfg_extra_body)}
+            agent._config_request_overrides_route = (agent.model, agent.provider)
+            _existing_overrides = dict(agent.request_overrides or {})
+            _merged_extra_body = dict(_cfg_extra_body)
+            if isinstance(_existing_overrides.get("extra_body"), dict):
+                _merged_extra_body.update(_existing_overrides["extra_body"])
+            _merged_overrides = dict(agent._config_request_overrides)
+            _merged_overrides.update(_existing_overrides)
+            _merged_overrides["extra_body"] = _merged_extra_body
+            agent.request_overrides = _merged_overrides
+    except Exception:
+        agent._config_request_overrides = {}
+        agent._config_request_overrides_route = None
+
     # Intent-ack continuation config: "auto" (default — codex_responses only,
     # the historical gate), true (all api_modes), false (never), or a list of
     # model-name substrings.  Resolved against the active api_mode/model in the
