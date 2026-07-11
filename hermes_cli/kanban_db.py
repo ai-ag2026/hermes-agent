@@ -4387,6 +4387,14 @@ def decide_task_review(
         raise ValueError(
             f"review decision must be one of {sorted(VALID_REVIEW_DECISIONS)}"
         )
+    if decision == "ACCEPT":
+        return _accept_task_review(
+            conn,
+            task_id,
+            summary=summary,
+            metadata=metadata,
+            expected_run_id=expected_run_id,
+        )
     now = int(time.time())
     with write_txn(conn):
         request = _pending_review_request(conn, task_id)
@@ -4501,6 +4509,114 @@ def decide_task_review(
         run_id=run_id,
         summary=summary,
         decision=decision,
+    )
+    return True
+
+
+def _accept_task_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str],
+    metadata: Optional[dict],
+    expected_run_id: Optional[int],
+) -> bool:
+    """Accept review only after the completion contract and artifacts commit."""
+    try:
+        with _completion_artifact_lock(conn):
+            request = _pending_review_request(conn, task_id)
+            task = get_task(conn, task_id)
+            if request is None or task is None or task.status != "running":
+                return False
+            run_id = task.current_run_id
+            if run_id is None or (expected_run_id is not None and run_id != int(expected_run_id)):
+                return False
+            implementation_assignee = request.get("implementation_assignee")
+            if not implementation_assignee:
+                return False
+            event = conn.execute(
+                "SELECT run_id FROM task_events WHERE task_id=? AND kind='review_requested' "
+                "ORDER BY id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            implementation_metadata: dict = {}
+            if event and event["run_id"] is not None:
+                run = conn.execute(
+                    "SELECT metadata FROM task_runs WHERE id=?", (event["run_id"],)
+                ).fetchone()
+                try:
+                    parsed = json.loads(run["metadata"] or "{}") if run else {}
+                except (TypeError, json.JSONDecodeError):
+                    parsed = {}
+                if isinstance(parsed, dict):
+                    implementation_metadata = parsed
+            completion_metadata = dict(implementation_metadata)
+            if isinstance(metadata, dict):
+                completion_metadata.update(metadata)
+            created_cards = completion_metadata.get("created_cards") or []
+            verified_cards, phantom_cards = _verify_created_cards(conn, task_id, created_cards)
+            if phantom_cards:
+                raise HallucinatedCardsError(phantom_cards, task_id)
+            created_artifact_paths: list[Path] = []
+            try:
+                _validate_completion_contract(task, completion_metadata)
+                artifact_manifest, created_artifact_paths = _promote_completion_artifacts(
+                    task, completion_metadata, board=get_current_board()
+                )
+            except CompletionEvidenceError as exc:
+                _record_completion_rejection(conn, task_id, exc, run_id=run_id)
+                raise
+            if artifact_manifest:
+                completion_metadata["artifact_manifest"] = artifact_manifest
+                completion_metadata["artifacts"] = [item["durable_path"] for item in artifact_manifest]
+            with _completion_evidence_error_boundary(
+                conn, task_id, run_id=run_id
+            ), _completion_artifact_txn(conn, created_artifact_paths) as promotion_state:
+                if _pending_review_request(conn, task_id) is None:
+                    return False
+                cur = conn.execute(
+                    "UPDATE tasks SET status='done', assignee=?, completed_at=?, "
+                    "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                    "block_kind=NULL, block_recurrences=0 "
+                    "WHERE id=? AND status='running' AND current_run_id=?",
+                    (implementation_assignee, int(time.time()), task_id, int(run_id)),
+                )
+                if cur.rowcount != 1:
+                    return False
+                for manifest in artifact_manifest:
+                    _persist_completion_artifact_manifest(conn, manifest)
+                _end_run(
+                    conn, task_id, outcome="accept", status="done",
+                    summary=summary, metadata=completion_metadata,
+                )
+                summary_lines = (summary or "").strip().splitlines()
+                preview = summary_lines[0][:400] if summary_lines else None
+                _append_event(
+                    conn, task_id, "review_decided",
+                    {"decision": "ACCEPT", "summary": preview}, run_id=run_id,
+                )
+                payload = {"summary": preview, "artifact_manifest": artifact_manifest}
+                if verified_cards:
+                    payload["created_cards"] = verified_cards
+                _append_event(conn, task_id, "completed", payload, run_id=run_id)
+                promotion_state["committed"] = True
+    except _CompletionArtifactLockError as exc:
+        error = CompletionEvidenceError(
+            "artifact_promotion_failed", f"completion artifact lock failed: {exc}"
+        )
+        current = get_task(conn, task_id)
+        _record_completion_rejection(
+            conn, task_id, error,
+            run_id=current.current_run_id if current is not None else None,
+        )
+        raise error from exc
+    _clear_failure_counter(conn, task_id)
+    recompute_ready(conn)
+    _cleanup_workspace(conn, task_id)
+    completed = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_completed", task_id, board=get_current_board(),
+        assignee=completed.assignee if completed else None, run_id=run_id,
+        summary=summary, decision="ACCEPT",
     )
     return True
 
@@ -6545,7 +6661,7 @@ def _assert_human_gate_open(
     invalidate a token a legitimate holder still has.
     """
     row = conn.execute(
-        "SELECT human_gate, gate_token_hash FROM tasks "
+        "SELECT human_gate, gate_token_hash, gate_token_issued_at FROM tasks "
         "WHERE id = ? AND status IN ('blocked', 'scheduled')",
         (task_id,),
     ).fetchone()
@@ -6558,7 +6674,25 @@ def _assert_human_gate_open(
             "(or the ntfy push failed) — wait for the push, or run "
             f"`hermes kanban gate {task_id} off` to release it"
         )
+    try:
+        from hermes_cli.config import load_config
+
+        gate_cfg = (load_config().get("kanban") or {}).get("human_gate") or {}
+        ttl = max(30, min(int(gate_cfg.get("token_ttl_seconds", 600)), 3600))
+    except (TypeError, ValueError, AttributeError):
+        ttl = 600
+    issued_at = row["gate_token_issued_at"]
+    if not issued_at or int(time.time()) - int(issued_at) > ttl:
+        _log.warning(
+            "human_gate token expired task=%s action=%s board=%s",
+            task_id, action, get_current_board(),
+        )
+        raise GateTokenError(f"{task_id} human-gate token has expired")
     if not token or not hmac.compare_digest(hash_gate_token(token), stored_hash):
+        _log.warning(
+            "human_gate token rejected task=%s action=%s board=%s",
+            task_id, action, get_current_board(),
+        )
         raise GateTokenError(
             f"{task_id} is human-gated: the correct one-time token "
             f"(delivered via ntfy) is required to {action} it"
@@ -7406,8 +7540,10 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and cascade to all related rows.
+def delete_task(
+    conn: sqlite3.Connection, task_id: str, *, operator_reason: Optional[str] = None
+) -> bool:
+    """Retention hard-delete for archived, non-gated tasks only.
 
     Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
     we explicitly delete from child tables first, then the task row.
@@ -7417,9 +7553,18 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
+        row = conn.execute(
+            "SELECT status, human_gate FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
             return False
+        if row["human_gate"]:
+            raise GateTokenError("human-gated tasks cannot be hard-deleted")
+        if row["status"] != "archived":
+            raise ValueError("hard-delete requires an archived task; archive it first")
+        if not str(operator_reason or "").strip():
+            raise ValueError("hard-delete requires an operator retention reason")
+        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
@@ -10187,6 +10332,16 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+
+    # A dispatcher may itself be launched from a task-bound worker. Never let
+    # ambient ownership or per-task execution settings bleed into the next
+    # child; scrub the whole Kanban namespace, then pin the new task/board
+    # explicitly below. The few non-prefixed task settings are cleared too.
+    for key in tuple(env):
+        if key.startswith("HERMES_KANBAN_"):
+            env.pop(key, None)
+    for key in ("HERMES_REASONING_EFFORT", "HERMES_TENANT", "TERMINAL_CWD"):
+        env.pop(key, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root

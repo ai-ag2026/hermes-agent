@@ -1495,6 +1495,10 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        "human_gate": {
+            "token_ttl_seconds": 600,
+            "max_failed_attempts": 5,
+        },
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

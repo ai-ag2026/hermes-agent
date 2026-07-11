@@ -1681,7 +1681,8 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         t = kb.create_task(conn, title="to-delete", assignee="alice")
         kb.add_comment(conn, t, "user", "comment")
         kb.add_comment(conn, t, "user", "another")
-        assert kb.delete_task(conn, t)
+        assert kb.archive_task(conn, t)
+        assert kb.delete_task(conn, t, operator_reason="retention expired")
         assert kb.get_task(conn, t) is None
         assert len(kb.list_comments(conn, t)) == 0
         assert len(kb.list_events(conn, t)) == 0
@@ -1699,7 +1700,8 @@ def test_delete_task_cascades_links(kanban_home):
         c = kb.create_task(conn, title="child", parents=[p])
         child = kb.get_task(conn, c)
         assert child is not None and child.status == "todo"
-        kb.delete_task(conn, p)
+        kb.archive_task(conn, p)
+        kb.delete_task(conn, p, operator_reason="retention expired")
         assert kb.get_task(conn, p) is None
         child_after = kb.get_task(conn, c)
         assert child_after is not None and child_after.status == "ready"
@@ -5536,6 +5538,35 @@ def test_stale_review_decision_is_rejected(kanban_home):
             expected_run_id=int(review.current_run_id) + 1,
         ) is False
         assert kb.get_task(conn, tid).status == "running"
+
+
+def test_review_accept_enforces_and_merges_completion_contract(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="contract", assignee="backend-eng",
+            completion_contract={"tests_or_smokes": True, "readback": True},
+        )
+        impl = kb.claim_task(conn, tid)
+        assert kb.request_task_review(
+            conn, tid, reviewer="reviewer", summary="ready",
+            metadata={"tests_or_smokes": ["pytest"]},
+            expected_run_id=impl.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid)
+        with pytest.raises(kb.CompletionEvidenceError):
+            kb.decide_task_review(
+                conn, tid, decision="ACCEPT", metadata={},
+                expected_run_id=review.current_run_id,
+            )
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.decide_task_review(
+            conn, tid, decision="ACCEPT", metadata={"readback": ["file:1"]},
+            expected_run_id=review.current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "done"
+        closed = kb.latest_run(conn, tid)
+        assert closed.metadata["tests_or_smokes"] == ["pytest"]
+        assert closed.metadata["readback"] == ["file:1"]
 
 
 def test_dependency_block_hook_observes_committed_state(kanban_home, monkeypatch):

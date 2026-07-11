@@ -956,11 +956,18 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 # ---------------------------------------------------------------------------
 
 @router.delete("/tasks/{task_id}")
-def delete_task(task_id: str, board: Optional[str] = Query(None)):
+def delete_task(
+    task_id: str,
+    board: Optional[str] = Query(None),
+    reason: str = Query(..., min_length=1),
+):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.delete_task(conn, task_id)
+        try:
+            ok = kanban_db.delete_task(conn, task_id, operator_reason=reason)
+        except (kanban_db.GateTokenError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}

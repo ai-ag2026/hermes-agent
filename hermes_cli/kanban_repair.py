@@ -50,6 +50,7 @@ Design constraints (from the card):
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -420,7 +421,9 @@ def _audit_stale_promotable(conn) -> list[Finding]:
 
 def _audit_done_completion_evidence(conn) -> list[Finding]:
     findings: list[Finding] = []
-    rows = conn.execute("SELECT id FROM tasks WHERE status = 'done'").fetchall()
+    rows = conn.execute(
+        "SELECT id, completion_contract FROM tasks WHERE status = 'done'"
+    ).fetchall()
     for row in rows:
         task_id = row["id"]
         if not _has_completion_evidence(conn, task_id):
@@ -435,6 +438,48 @@ def _audit_done_completion_evidence(conn) -> list[Finding]:
                     ),
                 )
             )
+        try:
+            contract = json.loads(row["completion_contract"] or "{}")
+        except (TypeError, ValueError):
+            contract = {}
+        if not isinstance(contract, dict) or not contract:
+            continue
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? "
+            "AND outcome IN ('completed', 'accept') ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        try:
+            evidence = json.loads(run["metadata"] or "{}") if run else {}
+        except (TypeError, ValueError):
+            evidence = {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        artifact_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_artifacts WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()["n"]
+        for key in ("tests_or_smokes", "readback", "artifacts"):
+            if contract.get(key) and not evidence.get(key):
+                findings.append(Finding(
+                    kind=f"done_missing_required_{key}",
+                    task_id=task_id,
+                    bucket="triage",
+                    detail=(
+                        f"completion contract requires {key!r}, but the "
+                        "closing run has no such evidence"
+                    ),
+                ))
+        if contract.get("artifacts") and not artifact_count:
+            findings.append(Finding(
+                kind="done_artifact_contract_without_manifest",
+                task_id=task_id,
+                bucket="triage",
+                detail=(
+                    "completion contract requires artifacts but no durable "
+                    "task_artifacts manifest exists"
+                ),
+            ))
     return findings
 
 
