@@ -2563,6 +2563,64 @@ def test_unblock_tool_requires_reason_for_needs_input(monkeypatch, worker_env):
         conn.close()
 
 
+def test_unblock_tool_passes_token_through_but_cannot_set_gate(monkeypatch, worker_env):
+    """Human-Gate v1: the kanban_unblock tool must redeem an operator-issued
+    token, but its schema/handler must have NO way to set or clear the
+    human_gate flag itself — that is CLI-only (kanban block --human-gate /
+    kanban gate <id> on|off)."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        kb.block_task(
+            conn, worker_env, reason="approval required",
+            kind="needs_input", human_gate=True,
+        )
+        token = kb.issue_gate_token(conn, worker_env)
+        assert token
+    finally:
+        conn.close()
+
+    # Missing token: refused (GateTokenError -> ValueError -> tool_error),
+    # card stays blocked. No new exception handling was added for this —
+    # the existing `except ValueError` in _handle_unblock already covers it.
+    out = kt._handle_unblock({"task_id": worker_env, "reason": "ok"})
+    assert json.loads(out).get("error")
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "blocked"
+    finally:
+        conn.close()
+
+    # Correct token: succeeds.
+    out2 = kt._handle_unblock({"task_id": worker_env, "reason": "ok", "token": token})
+    d2 = json.loads(out2)
+    assert d2.get("ok") is True
+
+    # Schema surface: neither the block nor unblock tool exposes a way to
+    # set/clear the gate flag.
+    assert "human_gate" not in kt.KANBAN_BLOCK_SCHEMA["parameters"]["properties"]
+    assert "human_gate" not in kt.KANBAN_UNBLOCK_SCHEMA["parameters"]["properties"]
+
+    # Even a smuggled human_gate arg on kanban_block is inert — the handler
+    # never reads that key, so block_task's own human_gate default (None)
+    # applies and the flag stays False.
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="other task", assignee="test-worker")
+    finally:
+        conn.close()
+    out3 = kt._handle_block({"task_id": other, "reason": "x", "human_gate": True})
+    assert json.loads(out3).get("ok") is True
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).human_gate is False
+    finally:
+        conn.close()
+
+
 def test_create_tool_passes_task_class_and_max_retries(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt

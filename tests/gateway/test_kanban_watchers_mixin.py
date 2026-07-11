@@ -8,6 +8,7 @@ that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 
@@ -67,3 +68,60 @@ def test_singleton_dispatcher_lock_is_exclusive(tmp_path):
     h3, st3 = _acquire_singleton_lock(lock)
     assert st3 == "held" and h3 is not None
     _release_singleton_lock(h3)
+
+
+def test_issue_pending_gate_tokens_issues_and_pushes_for_gated_blocked_cards(
+    tmp_path, monkeypatch,
+):
+    """Human-Gate v1's designated hook point: the notifier tick's per-board
+    gate-token scan must issue + push a token for every blocked,
+    human_gate=1 card missing one — independent of any chat subscription
+    (a card blocked from a bare `kanban block --human-gate` CLI call, with
+    nobody subscribed via a bot chat, must still get gated)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    pushed: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        kb, "send_gate_token_ntfy",
+        lambda task_id, token, **kw: (pushed.append((task_id, token)) or True),
+    )
+
+    conn = kb.connect()
+    try:
+        gated = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, gated, reason="x", kind="needs_input", human_gate=True)
+        ungated = kb.create_task(conn, title="plain", assignee="worker")
+        kb.block_task(conn, ungated, reason="y", kind="needs_input")
+
+        GatewayKanbanWatchersMixin._kanban_issue_pending_gate_tokens(
+            None, conn, board="default",
+        )
+
+        assert kb.get_task(conn, gated).human_gate is True
+        gated_row = conn.execute(
+            "SELECT gate_token_hash FROM tasks WHERE id = ?", (gated,)
+        ).fetchone()
+        assert gated_row["gate_token_hash"] is not None
+        assert len(pushed) == 1 and pushed[0][0] == gated
+
+        # Ungated card: never touched, no push.
+        ungated_row = conn.execute(
+            "SELECT gate_token_hash FROM tasks WHERE id = ?", (ungated,)
+        ).fetchone()
+        assert ungated_row["gate_token_hash"] is None
+
+        # A second scan is a no-op for the already-issued card — one push
+        # total, not a duplicate on every tick.
+        GatewayKanbanWatchersMixin._kanban_issue_pending_gate_tokens(
+            None, conn, board="default",
+        )
+        assert len(pushed) == 1
+    finally:
+        conn.close()

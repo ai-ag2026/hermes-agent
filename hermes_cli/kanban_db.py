@@ -70,8 +70,10 @@ new locking.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -86,6 +88,8 @@ import sys
 import threading
 import logging
 import time
+import urllib.parse
+import urllib.request
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1012,6 +1016,12 @@ class Task:
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
     completion_contract: Optional[dict] = None
+    # Human-Gate v1 flag only — the token hash/issued_at columns are
+    # deliberately NOT exposed here so they can never flow through
+    # ``_task_to_dict`` / ``kanban show --json`` / any tool payload. Code
+    # that needs to check or consume the hash reads it with a direct SQL
+    # query (see ``unblock_task`` / ``issue_gate_token``).
+    human_gate: bool = False
     # Event-sourcing resume (#2), in-memory only — NOT persisted columns and NOT
     # read by from_row. Populated by claim_task/claim_review_task so the spawn
     # path knows which resumable session id to pin for this run and whether this
@@ -1113,6 +1123,9 @@ class Task:
                 else 0
             ),
             completion_contract=completion_contract,
+            human_gate=(
+                bool(row["human_gate"]) if "human_gate" in keys and row["human_gate"] else False
+            ),
         )
 
 
@@ -1299,7 +1312,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
-    completion_contract  TEXT
+    completion_contract  TEXT,
+    -- Human-Gate v1 (2026-07-11, see human-gate-design.md). When 1, this
+    -- card can only be unblocked with a one-time token pushed to the
+    -- operator via ntfy — no tool surface and no worker session can set
+    -- or clear this flag; only the interactive CLI (`kanban block
+    -- --human-gate` / `kanban gate <id> on|off`) does. gate_token_hash
+    -- stores ONLY the sha256 hex digest of the current token, never the
+    -- plaintext; NULL means no token is currently redeemable (either
+    -- none has been issued yet, or the last one was consumed/rotated),
+    -- which makes unblock_task fail closed.
+    human_gate           INTEGER NOT NULL DEFAULT 0,
+    gate_token_hash       TEXT,
+    gate_token_issued_at  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2348,6 +2373,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "completion_contract" not in cols:
         _add_column_if_missing(
             conn, "tasks", "completion_contract", "completion_contract TEXT"
+        )
+
+    if "human_gate" not in cols:
+        # Human-Gate v1. 0 (the default) = today's behaviour for every
+        # existing row; only a card explicitly marked via the CLI opts in.
+        _add_column_if_missing(
+            conn, "tasks", "human_gate", "human_gate INTEGER NOT NULL DEFAULT 0"
+        )
+    if "gate_token_hash" not in cols:
+        _add_column_if_missing(conn, "tasks", "gate_token_hash", "gate_token_hash TEXT")
+    if "gate_token_issued_at" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "gate_token_issued_at", "gate_token_issued_at INTEGER"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -6242,6 +6280,181 @@ def edit_completed_task_result(
     return True
 
 
+class GateTokenError(ValueError):
+    """Raised by ``unblock_task`` when a ``human_gate=1`` card lacks a
+    valid one-time token (Human-Gate v1, human-gate-design.md).
+
+    Kept as a ``ValueError`` subclass so it flows through the same
+    catch sites the S4d needs_input refusal already relies on (the CLI's
+    top-level dispatch catch and ``tools/kanban_tools.py``'s ``except
+    ValueError`` handler) without any new plumbing.
+    """
+
+
+def hash_gate_token(token: str) -> str:
+    """sha256 hex digest of a plaintext gate token. The DB only ever
+    stores this — the plaintext exists only in memory and in exactly one
+    ntfy push."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def issue_gate_token(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Generate + persist (hashed) a fresh one-time unblock token.
+
+    Only meaningful for a card that is currently ``blocked`` with
+    ``human_gate=1`` — returns ``None`` (no-op) for anything else, so
+    callers can call this speculatively without checking state first.
+    Returns the PLAINTEXT token for exactly one delivery by the caller
+    (ntfy push); the plaintext is never written to the DB, an event
+    payload, or a log line.
+    """
+    token = secrets.token_urlsafe(6)
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, human_gate FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] != "blocked" or not row["human_gate"]:
+            return None
+        conn.execute(
+            "UPDATE tasks SET gate_token_hash = ?, gate_token_issued_at = ? WHERE id = ?",
+            (hash_gate_token(token), now, task_id),
+        )
+        # Audit-visible that a token was (re)issued, never what it is.
+        _append_event(conn, task_id, "gate_token_issued", {"issued_at": now})
+    return token
+
+
+def _load_ntfy_env() -> dict[str, str]:
+    """Read ntfy credentials the same way ``scripts/tars_cron_ntfy_relay.py``
+    does: parse ``~/.hermes/.env`` (or ``$HERMES_HOME/.env``) on top of the
+    real process environment, without pulling in python-dotenv."""
+    env = os.environ.copy()
+    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    env_path = Path(home) / ".env"
+    if env_path.exists():
+        for raw in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    return env
+
+
+def send_gate_token_ntfy(task_id: str, token: str, *, board: Optional[str] = None) -> bool:
+    """Push a human-gate unblock token to the operator's ntfy channel.
+
+    Best-effort, short timeout, stdlib-only urllib POST — mirrors
+    ``send_ntfy`` in ``scripts/tars_cron_ntfy_relay.py`` (same env keys:
+    ``NTFY_BASE_URL``/``NTFY_TOPIC``/``NTFY_TOKEN`` or
+    ``NTFY_USER``/``NTFY_PASSWORD``). Returns False on any failure
+    (missing config, network error, non-2xx response); the caller must
+    treat that as fail-closed. Never logs the token itself.
+    """
+    env = _load_ntfy_env()
+    base_url = env.get("NTFY_BASE_URL", "https://ntfy.stardock.cloud").rstrip("/")
+    topic = env.get("NTFY_TOPIC", "").strip("/")
+    if not topic:
+        _log.warning(
+            "human_gate: NTFY_TOPIC not configured; token for %s was NOT "
+            "delivered (card stays hard-blocked, fail closed)", task_id,
+        )
+        return False
+    board_flag = f" --board {board}" if board else ""
+    message = (
+        f"Karte {task_id} wartet auf dich:\n"
+        f"hermes kanban unblock {task_id} --reason '...' --token {token}{board_flag}"
+    )
+    req = urllib.request.Request(
+        f"{base_url}/{urllib.parse.quote(topic)}",
+        method="POST",
+        data=message.encode("utf-8"),
+        headers={
+            "Title": f"Human Gate: {task_id}"[:120],
+            "Priority": "high",
+            "Tags": "robot,lock",
+            "User-Agent": "hermes-kanban-human-gate",
+        },
+    )
+    ntfy_token = env.get("NTFY_TOKEN", "")
+    user = env.get("NTFY_USER", "")
+    password = env.get("NTFY_PASSWORD", "")
+    if ntfy_token:
+        req.add_header("Authorization", f"Bearer {ntfy_token}")
+    elif user and password:
+        raw = f"{user}:{password}".encode("utf-8")
+        req.add_header("Authorization", "Basic " + base64.b64encode(raw).decode("ascii"))
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            ok = 200 <= resp.status < 300
+    except Exception as exc:
+        _log.warning(
+            "human_gate: ntfy push failed for %s: %s: %s",
+            task_id, type(exc).__name__, exc,
+        )
+        return False
+    if not ok:
+        _log.warning("human_gate: ntfy push for %s returned a non-2xx status", task_id)
+    return ok
+
+
+def issue_and_notify_gate_token(
+    conn: sqlite3.Connection, task_id: str, *, board: Optional[str] = None
+) -> bool:
+    """Issue a fresh gate token for a blocked ``human_gate=1`` card and
+    push it via ntfy in one step. Returns True only if a token was both
+    issued and delivered.
+
+    On any failure the card stays hard-blocked (fail closed): either no
+    token was issued at all (nothing to gate), or a token hash is now
+    persisted with nobody holding the plaintext. Rescue path in both
+    cases: ``hermes kanban gate <id> off`` (interactive CLI only).
+    """
+    token = issue_gate_token(conn, task_id)
+    if token is None:
+        return False
+    delivered = send_gate_token_ntfy(task_id, token, board=board)
+    if not delivered:
+        _log.warning(
+            "human_gate: %s is now hard-locked (token issued, ntfy push "
+            "failed) — rescue with `hermes kanban gate %s off`",
+            task_id, task_id,
+        )
+    return delivered
+
+
+def set_human_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    on: bool,
+    actor: Optional[str] = None,
+) -> bool:
+    """CLI-only: mark/unmark a card as human-gated (``kanban gate <id>
+    on|off``). No tool surface exposes this — see kanban_tools.py.
+
+    Turning the gate off also clears any pending token hash. This is the
+    documented rescue path when ntfy delivery fails or was never
+    configured: since the plaintext token never existed anywhere in that
+    case, ``gate off`` is the only way back to ``ready``.
+    """
+    with write_txn(conn):
+        row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        if on:
+            conn.execute("UPDATE tasks SET human_gate = 1 WHERE id = ?", (task_id,))
+        else:
+            conn.execute(
+                "UPDATE tasks SET human_gate = 0, gate_token_hash = NULL, "
+                "gate_token_issued_at = NULL WHERE id = ?",
+                (task_id,),
+            )
+        _append_event(conn, task_id, "gate_set", {"on": bool(on), "actor": actor})
+    return True
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6249,6 +6462,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    human_gate: Optional[bool] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6273,6 +6487,14 @@ def block_task(
     * ``transient`` — treated like a generic block for routing, but a worker
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
+
+    ``human_gate=True`` marks the card as hard-gated (Human-Gate v1) the
+    moment it lands in ``blocked`` — CLI-only (``kanban block
+    --human-gate``); no tool surface can set this. ``None`` (the default,
+    used by every automated block/re-block) leaves the existing flag
+    untouched, so a gate set once persists across re-block cycles.
+    Meaningless (ignored) for the ``dependency`` and loop-breaker
+    ``triage`` routes, which never sit in ``blocked`` for a human.
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
@@ -6399,6 +6621,10 @@ def block_task(
             )
             routed_to = "triage"
         else:
+            # COALESCE(?, human_gate): passing None leaves the existing flag
+            # untouched (the common case — every automated block/re-block),
+            # passing 1 sets it (only ``kanban block --human-gate``).
+            gate_param = 1 if human_gate else None
             if expected_run_id is None:
                 cur = conn.execute(
                     """
@@ -6408,11 +6634,12 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
-                           block_recurrences = ?
+                           block_recurrences = ?,
+                           human_gate    = COALESCE(?, human_gate)
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                     """,
-                    (kind, recurrences, task_id),
+                    (kind, recurrences, gate_param, task_id),
                 )
             else:
                 cur = conn.execute(
@@ -6423,12 +6650,13 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
-                           block_recurrences = ?
+                           block_recurrences = ?,
+                           human_gate    = COALESCE(?, human_gate)
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    (kind, recurrences, gate_param, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
                 return False
@@ -6539,6 +6767,7 @@ def unblock_task(
     *,
     actor: Optional[str] = None,
     reason: Optional[str] = None,
+    token: Optional[str] = None,
 ) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
@@ -6547,6 +6776,16 @@ def unblock_task(
     showed only an empty event, making it impossible to distinguish a human
     approval from an autonomous agent lifting its own gate
     (Audit 2026-07-10: 22 nicht attribuierbare Unblocks an einem Tag).
+
+    Human-Gate v1: if the card has ``human_gate=1``, ``token`` must match
+    the currently-issued one-time token (delivered out-of-band via ntfy —
+    see ``issue_and_notify_gate_token``) or this raises
+    :class:`GateTokenError` and the card is left untouched. This check
+    lives HERE (not in the CLI or the tool layer) so every caller —
+    CLI, the ``kanban_unblock`` tool, and the dashboard's direct
+    ``unblock_task`` calls — goes through the same enforcement seam and
+    none of them can bypass it. A matching token is single-use: it is
+    cleared in the same transaction as the status transition.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -6557,6 +6796,33 @@ def unblock_task(
     """
     now = int(time.time())
     with write_txn(conn):
+        gate_row = conn.execute(
+            "SELECT human_gate, gate_token_hash FROM tasks "
+            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            (task_id,),
+        ).fetchone()
+        gated = bool(gate_row and gate_row["human_gate"])
+        if gated:
+            stored_hash = gate_row["gate_token_hash"]
+            if not stored_hash:
+                raise GateTokenError(
+                    f"{task_id} is human-gated but no token has been issued "
+                    "yet (or the ntfy push failed) — wait for the push, or "
+                    f"run `hermes kanban gate {task_id} off` to release it"
+                )
+            if not token or not hmac.compare_digest(hash_gate_token(token), stored_hash):
+                raise GateTokenError(
+                    f"{task_id} is human-gated: the correct one-time token "
+                    "(delivered via ntfy) is required to unblock it"
+                )
+            # Single-use: consume the token now, atomically with the status
+            # transition below (same write_txn — no window for a second
+            # unblock attempt to reuse it).
+            conn.execute(
+                "UPDATE tasks SET gate_token_hash = NULL, gate_token_issued_at = NULL "
+                "WHERE id = ?",
+                (task_id,),
+            )
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -6611,6 +6877,8 @@ def unblock_task(
             payload["actor"] = str(actor)[:120]
         if reason:
             payload["reason"] = str(reason)[:400]
+        if gated:
+            payload["human_gate"] = True
         _append_event(
             conn, task_id, "unblocked",
             payload or None,

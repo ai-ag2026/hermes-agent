@@ -5702,3 +5702,311 @@ def test_cli_unblock_needs_input_requires_reason(kanban_home, monkeypatch, capsy
             argparse.Namespace(task_ids=[tid], reason="approved by operator")
         )
         assert rc2 == 0
+
+
+# ---------------------------------------------------------------------------
+# Human-Gate v1 (human-gate-design.md, 2026-07-11)
+# ---------------------------------------------------------------------------
+
+def test_human_gate_token_roundtrip(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="needs approval", kind="needs_input", human_gate=True)
+        assert kb.get_task(conn, tid).human_gate is True
+        token = kb.issue_gate_token(conn, tid)
+        assert token
+        assert kb.unblock_task(conn, tid, actor="manfred", reason="approved", token=token) is True
+        assert kb.get_task(conn, tid).status in ("ready", "todo")
+        events = kb.list_events(conn, tid)
+        unblocked = [e for e in events if e.kind == "unblocked"][-1]
+        assert unblocked.payload["human_gate"] is True
+
+
+def test_human_gate_refuses_when_no_token_issued(kanban_home):
+    """A human_gate=1 card with a NULL hash (never issued, or ntfy failed)
+    must refuse ANY token, not just a wrong one — that's the fail-closed
+    state, and the only rescue path is `kanban gate <id> off`."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        with pytest.raises(kb.GateTokenError):
+            kb.unblock_task(conn, tid, actor="a", reason="x", token="whatever")
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_human_gate_refuses_missing_or_wrong_token(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        kb.issue_gate_token(conn, tid)
+
+        with pytest.raises(kb.GateTokenError):
+            kb.unblock_task(conn, tid, actor="a", reason="x")  # no token at all
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        with pytest.raises(kb.GateTokenError):
+            kb.unblock_task(conn, tid, actor="a", reason="x", token="not-the-token")
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_human_gate_token_is_single_use(kanban_home):
+    """A token that was already consumed must not work again, even for a
+    fresh re-block of the SAME card (gate persists across re-block, but
+    the old hash was cleared on the successful unblock)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+        assert kb.unblock_task(conn, tid, actor="a", reason="ok", token=token) is True
+
+        # Get the card back into blocked without issuing a new token.
+        if kb.get_task(conn, tid).status == "todo":
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.claim_task(conn, tid) is not None
+        # kind=None (not "needs_input" again) so this re-block doesn't also
+        # trip the unrelated S4 unblock-loop breaker (BLOCK_RECURRENCE_LIMIT)
+        # and get routed to triage instead of blocked.
+        kb.block_task(conn, tid, reason="still needs input")
+        assert kb.get_task(conn, tid).human_gate is True, "gate must persist across re-block"
+
+        with pytest.raises(kb.GateTokenError):
+            kb.unblock_task(conn, tid, actor="a", reason="replay", token=token)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_human_gate_reblock_rotates_token(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        old_token = kb.issue_gate_token(conn, tid)
+        assert kb.unblock_task(conn, tid, actor="a", reason="ok", token=old_token) is True
+
+        if kb.get_task(conn, tid).status == "todo":
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        assert kb.claim_task(conn, tid) is not None
+        # kind=None here too, for the same reason as the single-use test.
+        kb.block_task(conn, tid, reason="again")
+        new_token = kb.issue_gate_token(conn, tid)
+        assert new_token != old_token
+
+        with pytest.raises(kb.GateTokenError):
+            kb.unblock_task(conn, tid, actor="a", reason="replay old", token=old_token)
+        assert kb.unblock_task(conn, tid, actor="a", reason="ok again", token=new_token) is True
+
+
+def test_human_gate_token_never_persisted_in_plaintext(kanban_home):
+    """Dump every text-bearing row the token could have leaked into
+    (tasks columns, event payloads, comments) and confirm the plaintext
+    never appears — only its sha256 hash does, and only until consumed."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+        assert token
+        assert kb.hash_gate_token(token) != token
+        assert kb.unblock_task(conn, tid, actor="a", reason="ok", token=token) is True
+
+        task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+        for key in task_row.keys():
+            val = task_row[key]
+            if isinstance(val, str):
+                assert token not in val, f"plaintext token leaked into tasks.{key}"
+        assert task_row["gate_token_hash"] is None, "token must be cleared after use"
+
+        for row in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ?", (tid,)
+        ).fetchall():
+            if row["payload"]:
+                assert token not in row["payload"], "plaintext token leaked into task_events.payload"
+
+        for row in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ?", (tid,)
+        ).fetchall():
+            assert token not in (row["body"] or ""), "plaintext token leaked into task_comments.body"
+
+
+def test_human_gate_ntfy_failure_is_fail_closed(kanban_home, monkeypatch):
+    """A mocked HTTP failure during the ntfy push must leave the card
+    hard-blocked: the token hash stays persisted (nobody holds the
+    plaintext), so unblock_task keeps refusing until `gate off`."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+
+    def _raise(*_a, **_kw):
+        raise OSError("network unreachable")
+
+    monkeypatch.setattr(kb.urllib.request, "urlopen", _raise)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+
+        delivered = kb.issue_and_notify_gate_token(conn, tid)
+        assert delivered is False
+
+        row = conn.execute(
+            "SELECT gate_token_hash FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["gate_token_hash"] is not None  # issued, but never delivered
+
+        with pytest.raises(kb.GateTokenError):
+            kb.unblock_task(conn, tid, actor="a", reason="x", token="anything")
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # The only rescue path.
+        assert kb.set_human_gate(conn, tid, on=False, actor="manfred") is True
+        assert kb.unblock_task(conn, tid, actor="manfred", reason="rescued") is True
+
+
+def test_human_gate_missing_ntfy_config_is_fail_closed(kanban_home, monkeypatch):
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        assert kb.issue_and_notify_gate_token(conn, tid) is False
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_ungated_block_unaffected_by_human_gate(kanban_home):
+    """Behavioural neutrality: a card never marked human_gate=1 keeps
+    working exactly like before — no token required."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="plain", assignee="worker")
+        kb.block_task(conn, tid, reason="waiting", kind="needs_input")
+        assert kb.get_task(conn, tid).human_gate is False
+        assert kb.unblock_task(conn, tid, actor="a", reason="ok") is True
+
+
+def test_cmd_gate_on_off_toggles_flag_and_audits(kanban_home, monkeypatch):
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="plain", assignee="worker")
+
+    rc = kanban_cli._cmd_gate(argparse.Namespace(task_id=tid, state="on"))
+    assert rc == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).human_gate is True
+        events = kb.list_events(conn, tid)
+        on_events = [e for e in events if e.kind == "gate_set" and e.payload.get("on") is True]
+        assert on_events
+
+    rc2 = kanban_cli._cmd_gate(argparse.Namespace(task_id=tid, state="off"))
+    assert rc2 == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).human_gate is False
+        events = kb.list_events(conn, tid)
+        off_events = [e for e in events if e.kind == "gate_set" and e.payload.get("on") is False]
+        assert off_events
+
+
+def test_cmd_gate_refused_in_worker_session(kanban_home, monkeypatch, capsys):
+    """A worker must not be able to strip its own hard gate by shelling
+    out to `kanban gate <id> off` (same pattern as the S4d unblock
+    refusal — Audit 2026-07-10)."""
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="plain", assignee="worker")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_someworker")
+    rc = kanban_cli._cmd_gate(argparse.Namespace(task_id=tid, state="off"))
+    assert rc == 1
+    assert "refused" in capsys.readouterr().err
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).human_gate is False  # never touched
+
+
+def test_cli_block_human_gate_flag_and_unblock_token(kanban_home, monkeypatch, capsys):
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+
+    rc = kanban_cli._cmd_block(argparse.Namespace(
+        task_id=tid, reason=["approval", "needed"], ids=None,
+        kind="needs_input", human_gate=True,
+    ))
+    assert rc == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).human_gate is True
+        token = kb.issue_gate_token(conn, tid)
+
+    # Without --token: refused, bulk loop continues (single id here, but
+    # exercises the try/except path instead of an uncaught raise).
+    rc_fail = kanban_cli._cmd_unblock(
+        argparse.Namespace(task_ids=[tid], reason="ok", token=None)
+    )
+    assert rc_fail == 1
+    assert "human-gated" in capsys.readouterr().err
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+
+    rc_ok = kanban_cli._cmd_unblock(
+        argparse.Namespace(task_ids=[tid], reason="approved", token=token)
+    )
+    assert rc_ok == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status in ("ready", "todo")
+
+
+def test_human_gate_migration_idempotent_on_legacy_db(tmp_path, monkeypatch):
+    """A DB created before Human-Gate v1 shipped (missing all three
+    columns) must migrate cleanly on open, and a second open must be a
+    no-op rather than erroring on 'duplicate column'."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    db_path = kb.kanban_db_path(board="legacy_gate")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    # A deliberately minimal pre-Human-Gate `tasks` table — everything from
+    # `tenant` onward (including human_gate/gate_token_*) is missing, the
+    # same shape a DB predating dozens of additive migrations would have.
+    # `SCHEMA_SQL`'s `CREATE TABLE IF NOT EXISTS tasks` is a no-op against
+    # this table on the next `kb.connect()`, so only `_migrate_add_optional_
+    # columns` can add the missing columns — exercising the real migration
+    # path instead of `ALTER TABLE ... DROP COLUMN`, which is unreliable
+    # against a heavily commented CREATE TABLE like the current SCHEMA_SQL.
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE tasks (
+            id             TEXT PRIMARY KEY,
+            title          TEXT NOT NULL,
+            body           TEXT,
+            assignee       TEXT,
+            status         TEXT NOT NULL,
+            priority       INTEGER DEFAULT 0,
+            created_by     TEXT,
+            created_at     INTEGER NOT NULL,
+            started_at     INTEGER,
+            completed_at   INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            branch_name    TEXT,
+            claim_lock     TEXT,
+            claim_expires  INTEGER
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('t-legacy', 'T', 'blocked', 1000)"
+    )
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path) as c1:
+        cols = {r["name"] for r in c1.execute("PRAGMA table_info(tasks)")}
+        assert {"human_gate", "gate_token_hash", "gate_token_issued_at"} <= cols
+        legacy_task = kb.get_task(c1, "t-legacy")
+        assert legacy_task.human_gate is False  # safe default for a pre-existing row
+
+    # Re-running the migration (fresh connect) must not error.
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as c2:
+        cols2 = {r["name"] for r in c2.execute("PRAGMA table_info(tasks)")}
+        assert {"human_gate", "gate_token_hash", "gate_token_issued_at"} <= cols2

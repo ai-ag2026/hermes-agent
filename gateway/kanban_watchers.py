@@ -334,6 +334,28 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
+
+                            # Human-Gate v1 (human-gate-design.md): issue +
+                            # ntfy-push a fresh one-time token for every
+                            # blocked, human_gate=1 card that doesn't
+                            # currently have a redeemable one. Deliberately
+                            # NOT gated behind `subs`/`active_platforms` —
+                            # a gate must fire even when nobody subscribed
+                            # via a chat platform (e.g. `kanban block
+                            # --human-gate` run from a bare terminal, or
+                            # `kanban gate <id> on` for an already-blocked
+                            # card). Covers both the fresh-block case and
+                            # the re-block-after-unblock rotation case,
+                            # since unblock_task only clears the hash on a
+                            # successful, gate-satisfying unblock.
+                            try:
+                                self._kanban_issue_pending_gate_tokens(conn, board=slug)
+                            except Exception as exc:
+                                logger.warning(
+                                    "kanban notifier: gate token scan failed for board %s: %s",
+                                    slug, exc,
+                                )
+
                             subs = _kb.list_notify_subs(conn)
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
@@ -680,6 +702,33 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    def _kanban_issue_pending_gate_tokens(
+        self, conn, *, board: Optional[str] = None,
+    ) -> None:
+        """Issue + ntfy-push a fresh unblock token for every gated card
+        that doesn't currently have a redeemable one (Human-Gate v1).
+
+        Sync helper called from ``_kanban_notifier_watcher``'s per-board
+        ``_collect()`` on the SAME connection it already opened for that
+        board this tick — no extra connect. Takes no ``self`` state; it's
+        an instance method only for stylistic consistency with the other
+        small kanban helpers on this mixin (``_kanban_advance`` etc.).
+        """
+        from hermes_cli import kanban_db as _kb
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'blocked' AND human_gate = 1 "
+            "AND gate_token_hash IS NULL"
+        ).fetchall()
+        for row in rows:
+            tid = row["id"]
+            try:
+                _kb.issue_and_notify_gate_token(conn, tid, board=board)
+            except Exception as exc:
+                logger.warning(
+                    "kanban notifier: gate token issue failed for %s: %s",
+                    tid, exc,
+                )
 
     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
         from hermes_cli import kanban_db as _kb

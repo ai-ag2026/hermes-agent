@@ -1368,6 +1368,10 @@ def _handle_unblock(args: dict, **kw) -> str:
         return ownership_err
     board = args.get("board")
     reason = str(args.get("reason") or "").strip() or None
+    # Passed through, never generated or inspected here — this tool has no
+    # way to SET or clear human_gate, only to redeem a token an operator
+    # already received out-of-band via ntfy (Human-Gate v1).
+    token = str(args.get("token") or "").strip() or None
     actor = os.environ.get("HERMES_PROFILE") or "orchestrator"
     try:
         kb, conn = _connect(board=board)
@@ -1386,7 +1390,11 @@ def _handle_unblock(args: dict, **kw) -> str:
                     f"{tid} is a needs_input block — pass reason= (who "
                     "approved, what was decided) to lift it"
                 )
-            ok = kb.unblock_task(conn, str(tid), actor=actor, reason=reason)
+            # kb.unblock_task raises kb.GateTokenError (a ValueError
+            # subclass) for a human_gate=1 card with a missing/wrong
+            # token; the existing `except ValueError` below already
+            # surfaces that as a tool_error with no extra handling needed.
+            ok = kb.unblock_task(conn, str(tid), actor=actor, reason=reason, token=token)
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
             return _ok(task_id=str(tid), status="ready")
@@ -1978,6 +1986,16 @@ KANBAN_UNBLOCK_SCHEMA = {
                     "decided). REQUIRED for needs_input blocks — those are "
                     "human-decision gates and every lift must be "
                     "attributable."
+                ),
+            },
+            "token": {
+                "type": "string",
+                "description": (
+                    "One-time human-gate token. REQUIRED for cards marked "
+                    "with a hard human gate (delivered to the operator via "
+                    "ntfy, out of band) — this tool has no way to set or "
+                    "remove that gate, only to redeem a token you were "
+                    "given. Ignored for ungated cards."
                 ),
             },
             "board": _board_schema_prop(),

@@ -81,6 +81,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        # Flag only — NEVER the token hash. See Task.human_gate's comment
+        # in kanban_db.py for why the hash isn't even reachable from here.
+        "human_gate": bool(t.human_gate),
     }
 
 
@@ -587,6 +590,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "triage to break unblock loops. Omit for a generic block."
         ),
     )
+    p_block.add_argument(
+        "--human-gate", action="store_true",
+        help=(
+            "Hard-gate this card: unblocking it requires a one-time token "
+            "pushed to the operator via ntfy (Human-Gate v1) — no worker, "
+            "orchestrator, or tool call can lift it. Interactive/CLI marking "
+            "only; use `kanban gate <id> off` to release without a token."
+        ),
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -600,7 +612,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
+    p_unblock.add_argument(
+        "--token",
+        default=None,
+        help=(
+            "One-time human-gate token, delivered via ntfy. Required for "
+            "any card marked with `kanban block --human-gate` / `kanban "
+            "gate <id> on`; ignored for ungated cards."
+        ),
+    )
     p_unblock.add_argument("task_ids", nargs="+")
+
+    p_gate = sub.add_parser(
+        "gate",
+        help="Turn the hard human-gate on/off for a task (interactive CLI only)",
+    )
+    p_gate.add_argument("task_id")
+    p_gate.add_argument("state", choices=["on", "off"])
 
     p_promote = sub.add_parser(
         "promote",
@@ -1009,6 +1037,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "gate":     _cmd_gate,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -1597,6 +1626,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
+    if task.human_gate:
+        # Never print the hash — only ever the fact that a gate exists.
+        print("  HUMAN GATE: on (unblock needs a one-time token via ntfy)")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
@@ -2055,6 +2087,9 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
+    # None (not False) so block_task's COALESCE leaves an existing gate
+    # flag untouched on every call that didn't explicitly ask for one.
+    human_gate = True if getattr(args, "human_gate", False) else None
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
@@ -2068,6 +2103,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id_for(tid),
+                human_gate=human_gate,
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
@@ -2133,6 +2169,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     reason = getattr(args, "reason", None)
     if reason is not None:
         reason = reason.strip() or None
+    token = getattr(args, "token", None)
     author = _profile_author()
     failed: list[str] = []
     with kb.connect_closing() as conn:
@@ -2156,12 +2193,52 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 continue
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
-            if not kb.unblock_task(conn, tid, actor=author, reason=reason):
+            try:
+                ok = kb.unblock_task(conn, tid, actor=author, reason=reason, token=token)
+            except kb.GateTokenError as exc:
+                # Human-Gate v1: refuse per-id (not a bulk-aborting raise) so
+                # one gated card in a multi-id unblock doesn't stop the rest.
+                failed.append(tid)
+                print(f"cannot unblock {tid}: {exc}", file=sys.stderr)
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_gate(args: argparse.Namespace) -> int:
+    """Turn Human-Gate v1 on/off for a card — interactive CLI only.
+
+    Refused inside a worker session for the same reason `unblock` is
+    (Audit 2026-07-10 pattern): a worker shelling out to `kanban gate
+    <id> off` would otherwise be able to strip its own hard gate.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        print(
+            "refused: 'kanban gate' is not available from within a board "
+            "worker session (HERMES_KANBAN_TASK is set). Gate changes are "
+            "an operator/orchestrator-only action.",
+            file=sys.stderr,
+        )
+        return 1
+    author = _profile_author()
+    on = args.state == "on"
+    with kb.connect_closing() as conn:
+        ok = kb.set_human_gate(conn, args.task_id, on=on, actor=author)
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if on:
+        print(
+            f"{args.task_id}: human gate ON — if the card is blocked, a "
+            "one-time token will be pushed via ntfy within the next tick"
+        )
+    else:
+        print(f"{args.task_id}: human gate OFF")
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
@@ -2963,7 +3040,7 @@ Common subcommands:
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `complete <id>…`      Mark task(s) done
-  `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `block <id> [reason]` Mark blocked (add `--human-gate` for a hard ntfy-token gate); `schedule <id> [reason]` parks time-delay work; `unblock <id> [--token …]` to revive; `gate <id> on|off` to (un)mark a gate
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts
