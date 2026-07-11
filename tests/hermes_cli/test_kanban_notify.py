@@ -525,6 +525,10 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
             workspace_path=str(tmp_path),
         )
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        # Kernel worker gates (C1): mirror a real dispatcher-spawned worker —
+        # claimed card + matching run identity in the process env.
+        assert kb.claim_task(conn, tid) is not None
+        run_id = kb.get_task(conn, tid).current_run_id
     finally:
         conn.close()
 
@@ -532,6 +536,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     # → metadata.artifacts → event payload promotion.
     import os
     os.environ["HERMES_KANBAN_TASK"] = tid
+    os.environ["HERMES_KANBAN_RUN_ID"] = str(run_id)
     try:
         out = kt._handle_complete({
             "summary": "rendered the chart",
@@ -539,6 +544,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
         })
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
+        os.environ.pop("HERMES_KANBAN_RUN_ID", None)
     import json as _json
     assert _json.loads(out)["ok"] is True
 
@@ -613,11 +619,15 @@ async def test_missing_artifact_blocks_completion_before_notifier(
             workspace_path=str(tmp_path),
         )
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
+        # Kernel worker gates (C1): mirror a real worker (claim + run id).
+        assert kb.claim_task(conn, tid) is not None
+        run_id = kb.get_task(conn, tid).current_run_id
     finally:
         conn.close()
 
     import os
     os.environ["HERMES_KANBAN_TASK"] = tid
+    os.environ["HERMES_KANBAN_RUN_ID"] = str(run_id)
     try:
         out = kt._handle_complete({
             "summary": "one real, one ghost",
@@ -625,6 +635,7 @@ async def test_missing_artifact_blocks_completion_before_notifier(
         })
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
+        os.environ.pop("HERMES_KANBAN_RUN_ID", None)
 
     rejected = json.loads(out)
     assert rejected["success"] is False
@@ -633,7 +644,9 @@ async def test_missing_artifact_blocks_completion_before_notifier(
     try:
         task = kb.get_task(conn, tid)
         assert task is not None
-        assert task.status == "ready"
+        # Rejection happens BEFORE any state change: the claimed card is
+        # still running (pre-C1 this test used an unclaimed card → 'ready').
+        assert task.status == "running"
         assert conn.execute(
             "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'completed'",
             (tid,),
