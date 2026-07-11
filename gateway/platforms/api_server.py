@@ -134,6 +134,28 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _coerce_string_tuple(value: Any) -> tuple[str, ...]:
+    """Normalize a comma-separated string or sequence into non-empty strings."""
+    if not value:
+        return ()
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        items = value
+    else:
+        items = [value]
+    return tuple(str(item).strip() for item in items if str(item).strip())
+
+
+def _coerce_positive_float(value: Any, default: float) -> float:
+    """Parse a positive float while keeping malformed config fail-safe."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _normalize_chat_content(
     content: Any, *, _max_depth: int = 10, _depth: int = 0,
 ) -> str:
@@ -873,6 +895,46 @@ class APIServerAdapter(BasePlatformAdapter):
         self._model_routes: Dict[str, Dict[str, Any]] = self._parse_model_routes(
             extra.get("model_routes"),
         )
+        rabbit_fast = extra.get("rabbit_fast_response") or {}
+        if not isinstance(rabbit_fast, dict):
+            rabbit_fast = {}
+        self._rabbit_fast_enabled: bool = _coerce_request_bool(
+            rabbit_fast.get("enabled"), default=False,
+        )
+        self._rabbit_fast_source_ips: tuple[str, ...] = _coerce_string_tuple(
+            rabbit_fast.get("source_ips"),
+        )
+        self._rabbit_fast_user_agent_prefixes: tuple[str, ...] = _coerce_string_tuple(
+            rabbit_fast.get("user_agent_prefixes"),
+        )
+        self._rabbit_fast_sync_wait_seconds: float = _coerce_positive_float(
+            rabbit_fast.get("sync_wait_seconds"), 2.5,
+        )
+        self._rabbit_fast_ack_text: str = str(
+            rabbit_fast.get("ack_text")
+            or "Ich arbeite daran. Frag mich gleich nach Status oder Ergebnis."
+        )
+        self._rabbit_fast_pending_text: str = str(
+            rabbit_fast.get("pending_text") or "Der Auftrag läuft noch."
+        )
+        self._rabbit_fast_ready_text: str = str(
+            rabbit_fast.get("ready_text")
+            or "Der vorige Auftrag ist fertig. Sag Ergebnis, dann liefere ich ihn aus."
+        )
+        self._rabbit_fast_empty_text: str = str(
+            rabbit_fast.get("empty_text") or "Es läuft gerade kein Rabbit-Auftrag."
+        )
+        configured_status_terms = _coerce_string_tuple(rabbit_fast.get("status_terms"))
+        self._rabbit_fast_status_terms: frozenset[str] = frozenset(
+            term.casefold() for term in (
+                configured_status_terms
+                or ("status", "status?", "ergebnis", "ergebnis?", "result", "result?")
+            )
+        )
+        # Rabbit chat/completions has no push channel after its synchronous
+        # response closes. Keep one pullable background result per configured
+        # Rabbit source. This remains entirely outside ACP and unmatched API clients.
+        self._rabbit_fast_mailboxes: Dict[str, "asyncio.Task[Any]"] = {}
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -1022,6 +1084,71 @@ class APIServerAdapter(BasePlatformAdapter):
         ctx = self._request_audit_context(request)
         fields = [f"{key}={value!r}" for key, value in ctx.items() if value]
         return " ".join(fields) if fields else "source='unknown'"
+
+    def _rabbit_fast_request_key(
+        self, request: "web.Request", session_id: str,
+    ) -> Optional[str]:
+        """Return a mailbox key only for the explicitly configured Rabbit client.
+
+        Both source IP and User-Agent prefix must match. This deliberately fails
+        closed: enabling the feature without both allowlists affects no traffic.
+        A caller-provided Hermes session id further scopes the mailbox; otherwise
+        the Rabbit device IP is the stable pull key because a stateless client's
+        derived session id changes when its next message is merely "Status".
+        """
+        if not (
+            self._rabbit_fast_enabled
+            and self._rabbit_fast_source_ips
+            and self._rabbit_fast_user_agent_prefixes
+        ):
+            return None
+        ctx = self._request_audit_context(request)
+        source_ip = ctx.get("peer_ip") or ctx.get("remote")
+        user_agent = ctx.get("user_agent", "")
+        if source_ip not in self._rabbit_fast_source_ips:
+            return None
+        if not any(user_agent.startswith(prefix) for prefix in self._rabbit_fast_user_agent_prefixes):
+            return None
+        explicit_session = request.headers.get("X-Hermes-Session-Id", "").strip()
+        return f"{source_ip}:{explicit_session}" if explicit_session else source_ip
+
+    def _rabbit_fast_is_status_message(self, user_message: Any) -> bool:
+        text = _normalize_chat_content(user_message).strip().casefold()
+        return text in self._rabbit_fast_status_terms
+
+    def _rabbit_fast_completion_response(
+        self,
+        *,
+        completion_id: str,
+        model_name: str,
+        created: int,
+        session_id: str,
+        content: str,
+        state: str,
+    ) -> "web.Response":
+        """Build an OpenAI-compatible immediate Rabbit mailbox response."""
+        return web.json_response(
+            {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            },
+            headers={
+                "X-Hermes-Session-Id": session_id,
+                "X-Hermes-Rabbit-Async": state,
+            },
+        )
 
     def _cron_origin_from_request(self, request: "web.Request") -> Dict[str, str]:
         """Persist safe API source metadata on cron jobs created over HTTP."""
@@ -2301,8 +2428,83 @@ class APIServerAdapter(BasePlatformAdapter):
                 route=route,
             )
 
+        rabbit_state: Optional[str] = None
+        rabbit_result: Optional[tuple[Dict[str, Any], Dict[str, int]]] = None
+        rabbit_key = self._rabbit_fast_request_key(request, session_id)
+        if rabbit_key:
+            mailbox = self._rabbit_fast_mailboxes.get(rabbit_key)
+            is_status = self._rabbit_fast_is_status_message(user_message)
+
+            if mailbox is not None and not mailbox.done():
+                return self._rabbit_fast_completion_response(
+                    completion_id=completion_id,
+                    model_name=model_name,
+                    created=created,
+                    session_id=session_id,
+                    content=self._rabbit_fast_pending_text,
+                    state="running",
+                )
+
+            if mailbox is not None and mailbox.done():
+                if not is_status:
+                    return self._rabbit_fast_completion_response(
+                        completion_id=completion_id,
+                        model_name=model_name,
+                        created=created,
+                        session_id=session_id,
+                        content=self._rabbit_fast_ready_text,
+                        state="ready",
+                    )
+                self._rabbit_fast_mailboxes.pop(rabbit_key, None)
+                try:
+                    rabbit_result = mailbox.result()
+                except Exception as exc:
+                    logger.error("Rabbit background agent task failed: %s", exc, exc_info=True)
+                    return self._rabbit_fast_completion_response(
+                        completion_id=completion_id,
+                        model_name=model_name,
+                        created=created,
+                        session_id=session_id,
+                        content="Der Rabbit-Auftrag ist fehlgeschlagen. Bitte starte ihn erneut.",
+                        state="failed",
+                    )
+                rabbit_state = "completed"
+
+            elif is_status:
+                return self._rabbit_fast_completion_response(
+                    completion_id=completion_id,
+                    model_name=model_name,
+                    created=created,
+                    session_id=session_id,
+                    content=self._rabbit_fast_empty_text,
+                    state="empty",
+                )
+
+            else:
+                mailbox = asyncio.create_task(_compute_completion())
+                self._rabbit_fast_mailboxes[rabbit_key] = mailbox
+                try:
+                    rabbit_result = await asyncio.wait_for(
+                        asyncio.shield(mailbox),
+                        timeout=self._rabbit_fast_sync_wait_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    return self._rabbit_fast_completion_response(
+                        completion_id=completion_id,
+                        model_name=model_name,
+                        created=created,
+                        session_id=session_id,
+                        content=self._rabbit_fast_ack_text,
+                        state="accepted",
+                    )
+                else:
+                    self._rabbit_fast_mailboxes.pop(rabbit_key, None)
+                    rabbit_state = "immediate"
+
         idempotency_key = request.headers.get("Idempotency-Key")
-        if idempotency_key:
+        if rabbit_result is not None:
+            result, usage = rabbit_result
+        elif idempotency_key:
             fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
@@ -2344,6 +2546,8 @@ class APIServerAdapter(BasePlatformAdapter):
         }
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
+        if rabbit_state:
+            response_headers["X-Hermes-Rabbit-Async"] = rabbit_state
 
         # Hard-fail path: no usable assistant text AND a real failure → 5xx
         # with OpenAI-style error envelope so SDK clients raise instead of
