@@ -553,6 +553,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--token", default=None,
+        help=(
+            "One-time human-gate token, delivered via ntfy. Required to "
+            "complete a human_gate=1 card directly from blocked; ignored "
+            "otherwise."
+        ),
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -661,6 +669,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         dest="json",
         action="store_true",
         help="Emit machine-readable JSON result",
+    )
+    p_promote.add_argument(
+        "--token", default=None,
+        help=(
+            "One-time human-gate token, delivered via ntfy. Required to "
+            "promote a human_gate=1 card from blocked; ignored otherwise. "
+            "Applies to the primary task_id only, not --ids."
+        ),
     )
 
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
@@ -2010,14 +2026,17 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
-    # Guard: structured handoff fields are per-run, so they'd be
+    token = getattr(args, "token", None)
+    # Guard: structured handoff fields (and a gate token, which is
+    # single-use and tied to exactly one card) are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
-    if len(ids) > 1 and (summary or raw_meta):
+    if len(ids) > 1 and (summary or raw_meta or token):
         print(
-            "kanban: --summary / --metadata are per-task and can't be used "
-            "with multiple ids (would apply the same handoff to every task). "
-            "Complete tasks one at a time, or drop the flags for the bulk close.",
+            "kanban: --summary / --metadata / --token are per-task and "
+            "can't be used with multiple ids (would apply the same "
+            "handoff/token to every task). Complete tasks one at a time, "
+            "or drop the flags for the bulk close.",
             file=sys.stderr,
         )
         return 2
@@ -2040,6 +2059,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     summary=summary,
                     metadata=metadata,
                     expected_run_id=_worker_run_id_for(tid),
+                    token=token,
                 )
             except kb.CompletionEvidenceError as exc:
                 failed.append(tid)
@@ -2047,6 +2067,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     f"cannot complete {tid}: {exc.kind}: {exc}",
                     file=sys.stderr,
                 )
+                continue
+            except kb.GateTokenError as exc:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {exc}", file=sys.stderr)
                 continue
             if not completed:
                 failed.append(tid)
@@ -2245,6 +2269,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
     as_json = getattr(args, "json", False)
+    token = getattr(args, "token", None)
     extra_ids = list(getattr(args, "ids", None) or [])
     # Dedupe while preserving order; positional task_id always first.
     ids: list[str] = []
@@ -2257,6 +2282,10 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     results: list[dict[str, object]] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            # --token is single-use and tied to exactly one card — only
+            # ever apply it to the primary (first) task_id, never to the
+            # bulk --ids tail, so a gate token can't accidentally be
+            # offered (and wasted) against the wrong card.
             ok, err = kb.promote_task(
                 conn,
                 tid,
@@ -2264,6 +2293,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 reason=reason,
                 force=bool(args.force),
                 dry_run=bool(args.dry_run),
+                token=token if tid == args.task_id else None,
             )
             results.append({
                 "task_id": tid,

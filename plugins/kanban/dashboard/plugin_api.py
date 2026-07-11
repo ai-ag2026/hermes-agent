@@ -842,43 +842,50 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.status is not None:
             s = payload.status
             ok = True
-            if s == "done":
-                try:
-                    ok = kanban_db.complete_task(
-                        conn, task_id,
-                        result=payload.result,
-                        summary=payload.summary,
-                        metadata=payload.metadata,
-                        board=board,
-                    )
-                except kanban_db.CompletionEvidenceError as exc:
+            try:
+                if s == "done":
+                    try:
+                        ok = kanban_db.complete_task(
+                            conn, task_id,
+                            result=payload.result,
+                            summary=payload.summary,
+                            metadata=payload.metadata,
+                            board=board,
+                        )
+                    except kanban_db.CompletionEvidenceError as exc:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={"kind": exc.kind, "message": str(exc), **exc.details},
+                        ) from exc
+                elif s == "blocked":
+                    ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                elif s == "scheduled":
+                    ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
+                elif s == "ready":
+                    # Re-open a blocked/scheduled task, or just an explicit status set.
+                    current = kanban_db.get_task(conn, task_id)
+                    if current and current.status in ("blocked", "scheduled"):
+                        ok = kanban_db.unblock_task(conn, task_id)
+                    else:
+                        # Direct status write for drag-drop (todo -> ready etc).
+                        ok = _set_status_direct(conn, task_id, "ready")
+                elif s == "archived":
+                    ok = kanban_db.archive_task(conn, task_id)
+                elif s == "running":
                     raise HTTPException(
-                        status_code=409,
-                        detail={"kind": exc.kind, "message": str(exc), **exc.details},
-                    ) from exc
-            elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
-            elif s == "scheduled":
-                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
-            elif s == "ready":
-                # Re-open a blocked/scheduled task, or just an explicit status set.
-                current = kanban_db.get_task(conn, task_id)
-                if current and current.status in ("blocked", "scheduled"):
-                    ok = kanban_db.unblock_task(conn, task_id)
+                        status_code=400,
+                        detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
+                    )
+                elif s in ("todo", "triage", "scheduled"):
+                    ok = _set_status_direct(conn, task_id, s)
                 else:
-                    # Direct status write for drag-drop (todo -> ready etc).
-                    ok = _set_status_direct(conn, task_id, "ready")
-            elif s == "archived":
-                ok = kanban_db.archive_task(conn, task_id)
-            elif s == "running":
-                raise HTTPException(
-                    status_code=400,
-                    detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
-                )
-            elif s in ("todo", "triage", "scheduled"):
-                ok = _set_status_direct(conn, task_id, s)
-            else:
-                raise HTTPException(status_code=400, detail=f"unknown status: {s}")
+                    raise HTTPException(status_code=400, detail=f"unknown status: {s}")
+            except kanban_db.GateTokenError as exc:
+                # Human-Gate v1: every branch above can now raise this for a
+                # blocked/scheduled human_gate=1 card (2026-07-11 repair
+                # review) — the dashboard has no token field, so this is
+                # always a clean refusal, never a bypass.
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             if not ok:
                 # For ``ready``, name the blocking parent(s) so the dashboard
                 # can render an actionable toast instead of a silent no-op.
@@ -996,6 +1003,18 @@ def _set_status_direct(
     active run with outcome='reclaimed' so attempt history isn't
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
+
+    Human-Gate v1, refuse-only (2026-07-11 repair review self-audit):
+    this is the most dangerous exit out of ``blocked`` of all of them —
+    unlike every other status-changing function, it had (and generic
+    drag-drop endpoints like this one still have) NO source-status
+    restriction at all, so a ``status: "todo"`` PATCH on a
+    ``blocked``+``human_gate=1`` card reached here and silently
+    succeeded, bypassing the gate completely with no token, no refusal,
+    nothing. There is no token field on the dashboard's drag-drop
+    payload, so this is refuse-only regardless of ``new_status`` — an
+    operator who needs to move a gated card through the generic path
+    must first run ``kanban gate <id> off``.
     """
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
@@ -1005,6 +1024,8 @@ def _set_status_direct(
         ).fetchone()
         if prev is None:
             return False
+
+        kanban_db._assert_human_gate_open(conn, task_id, token=None, action="change status")
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.
         # Prevents the dispatcher from spawning a child whose upstream work
@@ -1594,7 +1615,12 @@ def reclaim_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
+        try:
+            ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
+        except kanban_db.GateTokenError as exc:
+            # Human-Gate v1: reclaim is refuse-only for a gated blocked
+            # card (2026-07-11 repair review) — no token field here.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not ok:
             raise HTTPException(
                 status_code=409,

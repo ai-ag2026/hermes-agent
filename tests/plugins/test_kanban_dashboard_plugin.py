@@ -563,6 +563,107 @@ def test_patch_status_running_rejected(client):
 
 
 # ---------------------------------------------------------------------------
+# Human-Gate v1 repair (2026-07-11 adversarial re-review). The dashboard
+# is not in the original design's file list, but the review named
+# `_set_status_direct` explicitly as an exit out of `blocked` to check —
+# it had NO source-status restriction at all, the most dangerous of the
+# bypasses found. All human_gate=1 state below is set directly via
+# kanban_db (no dashboard endpoint can set/clear the gate, by design).
+# ---------------------------------------------------------------------------
+
+def test_patch_status_refuses_gated_blocked_card_every_verb(client, kanban_home):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    with kb.connect() as conn:
+        kb.block_task(
+            conn, t["id"], reason="needs approval",
+            kind="needs_input", human_gate=True,
+        )
+
+    # 'done' (complete_task).
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "done"})
+    assert r.status_code == 409
+    assert "human-gated" in r.json()["detail"]
+
+    # 'ready' (routes through unblock_task since current status is blocked).
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "ready"})
+    assert r.status_code == 409
+    assert "human-gated" in r.json()["detail"]
+
+    # 'archived' (archive_task).
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "archived"})
+    assert r.status_code == 409
+    assert "human-gated" in r.json()["detail"]
+
+    # 'todo' — the generic drag-drop path (_set_status_direct). This is
+    # the actual reviewer-named finding: this function had no status
+    # check of any kind before the repair.
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "todo"})
+    assert r.status_code == 409
+    assert "human-gated" in r.json()["detail"]
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t["id"])
+        assert task.status == "blocked"
+        assert task.human_gate is True
+
+
+def test_bulk_update_gracefully_refuses_gated_blocked_card(client, kanban_home):
+    """The bulk endpoint's existing per-id `except Exception` catch-all
+    already turns a GateTokenError into a graceful per-id failure — this
+    just proves it, so a future change can't silently regress it into an
+    unhandled 500 that aborts the whole batch."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    with kb.connect() as conn:
+        kb.block_task(
+            conn, t["id"], reason="needs approval",
+            kind="needs_input", human_gate=True,
+        )
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [t["id"]], "status": "done"},
+    )
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert results[0]["ok"] is False
+    assert "human-gated" in results[0]["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t["id"]).status == "blocked"
+
+
+def test_reclaim_endpoint_refuses_gated_stall_blocked_card(client, kanban_home):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, t["id"]) is not None
+        # Reproduce detect_resource_stalls's shape: blocked, claim_lock left set.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked' WHERE id = ? AND status='running'",
+                (t["id"],),
+            )
+        assert kb.set_human_gate(conn, t["id"], on=True, actor="manfred") is True
+
+    r = client.post(f"/api/plugins/kanban/tasks/{t['id']}/reclaim", json={})
+    assert r.status_code == 409
+    assert "human-gated" in r.json()["detail"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t["id"]).status == "blocked"
+
+
+def test_patch_status_ungated_blocked_card_unaffected(client, kanban_home):
+    """Behavioural neutrality: a plain (never human_gate=1) blocked card
+    still moves through the dashboard exactly as before this repair."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"status": "blocked", "block_reason": "need input"},
+    )
+    assert r.status_code == 200
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "ready"})
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "ready"
+
+
+# ---------------------------------------------------------------------------
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
 

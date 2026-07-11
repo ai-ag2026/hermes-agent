@@ -6010,3 +6010,258 @@ def test_human_gate_migration_idempotent_on_legacy_db(tmp_path, monkeypatch):
     with kb.connect(db_path) as c2:
         cols2 = {r["name"] for r in c2.execute("PRAGMA table_info(tasks)")}
         assert {"human_gate", "gate_token_hash", "gate_token_issued_at"} <= cols2
+
+
+# ---------------------------------------------------------------------------
+# Human-Gate v1 repair (2026-07-11 adversarial re-review REJECT: two
+# reproduced bypasses in complete_task/reclaim_task, one structurally
+# identical in promote_task — all closed via the shared
+# _assert_human_gate_open() guard). See human-gate-design.md.
+# ---------------------------------------------------------------------------
+
+def test_repair_complete_task_refuses_gated_blocked_card(kanban_home):
+    """Reviewer Finding #1 repro: complete_task/_complete_task_locked
+    accepted blocked -> done with NO human_gate check at all — reachable
+    via Dashboard PATCH status=done, the bulk-update endpoint, and a bare
+    `hermes kanban complete` run outside a worker context."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="needs approval", kind="needs_input", human_gate=True)
+
+        # Exact repro: complete_task with no expected_run_id (the bare-CLI
+        # / dashboard shape), no token at all.
+        with pytest.raises(kb.GateTokenError):
+            kb.complete_task(conn, tid, result="done anyway")
+        assert kb.get_task(conn, tid).status == "blocked"
+        no_hash = conn.execute(
+            "SELECT gate_token_hash FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert no_hash["gate_token_hash"] is None  # nothing issued yet
+
+        # Wrong token: also refused, and a bad guess must not mutate the
+        # (now-issued) hash — a legitimate holder's token must still work.
+        token = kb.issue_gate_token(conn, tid)
+        with pytest.raises(kb.GateTokenError):
+            kb.complete_task(conn, tid, result="done anyway", token="wrong-guess")
+        unchanged = conn.execute(
+            "SELECT gate_token_hash FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert unchanged["gate_token_hash"] == kb.hash_gate_token(token)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # Positive path: the correct token completes it and consumes it.
+        assert kb.complete_task(conn, tid, result="done for real", token=token) is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_repair_complete_task_with_expected_run_id_also_gated(kanban_home):
+    """The second (expected_run_id-pinned) UPDATE branch in
+    _complete_task_locked must be gated too, not just the bare one.
+
+    ``block_task`` always closes the run (nulling ``current_run_id``), so
+    that path can't reach here with a matching ``expected_run_id`` once
+    blocked. A real S4c resource-stall block (detect_resource_stalls's
+    own UPDATE) deliberately leaves ``current_run_id`` set on the
+    now-blocked task — reproduce that shape instead.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='capability' "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                (tid, run_id),
+            )
+        assert kb.set_human_gate(conn, tid, on=True, actor="manfred") is True
+        with pytest.raises(kb.GateTokenError):
+            kb.complete_task(conn, tid, result="x", expected_run_id=run_id)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_repair_reclaim_task_refuses_stall_blocked_gated_card(kanban_home):
+    """Reviewer Finding #2 repro: detect_resource_stalls's own UPDATE
+    (kanban_db.py, S4c) sets status='blocked' WITHOUT clearing
+    claim_lock/worker_pid. reclaim_task's early-return only checked
+    `status != 'running'`, so such a card slipped past it (claim_lock is
+    not None) straight back to 'ready' via the plain UPDATE, with no
+    gate check at all. Refuse-only: no token parameter exists for
+    reclaim; the only way past this is `kanban gate <id> off` first."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+
+        # Reproduce detect_resource_stalls's exact update shape: status
+        # flips to blocked, claim_lock/worker_pid are deliberately left
+        # untouched (see kanban_db.py's detect_resource_stalls comment).
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='capability' "
+                "WHERE id = ? AND status = 'running'",
+                (tid,),
+            )
+        row = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["claim_lock"] is not None  # precondition for the exploit
+
+        assert kb.set_human_gate(conn, tid, on=True, actor="manfred") is True
+
+        with pytest.raises(kb.GateTokenError):
+            kb.reclaim_task(conn, tid, reason="operator abort")
+        assert kb.get_task(conn, tid).status == "blocked"
+        still_locked = conn.execute(
+            "SELECT claim_lock FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert still_locked["claim_lock"] is not None  # untouched by the refused attempt
+
+        # Rescue path: gate off, then reclaim succeeds normally.
+        assert kb.set_human_gate(conn, tid, on=False, actor="manfred") is True
+        assert kb.reclaim_task(conn, tid, reason="operator abort") is True
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_repair_promote_task_refuses_gated_blocked_card(kanban_home):
+    """Reviewer Finding #3 (structurally identical): promote_task's
+    UPDATE `WHERE status IN ('todo', 'blocked')` reached ready from
+    blocked with no gate check."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="needs approval", kind="needs_input", human_gate=True)
+
+        ok, err = kb.promote_task(conn, tid, actor="a", force=True)
+        assert ok is False
+        assert err is not None and "human-gated" in err
+        assert kb.get_task(conn, tid).status == "blocked"
+        no_hash = conn.execute(
+            "SELECT gate_token_hash FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert no_hash["gate_token_hash"] is None
+
+        token = kb.issue_gate_token(conn, tid)
+        bad_ok, bad_err = kb.promote_task(conn, tid, actor="a", force=True, token="wrong")
+        assert bad_ok is False
+        assert bad_err is not None and "human-gated" in bad_err
+        unchanged = conn.execute(
+            "SELECT gate_token_hash FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert unchanged["gate_token_hash"] == kb.hash_gate_token(token)
+
+        ok2, err2 = kb.promote_task(conn, tid, actor="a", force=True, token=token)
+        assert ok2 is True and err2 is None
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_repair_promote_task_dry_run_ignores_gate(kanban_home):
+    """dry_run is a read-only preview of the parent-dependency gate only
+    — it must never consume a token, and (documented scope boundary)
+    doesn't report the human gate as a blocker either."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+        ok, err = kb.promote_task(conn, tid, actor="a", force=True, dry_run=True, token=token)
+        assert ok is True and err is None
+        # Token must survive a dry_run untouched (never spent by a preview).
+        row = conn.execute(
+            "SELECT gate_token_hash FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["gate_token_hash"] == kb.hash_gate_token(token)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_repair_schedule_task_refuses_gated_blocked_card(kanban_home):
+    """Self-audit finding: schedule_task's UPDATE `WHERE status IN
+    ('todo','ready','running','blocked')` let a gated card be parked in
+    'scheduled' with no gate check, "laundering" it out of the blocked
+    column with no authorization at all. Refuse-only (no token param)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        with pytest.raises(kb.GateTokenError):
+            kb.schedule_task(conn, tid, reason="park it")
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_repair_archive_task_refuses_gated_blocked_card(kanban_home):
+    """Self-audit finding: archive_task's UPDATE `WHERE status !=
+    'archived'` disposed of a gated blocked card with no gate check —
+    no human decision ever required. Refuse-only (no token param)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        with pytest.raises(kb.GateTokenError):
+            kb.archive_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_repair_recompute_ready_skips_gated_card_even_when_not_sticky(kanban_home):
+    """Self-audit finding: recompute_ready's blocked -> ready auto-promotion
+    already skipped "sticky" blocks (an explicit kanban_block event), but
+    a card blocked via direct DB manipulation (no 'blocked' event — e.g.
+    the circuit breaker path, or any future writer) and THEN gated via
+    `kanban gate <id> on` was not sticky and would have been silently
+    auto-promoted once its parent finished, with no gate check."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = kb.create_task(conn, title="child", assignee="worker", parents=(parent,))
+        kb.claim_task(conn, parent)
+        assert kb.complete_task(conn, parent, result="done") is True
+
+        kb.claim_task(conn, child)
+        # Direct manipulation, deliberately bypassing block_task so NO
+        # 'blocked' event is emitted — the pre-existing non-sticky case.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (child,))
+        assert kb._has_sticky_block(conn, child) is False  # sanity: genuinely not sticky
+
+        assert kb.set_human_gate(conn, child, on=True, actor="manfred") is True
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        assert kb.get_task(conn, child).status == "blocked"
+
+
+def test_repair_cli_complete_and_promote_token_flags(kanban_home):
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+
+    rc_fail = kanban_cli._cmd_complete(argparse.Namespace(
+        task_ids=[tid], result="x", summary=None, metadata=None, token=None,
+    ))
+    assert rc_fail == 1
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+
+    rc_ok = kanban_cli._cmd_complete(argparse.Namespace(
+        task_ids=[tid], result="x", summary=None, metadata=None, token=token,
+    ))
+    assert rc_ok == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+
+    tid2 = None
+    with kb.connect() as conn:
+        tid2 = kb.create_task(conn, title="gated2", assignee="worker")
+        kb.block_task(conn, tid2, reason="x", kind="needs_input", human_gate=True)
+        token2 = kb.issue_gate_token(conn, tid2)
+
+    rc_fail2 = kanban_cli._cmd_promote(argparse.Namespace(
+        task_id=tid2, reason=[], ids=None, force=True, dry_run=False,
+        json=False, token=None,
+    ))
+    assert rc_fail2 == 1
+    rc_ok2 = kanban_cli._cmd_promote(argparse.Namespace(
+        task_id=tid2, reason=[], ids=None, force=True, dry_run=False,
+        json=False, token=token2,
+    ))
+    assert rc_ok2 == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid2).status == "ready"

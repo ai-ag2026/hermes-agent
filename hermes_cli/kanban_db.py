@@ -3864,23 +3864,34 @@ def recompute_ready(
       2. caller-supplied ``failure_limit`` (the dispatcher passes the
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
+
+    Human-Gate v1 (2026-07-11 repair review self-audit): a
+    ``human_gate=1`` card is skipped here unconditionally, even one whose
+    block isn't "sticky" (e.g. gated via ``kanban gate <id> on`` after a
+    legacy/un-typed block) — a bulk auto-promotion pass must never raise
+    (it would abort promoting every OTHER row in this tick), so this is a
+    silent ``continue``, not a call into ``_assert_human_gate_open``.
+    ``unblock_task`` (with a valid token) remains the only exit.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, human_gate "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
+            if cur_status == "blocked" and (
+                row["human_gate"] or _has_sticky_block(conn, task_id)
+            ):
+                # Worker / operator asked for human review, OR the card is
+                # hard-gated — do not silently auto-recover.
+                # ``unblock_task`` (with a valid token, for gated cards)
+                # is the only legitimate exit; it emits ``"unblocked"``
+                # which flips the sticky-block predicate back.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -4688,6 +4699,18 @@ def reclaim_task(
 
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
+
+    Human-Gate v1, refuse-only: a card that is ``blocked``/``scheduled``
+    with ``human_gate=1`` always refuses (raises :class:`GateTokenError`),
+    regardless of ``reason`` — reclaim has no natural token parameter to
+    accept (per the 2026-07-11 repair review), so there is no positive
+    path here at all; use ``unblock_task`` with the token instead, or
+    ``kanban gate <id> off`` first. 2026-07-11 review finding: this
+    function's early-return only checked ``status != 'running'``, which
+    let a card S4c's resource-stall detector had blocked WITHOUT clearing
+    ``claim_lock`` slip through (``status == 'blocked'`` but
+    ``claim_lock`` still set) straight back to ``ready`` with no gate
+    check at all.
     """
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
@@ -4703,6 +4726,13 @@ def reclaim_task(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
     with write_txn(conn):
+        # Authoritative (atomic-with-the-UPDATE) gate check. Deliberately
+        # after the worker-termination call above rather than gating that
+        # too: terminating a lingering process tied to a card that turns
+        # out to be gate-refused is harmless cleanup, not a state change,
+        # and keeping a single check point here (vs. duplicating it in an
+        # earlier non-atomic pre-check) avoids the two checks drifting.
+        _assert_human_gate_open(conn, task_id, token=None, action="reclaim")
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
@@ -5459,8 +5489,16 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     board: Optional[str] = None,
+    token: Optional[str] = None,
 ) -> bool:
-    """Complete a task while excluding concurrent artifact scavenging."""
+    """Complete a task while excluding concurrent artifact scavenging.
+
+    ``token``: Human-Gate v1 one-time token, required (via
+    :func:`_assert_human_gate_open`) to complete a ``blocked`` card
+    marked ``human_gate=1`` — see ``_complete_task_locked`` for where the
+    check runs. ``None`` for every other card (the overwhelming common
+    case: completing from ``running``/``ready``) is a no-op.
+    """
     try:
         with _completion_artifact_lock(conn):
             return _complete_task_locked(
@@ -5472,6 +5510,7 @@ def complete_task(
                 created_cards=created_cards,
                 expected_run_id=expected_run_id,
                 board=board,
+                token=token,
             )
     except _CompletionArtifactLockError as exc:
         error = CompletionEvidenceError(
@@ -5498,12 +5537,22 @@ def _complete_task_locked(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     board: Optional[str] = None,
+    token: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
     a claim/start/complete sequence.
+
+    Also accepts (and this is the whole reason it needs ``token``) a
+    task that is ``blocked`` — an operator affordance for closing out a
+    card without a formal unblock first. 2026-07-11 repair review: this
+    is precisely why a ``human_gate=1`` blocked card could previously be
+    completed straight past the gate (Dashboard PATCH status=done, bulk
+    update, and bare ``hermes kanban complete`` outside a worker context
+    all reach here). ``_assert_human_gate_open`` closes that — see the
+    call right before the ``done`` CAS below.
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
@@ -5592,6 +5641,12 @@ def _complete_task_locked(
         task_id,
         run_id=task.current_run_id,
     ), _completion_artifact_txn(conn, created_artifact_paths) as promotion_state:
+        # Human-Gate v1: no-op unless task_id is currently blocked/scheduled
+        # AND human_gate=1, in which case a missing/wrong token raises
+        # GateTokenError here — inside the same write_txn as (and strictly
+        # before) the 'done' CAS below, so a rejection never touches state
+        # and a valid token is consumed atomically with the transition.
+        _assert_human_gate_open(conn, task_id, token=token, action="complete")
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -6455,6 +6510,67 @@ def set_human_gate(
     return True
 
 
+def _assert_human_gate_open(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    token: Optional[str] = None,
+    action: str = "unblock",
+) -> bool:
+    """Shared Human-Gate v1 enforcement point for every exit out of
+    ``blocked`` (unblock/complete/reclaim/promote/schedule/archive/direct
+    status writes — see human-gate-design.md and the 2026-07-11 repair
+    review that found ``complete_task``/``reclaim_task``/``promote_task``
+    bypassing the original unblock-only check).
+
+    MUST be called from inside the SAME write transaction as the state
+    transition that leaves ``blocked``, immediately before the mutating
+    UPDATE — the check and the token's single-use consumption must be
+    atomic with the transition, or a second caller could race past a
+    stale check or replay an already-spent token.
+
+    Returns ``False`` (a pure no-op, nothing enforced) when the task is
+    not currently ``blocked``/``scheduled`` with ``human_gate=1`` — every
+    ungated task, and every task in any other status, is unaffected,
+    preserving behavioural neutrality. ``scheduled`` is included for the
+    same reason ``unblock_task`` always covered it: a gated card that
+    reaches ``scheduled`` (only possible pre-repair, or via a future bug)
+    must stay just as locked as one still sitting in ``blocked``.
+    Returns ``True`` when a valid token was supplied and consumed
+    (single-use). Raises :class:`GateTokenError` when the task IS gated
+    and blocked/scheduled but ``token`` is missing, wrong, or none has
+    been issued yet. A raise NEVER touches ``gate_token_hash`` — a bad
+    guess (or a caller that never had a token to offer, e.g. an
+    automated/refuse-only caller passing ``token=None``) must never
+    invalidate a token a legitimate holder still has.
+    """
+    row = conn.execute(
+        "SELECT human_gate, gate_token_hash FROM tasks "
+        "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["human_gate"]:
+        return False
+    stored_hash = row["gate_token_hash"]
+    if not stored_hash:
+        raise GateTokenError(
+            f"{task_id} is human-gated but no token has been issued yet "
+            "(or the ntfy push failed) — wait for the push, or run "
+            f"`hermes kanban gate {task_id} off` to release it"
+        )
+    if not token or not hmac.compare_digest(hash_gate_token(token), stored_hash):
+        raise GateTokenError(
+            f"{task_id} is human-gated: the correct one-time token "
+            f"(delivered via ntfy) is required to {action} it"
+        )
+    conn.execute(
+        "UPDATE tasks SET gate_token_hash = NULL, gate_token_issued_at = NULL "
+        "WHERE id = ?",
+        (task_id,),
+    )
+    return True
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6699,6 +6815,7 @@ def promote_task(
     reason: Optional[str] = None,
     force: bool = False,
     dry_run: bool = False,
+    token: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Manually promote a `todo` or `blocked` task to `ready`.
 
@@ -6709,6 +6826,17 @@ def promote_task(
     assignee or claim state. Returns ``(True, None)`` on success and
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
+
+    ``token``: Human-Gate v1 one-time token, required to promote a
+    ``blocked`` card marked ``human_gate=1`` — 2026-07-11 repair review
+    found this function reaching ``ready`` from ``blocked`` with no gate
+    check at all. A missing/wrong token is reported through the SAME
+    ``(False, reason)`` contract as every other refusal here, rather
+    than raising, so no existing caller needs new exception handling.
+    ``dry_run`` deliberately does NOT check the gate (or consume a
+    token): dry_run's contract is "would the parent-dependency gate
+    allow this", and a single-use token must never be spent by a
+    read-only preview.
     """
     row = conn.execute(
         "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -6744,6 +6872,10 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        try:
+            _assert_human_gate_open(conn, task_id, token=token, action="promote")
+        except GateTokenError as exc:
+            return False, str(exc)
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
@@ -6780,12 +6912,17 @@ def unblock_task(
     Human-Gate v1: if the card has ``human_gate=1``, ``token`` must match
     the currently-issued one-time token (delivered out-of-band via ntfy —
     see ``issue_and_notify_gate_token``) or this raises
-    :class:`GateTokenError` and the card is left untouched. This check
-    lives HERE (not in the CLI or the tool layer) so every caller —
-    CLI, the ``kanban_unblock`` tool, and the dashboard's direct
-    ``unblock_task`` calls — goes through the same enforcement seam and
-    none of them can bypass it. A matching token is single-use: it is
-    cleared in the same transaction as the status transition.
+    :class:`GateTokenError` and the card is left untouched. The check is
+    delegated to the shared :func:`_assert_human_gate_open` guard — the
+    2026-07-11 repair review found ``complete_task``/``reclaim_task``/
+    ``promote_task`` reaching ``ready``/``done``/``archived`` from
+    ``blocked`` WITHOUT this check because it originally lived only here,
+    inline. Every one of those functions (plus ``schedule_task``,
+    ``archive_task``, ``recompute_ready``, and the dashboard's
+    ``_set_status_direct``) now calls the same guard, so no exit out of
+    ``blocked`` — CLI, tool, dashboard, or automatic — can bypass it.
+    A matching token is single-use: consumed atomically inside the guard,
+    in the same transaction as the status transition below.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -6796,33 +6933,7 @@ def unblock_task(
     """
     now = int(time.time())
     with write_txn(conn):
-        gate_row = conn.execute(
-            "SELECT human_gate, gate_token_hash FROM tasks "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (task_id,),
-        ).fetchone()
-        gated = bool(gate_row and gate_row["human_gate"])
-        if gated:
-            stored_hash = gate_row["gate_token_hash"]
-            if not stored_hash:
-                raise GateTokenError(
-                    f"{task_id} is human-gated but no token has been issued "
-                    "yet (or the ntfy push failed) — wait for the push, or "
-                    f"run `hermes kanban gate {task_id} off` to release it"
-                )
-            if not token or not hmac.compare_digest(hash_gate_token(token), stored_hash):
-                raise GateTokenError(
-                    f"{task_id} is human-gated: the correct one-time token "
-                    "(delivered via ntfy) is required to unblock it"
-                )
-            # Single-use: consume the token now, atomically with the status
-            # transition below (same write_txn — no window for a second
-            # unblock attempt to reuse it).
-            conn.execute(
-                "UPDATE tasks SET gate_token_hash = NULL, gate_token_issued_at = NULL "
-                "WHERE id = ?",
-                (task_id,),
-            )
+        gated = _assert_human_gate_open(conn, task_id, token=token, action="unblock")
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -7234,7 +7345,17 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Archive a task from any non-archived status.
+
+    Human-Gate v1, refuse-only (2026-07-11 repair review self-audit): a
+    ``blocked``/``scheduled``+``human_gate=1`` card always refuses —
+    archiving disposes of a card without ever requiring the human
+    decision the gate exists to force. No token parameter; run
+    ``kanban gate <id> off`` first if archiving a gated card is
+    genuinely needed.
+    """
     with write_txn(conn):
+        _assert_human_gate_open(conn, task_id, token=None, action="archive")
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -7626,8 +7747,18 @@ def schedule_task(
     ``scheduled`` tasks are intentionally not dispatchable; an external cron,
     human action, or automation can later call ``unblock_task`` to re-gate them
     to ``ready`` (or ``todo`` if parents are still incomplete).
+
+    Human-Gate v1, refuse-only: parking a ``blocked``+``human_gate=1``
+    card in ``scheduled`` is refused outright (2026-07-11 repair review
+    self-audit) — even though ``unblock_task`` still gates the eventual
+    return to ``ready``/``todo``, silently letting a gated card be
+    "laundered" out of the ``blocked`` column into ``scheduled`` without
+    a token would hide it from operator attention with no authorization
+    at all. No token parameter here; use ``kanban gate <id> off`` first
+    if scheduling a gated card is genuinely needed.
     """
     with write_txn(conn):
+        _assert_human_gate_open(conn, task_id, token=None, action="schedule")
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
