@@ -2866,11 +2866,11 @@ def _reject_foreign_workspace_refs(
     board: Optional[str],
 ) -> None:
     """Reject handoffs that depend on another task's disposable workspace."""
-    root = str(workspaces_root(board=board)).rstrip("/")
+    root = str(workspaces_root(board=board)).rstrip("/\\")
     if not root:
         return
     pattern = re.compile(
-        re.escape(root) + r"/(t_[A-Za-z0-9_-]+)(?=$|[/\s'\"`),.;:!?])"
+        re.escape(root) + r"[/\\](t_[A-Za-z0-9_-]+)(?=$|[/\\\s'\"`),.;:!?])"
     )
     referenced_ids = {
         match.group(1)
@@ -2891,7 +2891,8 @@ def _reject_foreign_workspace_refs(
                 (referenced_id,),
             ).fetchall()
         ]
-        detail = f"{root}/{referenced_id}"
+        separator = "\\" if "\\" in root and "/" not in root else "/"
+        detail = f"{root}{separator}{referenced_id}"
         if durable_paths:
             detail += "\n  durable artifact path(s):\n  - " + "\n  - ".join(durable_paths)
         details.append(detail)

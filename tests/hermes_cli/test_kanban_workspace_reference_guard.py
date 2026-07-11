@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -42,6 +42,27 @@ def test_create_rejects_foreign_workspace_reference_in_title_or_body(
     message = str(exc_info.value)
     assert foreign_id in message
     assert str(foreign_workspace) in message
+
+
+def test_create_rejects_foreign_windows_workspace_reference(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    windows_root = PureWindowsPath(r"C:\kanban\workspaces")
+    monkeypatch.setattr(kb, "workspaces_root", lambda board=None: windows_root)
+
+    with kb.connect_closing() as conn:
+        foreign_id = kb.create_task(conn, title="producer")
+        foreign_workspace = windows_root / foreign_id
+
+        with pytest.raises(ValueError, match="scratch workspace") as exc_info:
+            kb.create_task(
+                conn,
+                title="consumer",
+                body=f"Read {foreign_workspace / 'result.json'}",
+            )
+
+    assert str(foreign_workspace) in str(exc_info.value)
 
 
 def test_create_allows_foreign_workspace_reference_with_explicit_opt_out(
