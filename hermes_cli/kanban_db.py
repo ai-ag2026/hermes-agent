@@ -10934,6 +10934,31 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+_WORKER_ENV_STRIP_DEFAULT = (
+    "NTFY_TOKEN",
+    "NTFY_ADMIN_TOKEN",
+)
+
+
+def _worker_env_strip_keys() -> tuple[str, ...]:
+    """Secret env keys stripped from dispatcher-spawned worker processes.
+
+    Defaults cover the notification/Human-Gate channel (C4, audit
+    2026-07-11). Operators can extend via ``kanban.worker_env_strip``
+    (list of env var names) without a code change.
+    """
+    keys = list(_WORKER_ENV_STRIP_DEFAULT)
+    try:
+        from hermes_cli.config import load_config
+        extra = (load_config().get("kanban") or {}).get("worker_env_strip") or []
+        for item in extra:
+            if isinstance(item, str) and item.strip():
+                keys.append(item.strip())
+    except Exception:
+        pass
+    return tuple(keys)
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -10971,6 +10996,15 @@ def _default_spawn(
         if key.startswith("HERMES_KANBAN_"):
             env.pop(key, None)
     for key in ("HERMES_REASONING_EFFORT", "HERMES_TENANT", "TERMINAL_CWD"):
+        env.pop(key, None)
+
+    # C4 (Audit 2026-07-11): operational secrets a worker has no business
+    # holding. NTFY_* serves the Human-Gate/attention escalation channel —
+    # a prompt-injected worker holding it could impersonate or drown the
+    # very channel that gates it. Extendable via kanban.worker_env_strip.
+    # GITEA_TOKEN is deliberately NOT stripped: workers push branches/PRs
+    # as part of normal board work (accepted LAN-secret decision).
+    for key in _worker_env_strip_keys():
         env.pop(key, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml

@@ -6577,3 +6577,58 @@ def test_crash_grace_measured_from_active_run(kanban_home, monkeypatch):
         # Fresh respawn is inside the grace window → NOT reclaimed as crashed.
         assert crashed == []
         assert kb.get_task(conn, t).status == "running"
+
+
+# ---------------------------------------------------------------------------
+# C4 (Audit 2026-07-11): worker spawn env must not leak notification secrets
+# ---------------------------------------------------------------------------
+
+def test_spawn_strips_notification_secrets(kanban_home, monkeypatch):
+    """NTFY_* serves the Human-Gate/attention channel; a worker must not
+    hold it. GITEA_TOKEN stays (workers push branches/PRs — accepted)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("NTFY_TOKEN", "sekrit")
+    monkeypatch.setenv("NTFY_ADMIN_TOKEN", "sekrit2")
+    monkeypatch.setenv("GITEA_TOKEN", "needed-for-pushes")
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            self.pid = 4242
+
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="coder")
+        task = kb.get_task(conn, t)
+    _kb._default_spawn(task, str(kanban_home))
+
+    env = captured["env"]
+    assert "NTFY_TOKEN" not in env
+    assert "NTFY_ADMIN_TOKEN" not in env
+    assert env.get("GITEA_TOKEN") == "needed-for-pushes"
+
+
+def test_spawn_env_strip_extendable_via_config(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("MY_EXTRA_SECRET", "x")
+    import hermes_cli.config as _cfg
+    monkeypatch.setattr(
+        _cfg, "load_config",
+        lambda *a, **k: {"kanban": {"worker_env_strip": ["MY_EXTRA_SECRET"]}},
+    )
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            self.pid = 4242
+
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="coder")
+        task = kb.get_task(conn, t)
+    _kb._default_spawn(task, str(kanban_home))
+    assert "MY_EXTRA_SECRET" not in captured["env"]

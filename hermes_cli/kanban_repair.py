@@ -699,6 +699,63 @@ def _audit_archived_with_pending_review(conn) -> list[Finding]:
     return findings
 
 
+def _audit_referential_integrity(conn) -> list[Finding]:
+    """H8 (Audit 2026-07-11): side tables must reference existing tasks.
+
+    ``kanban audit`` previously only walked the task graph — 5 orphaned
+    notify_subs rows from the 2026-07-09 corruption sat undetected for two
+    days ("0 violations"). Checks notify_subs, task_artifacts and
+    task_links against ``tasks``. Read-only; orphans bucket as triage
+    (cleanup is a deliberate operator delete, not an auto-repair).
+    """
+    findings: list[Finding] = []
+    checks = (
+        (
+            "kanban_notify_subs",
+            "SELECT ns.task_id AS ref, COUNT(*) AS n FROM kanban_notify_subs ns "
+            "LEFT JOIN tasks t ON t.id = ns.task_id "
+            "WHERE t.id IS NULL GROUP BY ns.task_id",
+            "notify subscription(s) reference a task that no longer exists "
+            "(corruption residue or missed cascade) — relays poll these "
+            "forever and never deliver",
+        ),
+        (
+            "task_artifacts",
+            "SELECT a.task_id AS ref, COUNT(*) AS n FROM task_artifacts a "
+            "LEFT JOIN tasks t ON t.id = a.task_id "
+            "WHERE t.id IS NULL GROUP BY a.task_id",
+            "artifact row(s) reference a task that no longer exists — "
+            "durable files leak and the manifest is unreachable",
+        ),
+        (
+            "task_links",
+            "SELECT l.parent_id AS ref, COUNT(*) AS n FROM task_links l "
+            "LEFT JOIN tasks p ON p.id = l.parent_id "
+            "LEFT JOIN tasks c ON c.id = l.child_id "
+            "WHERE p.id IS NULL OR c.id IS NULL GROUP BY l.parent_id",
+            "dependency link(s) reference a task that no longer exists — "
+            "ready-promotion logic can misjudge the component",
+        ),
+    )
+    for table, sql, why in checks:
+        try:
+            rows = conn.execute(sql).fetchall()
+        except Exception:
+            # Table absent on old DBs — nothing to check.
+            continue
+        for row in rows:
+            findings.append(
+                Finding(
+                    kind="orphaned_reference",
+                    task_id=str(row["ref"]),
+                    bucket="triage",
+                    detail=f"{table}: {int(row['n'])} {why}",
+                    data={"table": table, "count": int(row["n"])},
+                )
+            )
+    return findings
+
+
 _AUDIT_FUNCS: tuple[Callable[[Any], list[Finding]], ...] = (
     _audit_run_pointer_invariants,
     _audit_multiple_open_runs,
@@ -708,6 +765,7 @@ _AUDIT_FUNCS: tuple[Callable[[Any], list[Finding]], ...] = (
     _audit_orphaned_completed_runs,
     _audit_closeout_evidence_on_blocked,
     _audit_archived_with_pending_review,
+    _audit_referential_integrity,
 )
 
 

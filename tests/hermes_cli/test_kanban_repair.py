@@ -717,3 +717,58 @@ def test_cli_repair_dry_run_then_apply_requires_actor_and_reason(kanban_home):
     assert applied_payload["applied_count"] == 1
     with kb.connect() as conn:
         assert kb.get_task(conn, task_id).status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# H8 (Audit 2026-07-11): referential integrity of side tables
+# ---------------------------------------------------------------------------
+
+def test_orphaned_notify_sub_is_flagged(kanban_home):
+    with kb.connect() as conn:
+        # A sub whose task never existed (the 2026-07-09 corruption residue).
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, thread_id, created_at) "
+            "VALUES ('t_ghost', 'webui', 'c1', '', 0)"
+        )
+        conn.commit()
+        report = kr.run_audit(conn)
+    orphans = _findings_by_kind(report, "orphaned_reference")
+    assert len(orphans) == 1
+    assert orphans[0].task_id == "t_ghost"
+    assert orphans[0].data["table"] == "kanban_notify_subs"
+    assert orphans[0].bucket == "triage"
+
+
+def test_orphaned_artifact_and_link_are_flagged(kanban_home):
+    with kb.connect() as conn:
+        real = kb.create_task(conn, title="real")
+        conn.execute(
+            "INSERT INTO task_artifacts "
+            "(task_id, producer_run_id, original_path, durable_path, sha256, "
+            " size, validated_at, retention_class) "
+            "VALUES ('t_gone', 0, '/tmp/a', '/tmp/d', 'x', 1, 0, 'keep')"
+        )
+        conn.execute(
+            "INSERT INTO task_links (parent_id, child_id) VALUES (?, 't_missing_child')",
+            (real,),
+        )
+        conn.commit()
+        report = kr.run_audit(conn)
+    orphans = _findings_by_kind(report, "orphaned_reference")
+    tables = {f.data["table"] for f in orphans}
+    assert tables == {"task_artifacts", "task_links"}
+
+
+def test_healthy_references_not_flagged(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="p")
+        child = kb.create_task(conn, title="c", parents=[parent])
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, thread_id, created_at) "
+            "VALUES (?, 'telegram', 'c1', '', 0)", (parent,),
+        )
+        conn.commit()
+        report = kr.run_audit(conn)
+    assert not _findings_by_kind(report, "orphaned_reference")
