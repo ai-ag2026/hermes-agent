@@ -1577,7 +1577,12 @@ def terminate_run_endpoint(
                 status_code=409,
                 detail=f"run {run_id} already ended",
             )
-        ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        try:
+            ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        except kanban_db.GateTokenError as exc:
+            # Human-Gate v1: reclaim is refuse-only for a gated blocked
+            # card (2026-07-11 repair review) — no token field here.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not ok:
             raise HTTPException(
                 status_code=409,
