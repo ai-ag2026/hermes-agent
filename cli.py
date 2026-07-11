@@ -15934,7 +15934,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     def _block(reason: str) -> None:
         c = _kb.connect()
         try:
-            _kb.block_task(c, task_id, reason=reason)
+            # trusted_internal: harness code (goal-loop escape), not a
+            # model-driven surface — the kernel worker gates (C1) would
+            # otherwise refuse an untyped block on a goal_mode card.
+            _kb.block_task(c, task_id, reason=reason, trusted_internal=True)
         finally:
             try:
                 c.close()

@@ -168,9 +168,17 @@ def worker_env(monkeypatch, tmp_path):
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    # Mirror the real dispatcher spawn (_default_spawn): a spawned worker
+    # always carries its run identity; the kernel worker gates (C1) refuse
+    # lifecycle transitions without it.
+    if run_id is not None:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    else:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
     return tid
 
 
@@ -709,17 +717,25 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
             body="Must achieve X with verified evidence.", goal_mode=True
         )
         kb.claim_task(conn, goal_task_id)
+        run_id = kb.get_task(conn, goal_task_id).current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
+    # C1 (audit 2026-07-11): for worker-scoped processes the judge gate now
+    # runs in the KERNEL (kanban_db), so patch it there; the tool-layer
+    # patches stay for the orchestrator-surface variant of the gate.
     def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
         return "continue", "missing verification evidence", False
 
     monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
     monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+    import hermes_cli.goals as _goals
+    monkeypatch.setattr(_goals, "judge_goal", mock_judge_goal)
+    monkeypatch.setattr(kb, "_goal_judge_available", lambda: True)
 
     # Attempt to complete should be rejected
     out = kt._handle_complete({"summary": "I did some stuff but not X"})
@@ -765,17 +781,23 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
             body="Must achieve X with verified evidence.", goal_mode=True
         )
         kb.claim_task(conn, goal_task_id)
+        run_id = kb.get_task(conn, goal_task_id).current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
 
     # No judge reachable. judge_goal must not even be consulted; if it were,
     # this stub would reject — so reaching "done" proves the probe short-circuit.
+    # C1: the kernel gate probes availability too — patch both layers.
     def fail_if_called(goal, last_response, *, timeout=30.0, subgoals=None):
         raise AssertionError("judge_goal must not run when no judge is available")
 
     monkeypatch.setattr("tools.kanban_tools.judge_goal", fail_if_called)
     monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: False)
+    import hermes_cli.goals as _goals
+    monkeypatch.setattr(_goals, "judge_goal", fail_if_called)
+    monkeypatch.setattr(kb, "_goal_judge_available", lambda: False)
 
     out = kt._handle_complete({"summary": "done enough"})
     d = json.loads(out)
@@ -877,9 +899,14 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
             body="Must achieve X.", goal_mode=True,
         )
         kb.claim_task(conn, goal_task_id)
+        run_id = kb.get_task(conn, goal_task_id).current_run_id
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    # Mirror the real dispatcher spawn: workers carry their run identity
+    # (kernel worker gates C1 refuse lifecycle calls without it).
+    if run_id is not None:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return goal_task_id
 
 
@@ -1739,7 +1766,10 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     conn = kb.connect()
     try:
         other = kb.create_task(conn, title="blocked sibling", assignee="peer")
-        kb.block_task(conn, other, reason="waiting")
+        # trusted_internal: test-rig setup acting as the operator; the test
+        # process itself carries worker scope, which the kernel gates (C1)
+        # would otherwise (correctly) refuse for a foreign card.
+        kb.block_task(conn, other, reason="waiting", trusted_internal=True)
     finally:
         conn.close()
 
@@ -2581,15 +2611,23 @@ def test_complete_tool_refuses_needs_input_blocked(worker_env):
         conn.close()
 
 
-def test_complete_tool_allows_non_needs_input_blocked(worker_env):
-    """Un-typed blocks stay completable (existing operator affordance)."""
+def test_complete_tool_allows_non_needs_input_blocked(monkeypatch, worker_env):
+    """Un-typed blocks stay completable (existing OPERATOR affordance).
+
+    Operator surface = no worker scope in env (C1). A worker completing its
+    own blocked card is stopped by the expected_run_id CAS (its run was
+    ended by the block), which is correct — the affordance belongs to the
+    operator, not the worker."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
     conn = kb.connect()
     try:
-        kb.block_task(conn, worker_env, reason="transient hiccup")
+        kb.block_task(conn, worker_env, reason="transient hiccup",
+                      trusted_internal=True)
     finally:
         conn.close()
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
     out = kt._handle_complete({"task_id": worker_env, "summary": "recovered"})
     d = json.loads(out)
     assert d.get("ok") is True

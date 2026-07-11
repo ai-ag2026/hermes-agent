@@ -292,7 +292,9 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+# Canonical definition lives in the kernel (audit 2026-07-11, Meta-Muster E:
+# duplicated invariants drift). Imported lazily in _handle_block via the
+# connected ``kb`` module: kb.GOAL_MODE_BLOCK_ALLOWED_KINDS.
 
 
 def _goal_judge_available() -> bool:
@@ -751,8 +753,18 @@ def _handle_complete(args: dict, **kw) -> str:
             # calling kanban_complete before acceptance criteria are met.
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
+            # Skipped when the kernel worker gates cover this process
+            # (audit 2026-07-11 C1): complete_task runs the same judge for
+            # worker-scoped processes, and judging twice would double the
+            # LLM cost per completion. This tool-side check remains for
+            # agent surfaces WITHOUT worker scope (orchestrator profiles),
+            # which the kernel deliberately does not gate.
+            _kernel_gated = kb._worker_scope()[0] is not None
             task = kb.get_task(conn, tid)
-            if task and task.goal_mode and _goal_judge_available():
+            if (
+                not _kernel_gated
+                and task and task.goal_mode and _goal_judge_available()
+            ):
                 verdict = "done"
                 reason = ""
                 try:
@@ -785,6 +797,8 @@ def _handle_complete(args: dict, **kw) -> str:
                     expected_run_id=_worker_run_id(tid),
                     board=board,
                 )
+            except kb.WorkerGateError as gate_err:
+                return tool_error(f"kanban_complete refused: {gate_err}")
             except kb.CompletionEvidenceError as evidence_err:
                 return json.dumps(
                     {
@@ -1006,25 +1020,28 @@ def _handle_block(args: dict, **kw) -> str:
         if (
             task
             and task.goal_mode
-            and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
+            and kind not in kb.GOAL_MODE_BLOCK_ALLOWED_KINDS
         ):
             conn.close()
             return tool_error(
                 f"goal_mode tasks can only block with kind in "
-                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
+                f"{sorted(kb.GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
                 f"If the task is actually finished or cannot proceed for "
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
             )
         try:
-            ok = kb.block_task(
-                conn, tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id(tid),
-                human_summary=human_summary,
-                human_action=human_action,
-            )
+            try:
+                ok = kb.block_task(
+                    conn, tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id(tid),
+                    human_summary=human_summary,
+                    human_action=human_action,
+                )
+            except kb.WorkerGateError as gate_err:
+                return tool_error(f"kanban_block refused: {gate_err}")
             if not ok:
                 return tool_error(
                     f"could not block {tid} (unknown id or not in "

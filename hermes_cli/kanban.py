@@ -2095,6 +2095,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     expected_run_id=_worker_run_id_for(tid),
                     token=token,
                 )
+            except kb.WorkerGateError as exc:
+                failed.append(tid)
+                print(
+                    f"cannot complete {tid}: worker gate ({exc.gate}): {exc}",
+                    file=sys.stderr,
+                )
+                continue
             except kb.CompletionEvidenceError as exc:
                 failed.append(tid)
                 print(
@@ -2155,16 +2162,25 @@ def _cmd_block(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-                human_gate=human_gate,
-                human_summary=getattr(args, "human_summary", None),
-                human_action=getattr(args, "human_action", None),
-            ):
+            try:
+                blocked_ok = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id_for(tid),
+                    human_gate=human_gate,
+                    human_summary=getattr(args, "human_summary", None),
+                    human_action=getattr(args, "human_action", None),
+                )
+            except kb.WorkerGateError as exc:
+                failed.append(tid)
+                print(
+                    f"cannot block {tid}: worker gate ({exc.gate}): {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            if not blocked_ok:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:

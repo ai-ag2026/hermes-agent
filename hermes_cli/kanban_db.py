@@ -130,6 +130,12 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# Goal-mode tasks may only block with kinds that represent a genuine external
+# blocker the worker cannot resolve itself; everything else must route through
+# complete (where the goal judge gates). Canonical here (audit 2026-07-11,
+# Meta-Muster E: this set previously lived only in tools/kanban_tools.py).
+GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -5138,6 +5144,209 @@ class CompletionEvidenceError(ValueError):
         self.details = details
 
 
+class WorkerGateError(ValueError):
+    """Raised when a dispatcher-spawned worker process attempts a lifecycle
+    transition the worker gates refuse.
+
+    Audit 2026-07-11 C1: ownership, needs_input, the goal-mode judge and the
+    goal-mode block-kind restriction lived only in the ``kanban_*`` tool
+    handlers, so ``hermes kanban complete/block`` from a worker's own
+    terminal bypassed every one of them. These gates now live in the kernel
+    (``complete_task``/``block_task``) and key on the PROCESS being scoped to
+    a task via ``HERMES_KANBAN_TASK`` — CLI, tool and any future surface in a
+    worker process share one gate. Operator CLI sessions, the gateway
+    process (dispatcher/dashboard/Telegram) and orchestrator profiles carry
+    no such scope and are unaffected.
+    """
+
+    def __init__(self, gate: str, message: str) -> None:
+        super().__init__(message)
+        self.gate = gate
+
+
+def _worker_scope() -> tuple[Optional[str], Optional[int]]:
+    """(task_id, run_id) this PROCESS is scoped to, or (None, None).
+
+    A dispatcher-spawned worker carries both ``HERMES_KANBAN_TASK`` and
+    ``HERMES_KANBAN_RUN_ID``. A delegate_task subagent's terminal subprocess
+    keeps TASK but has RUN_ID deliberately stripped (see
+    ``tools/environments/local.py:_strip_delegated_subagent_kanban_env``), so
+    "scoped task without a run identity" identifies exactly the delegated
+    path the gates must refuse.
+    """
+    tid = (os.environ.get("HERMES_KANBAN_TASK") or "").strip() or None
+    raw_rid = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    rid: Optional[int] = None
+    if raw_rid:
+        try:
+            rid = int(raw_rid)
+        except ValueError:
+            rid = None
+    return tid, rid
+
+
+def _goal_judge_available() -> bool:
+    """True when an auxiliary client is configured for the goal judge.
+
+    ``judge_goal`` is fail-open at the source: with no reachable auxiliary
+    model it returns a ``"continue"`` verdict indistinguishable from a real
+    "not done yet". Enforcing the gate then would wedge every goal_mode
+    worker, so we probe availability first (mirrors judge_goal's own lookup).
+    """
+    try:
+        from agent.auxiliary_client import get_text_auxiliary_client
+        client, model = get_text_auxiliary_client("goal_judge")
+    except Exception:
+        return False
+    return client is not None and bool(model)
+
+
+def _record_worker_gate_refusal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    error: "WorkerGateError",
+    *,
+    run_id: Optional[int] = None,
+) -> None:
+    """Best-effort audit event for a refused worker lifecycle transition."""
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, kind,
+                {"gate": error.gate, "error": str(error)},
+                run_id=run_id,
+            )
+    except Exception as audit_error:
+        _log.warning(
+            "worker gate refusal audit failed for task %s (%s): %s",
+            task_id, error.gate, audit_error,
+        )
+
+
+def _enforce_worker_complete_gates(
+    conn: sqlite3.Connection,
+    task,
+    task_id: str,
+    summary: Optional[str],
+    result: Optional[str],
+) -> None:
+    """Kernel worker gates for ``complete_task`` (audit 2026-07-11 C1).
+
+    No-op unless the calling PROCESS is scoped to a task (see
+    ``_worker_scope``). Raises :class:`WorkerGateError` (and records an
+    audit event) instead of returning False so every surface can show the
+    worker an actionable message.
+    """
+    scope_tid, scope_rid = _worker_scope()
+    if scope_tid is None:
+        return
+
+    def _refuse(gate: str, message: str) -> None:
+        err = WorkerGateError(gate, message)
+        _record_worker_gate_refusal(
+            conn, task_id, "completion_blocked_gate", err,
+            run_id=getattr(task, "current_run_id", None),
+        )
+        raise err
+
+    if task_id != scope_tid:
+        _refuse(
+            "ownership",
+            f"worker is scoped to task {scope_tid}; refusing to complete "
+            f"{task_id}. Use kanban_comment to hand off information to "
+            f"other tasks, or kanban_create to spawn follow-up work.",
+        )
+    if scope_rid is None or (
+        task.current_run_id is not None
+        and int(task.current_run_id) != scope_rid
+    ):
+        _refuse(
+            "run_identity",
+            f"this process carries no valid run identity for {task_id} "
+            "(HERMES_KANBAN_RUN_ID missing or stale). Delegated subagents "
+            "never complete their parent's card; a reclaimed worker must "
+            "not complete a run it no longer owns.",
+        )
+    if task.status == "blocked" and (task.block_kind or "") == "needs_input":
+        _refuse(
+            "needs_input",
+            f"{task_id} is blocked with kind=needs_input — a human decision "
+            "gate. Completing it from a worker context would dissolve the "
+            "gate without any human in the loop: post your evidence as a "
+            "comment and leave the card for the operator.",
+        )
+    if getattr(task, "goal_mode", 0) and _goal_judge_available():
+        verdict, reason = "done", ""
+        try:
+            from hermes_cli.goals import judge_goal
+            verdict, reason, _ = judge_goal(
+                goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                last_response=(summary or result or "").strip(),
+            )
+        except Exception as judge_exc:
+            # Defensive: judge_goal swallows its own errors, but if it ever
+            # raises, fail open rather than wedge the worker.
+            _log.warning(
+                "goal judge check failed, allowing completion: %s",
+                judge_exc, exc_info=True,
+            )
+        if verdict != "done":
+            _refuse(
+                "goal_judge",
+                f"Goal completion rejected by judge: {reason}. To proceed, "
+                "either: (1) provide explicit acceptance evidence in your "
+                "summary matching the task's criteria, or (2) create "
+                f"continuation tasks with parents=[{task_id}] and keep this "
+                "task alive.",
+            )
+
+
+def _enforce_worker_block_gates(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: Optional[str],
+) -> None:
+    """Kernel worker gates for ``block_task`` (audit 2026-07-11 C1)."""
+    scope_tid, scope_rid = _worker_scope()
+    if scope_tid is None:
+        return
+
+    def _refuse(gate: str, message: str) -> None:
+        err = WorkerGateError(gate, message)
+        _record_worker_gate_refusal(conn, task_id, "block_refused_gate", err)
+        raise err
+
+    if task_id != scope_tid:
+        _refuse(
+            "ownership",
+            f"worker is scoped to task {scope_tid}; refusing to block "
+            f"{task_id}. Use kanban_comment to hand off information to "
+            f"other tasks.",
+        )
+    if scope_rid is None:
+        _refuse(
+            "run_identity",
+            f"this process carries no valid run identity for {task_id} "
+            "(HERMES_KANBAN_RUN_ID missing). Delegated subagents never "
+            "drive their parent card's lifecycle.",
+        )
+    task = get_task(conn, task_id)
+    if (
+        task is not None
+        and getattr(task, "goal_mode", 0)
+        and kind not in GOAL_MODE_BLOCK_ALLOWED_KINDS
+    ):
+        _refuse(
+            "goal_mode_block",
+            f"goal_mode tasks can only block with kind in "
+            f"{sorted(GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If "
+            "the task is actually finished or cannot proceed for another "
+            "reason, call kanban_complete instead — the completion judge "
+            "will evaluate it.",
+        )
+
+
 def _record_completion_rejection(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5694,7 +5903,20 @@ def complete_task(
     marked ``human_gate=1`` — see ``_complete_task_locked`` for where the
     check runs. ``None`` for every other card (the overwhelming common
     case: completing from ``running``/``ready``) is a no-op.
+
+    Raises :class:`WorkerGateError` when the calling process is a
+    dispatcher-spawned worker and the transition fails the worker gates
+    (ownership / run identity / needs_input / goal judge) — audit
+    2026-07-11 C1. Enforced HERE (not in the tool layer) so CLI, tool and
+    every other surface inside a worker process share one gate. Runs
+    before the artifact lock so the judge's LLM call never holds it.
     """
+    if _worker_scope()[0] is not None:
+        _gate_task = get_task(conn, task_id)
+        if _gate_task is not None:
+            _enforce_worker_complete_gates(
+                conn, _gate_task, task_id, summary, result
+            )
     try:
         with _completion_artifact_lock(conn):
             return _complete_task_locked(
@@ -6899,6 +7121,7 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     require_unclaimed: bool = False,
+    trusted_internal: bool = False,
     human_gate: Optional[bool] = None,
     human_summary: Optional[str] = None,
     human_action: Optional[str] = None,
@@ -6952,6 +7175,15 @@ def block_task(
     atomically refuses to de-claim a card that was claimed between snapshot
     and block.
 
+    ``trusted_internal=True`` skips the kernel worker gates (audit
+    2026-07-11 C1) for harness code that legitimately blocks in-process
+    inside a worker (e.g. the goal-loop escape in cli.py). Model-driven
+    surfaces (tool handler, CLI) must never set it.
+
+    Raises :class:`WorkerGateError` when the calling process is a
+    dispatcher-spawned worker and the transition fails the worker gates
+    (ownership / run identity / goal-mode block kinds).
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -6959,6 +7191,8 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if not trusted_internal:
+        _enforce_worker_block_gates(conn, task_id, kind)
     unclaimed_guard = " AND claim_lock IS NULL" if require_unclaimed else ""
 
     def _with_human_fields(payload: dict) -> dict:
