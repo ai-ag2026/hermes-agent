@@ -6027,6 +6027,84 @@ def test_cmd_gate_refused_in_worker_session(kanban_home, monkeypatch, capsys):
         assert kb.get_task(conn, tid).human_gate is False  # never touched
 
 
+@pytest.mark.parametrize("action", ["complete", "promote"])
+def test_cmd_gate_token_issues_delivers_and_redeems_action_grant(
+    kanban_home, monkeypatch, action
+):
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    delivered = {}
+
+    def _capture(task_id, token, *, board=None, action="unblock"):
+        delivered.update(task_id=task_id, token=token, board=board, action=action)
+        return True
+
+    monkeypatch.setattr(kb, "send_gate_token_ntfy", _capture)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="approval", kind="needs_input", human_gate=True)
+
+    rc = kanban_cli._cmd_gate_token(argparse.Namespace(task_id=tid, action=action))
+    assert rc == 0
+    assert delivered["task_id"] == tid
+    assert delivered["action"] == action
+
+    with kb.connect() as conn:
+        if action == "complete":
+            assert kb.complete_task(
+                conn,
+                tid,
+                result="approved",
+                summary="approved",
+                token=delivered["token"],
+            ) is True
+            assert kb.get_task(conn, tid).status == "done"
+        else:
+            ok, err = kb.promote_task(
+                conn,
+                tid,
+                actor="operator",
+                reason="approved",
+                token=delivered["token"],
+            )
+            assert (ok, err) == (True, None)
+            assert kb.get_task(conn, tid).status == "ready"
+        row = conn.execute(
+            "SELECT gate_token_hash FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["gate_token_hash"] is None
+
+
+def test_cmd_gate_token_refused_in_worker_session(kanban_home, monkeypatch, capsys):
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="approval", kind="needs_input", human_gate=True)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    rc = kanban_cli._cmd_gate_token(argparse.Namespace(task_id=tid, action="complete"))
+    assert rc == 1
+    assert "refused" in capsys.readouterr().err
+
+
+def test_gate_token_parser_requires_and_captures_action():
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="top")
+    kanban_cli.build_parser(subparsers)
+    args = parser.parse_args(
+        ["kanban", "gate-token", "t_example", "--action", "complete"]
+    )
+    assert args.kanban_action == "gate-token"
+    assert args.task_id == "t_example"
+    assert args.action == "complete"
+
+
 def test_cli_block_human_gate_flag_and_unblock_token(kanban_home, monkeypatch, capsys):
     import argparse
     from hermes_cli import kanban as kanban_cli

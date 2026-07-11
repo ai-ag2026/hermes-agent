@@ -638,6 +638,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gate.add_argument("task_id")
     p_gate.add_argument("state", choices=["on", "off"])
 
+    p_gate_token = sub.add_parser(
+        "gate-token",
+        help="Issue and ntfy-deliver an action-bound human-gate token (operator only)",
+    )
+    p_gate_token.add_argument("task_id")
+    p_gate_token.add_argument(
+        "--action",
+        required=True,
+        choices=["unblock", "complete", "promote"],
+        help="Transition this single-use token authorizes.",
+    )
+
     p_promote = sub.add_parser(
         "promote",
         help="Manually move one or more todo/blocked tasks to ready (recovery path)",
@@ -1054,6 +1066,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "gate":     _cmd_gate,
+            "gate-token": _cmd_gate_token,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -2262,6 +2275,32 @@ def _cmd_gate(args: argparse.Namespace) -> int:
         )
     else:
         print(f"{args.task_id}: human gate OFF")
+    return 0
+
+
+def _cmd_gate_token(args: argparse.Namespace) -> int:
+    """Issue and ntfy-deliver an action-bound gate grant — operator only."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        print(
+            "refused: 'kanban gate-token' is not available from within a "
+            "board worker session (HERMES_KANBAN_TASK is set).",
+            file=sys.stderr,
+        )
+        return 1
+    with kb.connect_closing() as conn:
+        delivered = kb.issue_and_notify_gate_token(
+            conn,
+            args.task_id,
+            action=args.action,
+        )
+    if not delivered:
+        print(
+            f"cannot issue/deliver {args.action} gate token for {args.task_id}; "
+            "card remains hard-blocked",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"{args.task_id}: {args.action} gate token delivered via ntfy")
     return 0
 
 

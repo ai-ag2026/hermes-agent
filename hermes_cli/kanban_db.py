@@ -6570,8 +6570,14 @@ def _load_ntfy_env() -> dict[str, str]:
     return env
 
 
-def send_gate_token_ntfy(task_id: str, token: str, *, board: Optional[str] = None) -> bool:
-    """Push a human-gate unblock token to the operator's ntfy channel.
+def send_gate_token_ntfy(
+    task_id: str,
+    token: str,
+    *,
+    board: Optional[str] = None,
+    action: str = "unblock",
+) -> bool:
+    """Push an action-bound human-gate token to the operator's ntfy channel.
 
     Best-effort, short timeout, stdlib-only urllib POST — mirrors
     ``send_ntfy`` in ``scripts/tars_cron_ntfy_relay.py`` (same env keys:
@@ -6590,9 +6596,17 @@ def send_gate_token_ntfy(task_id: str, token: str, *, board: Optional[str] = Non
         )
         return False
     board_flag = f" --board {board}" if board else ""
+    commands = {
+        "unblock": f"hermes kanban unblock {task_id} --reason '...' --token {token}{board_flag}",
+        "complete": f"hermes kanban complete {task_id} --summary '...' --token {token}{board_flag}",
+        "promote": f"hermes kanban promote {task_id} --token {token}{board_flag}",
+    }
+    command = commands.get(action)
+    if command is None:
+        raise ValueError(f"unsupported human-gate action: {action}")
     message = (
-        f"Karte {task_id} wartet auf dich:\n"
-        f"hermes kanban unblock {task_id} --reason '...' --token {token}{board_flag}"
+        f"Karte {task_id} wartet auf deine Freigabe für {action}:\n"
+        f"{command}"
     )
     req = urllib.request.Request(
         f"{base_url}/{urllib.parse.quote(topic)}",
@@ -6628,7 +6642,11 @@ def send_gate_token_ntfy(task_id: str, token: str, *, board: Optional[str] = Non
 
 
 def issue_and_notify_gate_token(
-    conn: sqlite3.Connection, task_id: str, *, board: Optional[str] = None
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    action: str = "unblock",
+    board: Optional[str] = None,
 ) -> bool:
     """Issue a fresh gate token for a blocked ``human_gate=1`` card and
     push it via ntfy in one step. Returns True only if a token was both
@@ -6639,10 +6657,12 @@ def issue_and_notify_gate_token(
     persisted with nobody holding the plaintext. Rescue path in both
     cases: ``hermes kanban gate <id> off`` (interactive CLI only).
     """
-    token = issue_gate_token(conn, task_id, action="unblock", board=board)
+    if action not in {"unblock", "complete", "promote"}:
+        raise ValueError(f"unsupported human-gate action: {action}")
+    token = issue_gate_token(conn, task_id, action=action, board=board)
     if token is None:
         return False
-    delivered = send_gate_token_ntfy(task_id, token, board=board)
+    delivered = send_gate_token_ntfy(task_id, token, board=board, action=action)
     if not delivered:
         _log.warning(
             "human_gate: %s is now hard-locked (token issued, ntfy push "
