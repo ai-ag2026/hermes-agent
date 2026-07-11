@@ -5777,6 +5777,62 @@ def test_human_gate_token_roundtrip(kanban_home):
         assert unblocked.payload["human_gate"] is True
 
 
+def test_human_gate_grant_binds_board_task_and_action(kanban_home):
+    with kb.scoped_current_board("default"), kb.connect() as conn:
+        first = kb.create_task(conn, title="first", assignee="worker")
+        second = kb.create_task(conn, title="second", assignee="worker")
+        for tid in (first, second):
+            kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, first, action="unblock", board="default")
+        assert token
+        with pytest.raises(kb.GateTokenError, match="different action"):
+            kb.complete_task(conn, first, result="x", token=token)
+        with pytest.raises(kb.GateTokenError):
+            kb.unblock_task(conn, second, token=token)
+        with kb.scoped_current_board("other"):
+            with pytest.raises(kb.GateTokenError, match="different board"):
+                kb.unblock_task(conn, first, token=token)
+        with kb.scoped_current_board("default"):
+            assert kb.unblock_task(conn, first, token=token) is True
+
+
+def test_human_gate_failed_attempt_lockout_persists_across_connections(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_human_gate_config", lambda: {
+        "token_ttl_seconds": 600, "max_failed_attempts": 2,
+        "failure_window_seconds": 60, "lockout_seconds": 60,
+    })
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+        for _ in range(2):
+            with pytest.raises(kb.GateTokenError):
+                kb.unblock_task(conn, tid, token="wrong")
+    with kb.connect() as fresh:
+        row = fresh.execute(
+            "SELECT gate_failed_attempts, gate_locked_until FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["gate_failed_attempts"] == 2
+        assert row["gate_locked_until"] > int(time.time())
+        with pytest.raises(kb.GateTokenError, match="temporarily locked"):
+            kb.unblock_task(fresh, tid, token=token)
+
+
+def test_human_gate_rotation_resets_failed_attempts(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        with pytest.raises(kb.GateTokenError):
+            kb.unblock_task(conn, tid, token="wrong")
+        token = kb.issue_gate_token(conn, tid)
+        row = conn.execute(
+            "SELECT gate_failed_attempts, gate_locked_until FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["gate_failed_attempts"] == 0
+        assert row["gate_locked_until"] is None
+        assert kb.unblock_task(conn, tid, token=token) is True
+
+
 def test_human_gate_refuses_when_no_token_issued(kanban_home):
     """A human_gate=1 card with a NULL hash (never issued, or ntfy failed)
     must refuse ANY token, not just a wrong one — that's the fail-closed
@@ -6095,7 +6151,7 @@ def test_repair_complete_task_refuses_gated_blocked_card(kanban_home):
 
         # Wrong token: also refused, and a bad guess must not mutate the
         # (now-issued) hash — a legitimate holder's token must still work.
-        token = kb.issue_gate_token(conn, tid)
+        token = kb.issue_gate_token(conn, tid, action="complete")
         with pytest.raises(kb.GateTokenError):
             kb.complete_task(conn, tid, result="done anyway", token="wrong-guess")
         unchanged = conn.execute(
@@ -6196,7 +6252,7 @@ def test_repair_promote_task_refuses_gated_blocked_card(kanban_home):
         ).fetchone()
         assert no_hash["gate_token_hash"] is None
 
-        token = kb.issue_gate_token(conn, tid)
+        token = kb.issue_gate_token(conn, tid, action="promote")
         bad_ok, bad_err = kb.promote_task(conn, tid, actor="a", force=True, token="wrong")
         assert bad_ok is False
         assert bad_err is not None and "human-gated" in bad_err
@@ -6217,7 +6273,7 @@ def test_repair_promote_task_dry_run_ignores_gate(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="gated", assignee="worker")
         kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
-        token = kb.issue_gate_token(conn, tid)
+        token = kb.issue_gate_token(conn, tid, action="promote")
         ok, err = kb.promote_task(conn, tid, actor="a", force=True, dry_run=True, token=token)
         assert ok is True and err is None
         # Token must survive a dry_run untouched (never spent by a preview).
@@ -6286,7 +6342,7 @@ def test_repair_cli_complete_and_promote_token_flags(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="gated", assignee="worker")
         kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
-        token = kb.issue_gate_token(conn, tid)
+        token = kb.issue_gate_token(conn, tid, action="complete")
 
     rc_fail = kanban_cli._cmd_complete(argparse.Namespace(
         task_ids=[tid], result="x", summary=None, metadata=None, token=None,
@@ -6306,7 +6362,7 @@ def test_repair_cli_complete_and_promote_token_flags(kanban_home):
     with kb.connect() as conn:
         tid2 = kb.create_task(conn, title="gated2", assignee="worker")
         kb.block_task(conn, tid2, reason="x", kind="needs_input", human_gate=True)
-        token2 = kb.issue_gate_token(conn, tid2)
+        token2 = kb.issue_gate_token(conn, tid2, action="promote")
 
     rc_fail2 = kanban_cli._cmd_promote(argparse.Namespace(
         task_id=tid2, reason=[], ids=None, force=True, dry_run=False,

@@ -669,7 +669,18 @@ def test_patch_status_ungated_blocked_card_unaffected(client, kanban_home):
 
 def test_delete_task(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
-    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+    # Hard-delete is retention cleanup, not a lifecycle shortcut.
+    r = client.delete(
+        f"/api/plugins/kanban/tasks/{t['id']}", params={"reason": "retention cleanup"}
+    )
+    assert r.status_code == 409
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "archived"}
+    )
+    assert r.status_code == 200
+    r = client.delete(
+        f"/api/plugins/kanban/tasks/{t['id']}", params={"reason": "retention cleanup"}
+    )
     assert r.status_code == 200
     assert r.json()["deleted"] is True
     assert r.json()["task_id"] == t["id"]
@@ -685,7 +696,10 @@ def test_delete_task(client):
 
 
 def test_delete_task_not_found(client):
-    r = client.delete("/api/plugins/kanban/tasks/t_nonexistent")
+    r = client.delete(
+        "/api/plugins/kanban/tasks/t_nonexistent",
+        params={"reason": "retention cleanup"},
+    )
     assert r.status_code == 404
     assert "not found" in r.json()["detail"]
 

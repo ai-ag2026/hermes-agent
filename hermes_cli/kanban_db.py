@@ -1324,7 +1324,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- which makes unblock_task fail closed.
     human_gate           INTEGER NOT NULL DEFAULT 0,
     gate_token_hash       TEXT,
-    gate_token_issued_at  INTEGER
+    gate_token_issued_at  INTEGER,
+    gate_token_board      TEXT,
+    gate_token_task_id    TEXT,
+    gate_token_action     TEXT,
+    gate_failed_attempts  INTEGER NOT NULL DEFAULT 0,
+    gate_failure_window_started_at INTEGER,
+    gate_locked_until     INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2387,6 +2393,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "gate_token_issued_at", "gate_token_issued_at INTEGER"
         )
+    for name, definition in (
+        ("gate_token_board", "gate_token_board TEXT"),
+        ("gate_token_task_id", "gate_token_task_id TEXT"),
+        ("gate_token_action", "gate_token_action TEXT"),
+        ("gate_failed_attempts", "gate_failed_attempts INTEGER NOT NULL DEFAULT 0"),
+        ("gate_failure_window_started_at", "gate_failure_window_started_at INTEGER"),
+        ("gate_locked_until", "gate_locked_until INTEGER"),
+    ):
+        if name not in cols:
+            _add_column_if_missing(conn, "tasks", name, definition)
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -2764,7 +2780,13 @@ def write_txn(conn: sqlite3.Connection):
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
-    except Exception:
+    except Exception as exc:
+        # Authentication failures persist only their bounded failure/audit
+        # counters. Human-gate guards run immediately before the protected
+        # transition, so no status mutation has occurred when this commits.
+        if isinstance(exc, GateTokenError) and exc.persist_failure:
+            _execute_boundary_with_retry(conn, "COMMIT")
+            raise
         try:
             conn.execute("ROLLBACK")
         except sqlite3.OperationalError:
@@ -4598,7 +4620,7 @@ def _accept_task_review(
                 if verified_cards:
                     payload["created_cards"] = verified_cards
                 _append_event(conn, task_id, "completed", payload, run_id=run_id)
-                promotion_state["committed"] = True
+                promotion_state["accepted"] = True
     except _CompletionArtifactLockError as exc:
         error = CompletionEvidenceError(
             "artifact_promotion_failed", f"completion artifact lock failed: {exc}"
@@ -6452,14 +6474,37 @@ def edit_completed_task_result(
 
 
 class GateTokenError(ValueError):
-    """Raised by ``unblock_task`` when a ``human_gate=1`` card lacks a
-    valid one-time token (Human-Gate v1, human-gate-design.md).
+    """A human-gate grant was absent, invalid, expired, or locked out."""
 
-    Kept as a ``ValueError`` subclass so it flows through the same
-    catch sites the S4d needs_input refusal already relies on (the CLI's
-    top-level dispatch catch and ``tools/kanban_tools.py``'s ``except
-    ValueError`` handler) without any new plumbing.
-    """
+    def __init__(self, message: str, *, persist_failure: bool = False):
+        super().__init__(message)
+        self.persist_failure = persist_failure
+
+
+def _human_gate_config() -> dict[str, int]:
+    defaults = {
+        "token_ttl_seconds": 600,
+        "max_failed_attempts": 5,
+        "failure_window_seconds": 300,
+        "lockout_seconds": 300,
+    }
+    try:
+        from hermes_cli.config import load_config
+        raw = (load_config().get("kanban") or {}).get("human_gate") or {}
+    except Exception:
+        raw = {}
+    limits = {
+        "token_ttl_seconds": (30, 3600),
+        "max_failed_attempts": (1, 20),
+        "failure_window_seconds": (30, 3600),
+        "lockout_seconds": (30, 3600),
+    }
+    for key, (low, high) in limits.items():
+        try:
+            defaults[key] = max(low, min(int(raw.get(key, defaults[key])), high))
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return defaults
 
 
 def hash_gate_token(token: str) -> str:
@@ -6469,7 +6514,13 @@ def hash_gate_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def issue_gate_token(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+def issue_gate_token(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    action: str = "unblock",
+    board: Optional[str] = None,
+) -> Optional[str]:
     """Generate + persist (hashed) a fresh one-time unblock token.
 
     Only meaningful for a card that is currently ``blocked`` with
@@ -6487,12 +6538,18 @@ def issue_gate_token(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
         ).fetchone()
         if row is None or row["status"] != "blocked" or not row["human_gate"]:
             return None
+        board_slug = _normalize_board_slug(board) or get_current_board()
         conn.execute(
-            "UPDATE tasks SET gate_token_hash = ?, gate_token_issued_at = ? WHERE id = ?",
-            (hash_gate_token(token), now, task_id),
+            "UPDATE tasks SET gate_token_hash = ?, gate_token_issued_at = ?, "
+            "gate_token_board = ?, gate_token_task_id = ?, gate_token_action = ?, "
+            "gate_failed_attempts = 0, gate_failure_window_started_at = NULL, "
+            "gate_locked_until = NULL WHERE id = ?",
+            (hash_gate_token(token), now, board_slug, task_id, action, task_id),
         )
-        # Audit-visible that a token was (re)issued, never what it is.
-        _append_event(conn, task_id, "gate_token_issued", {"issued_at": now})
+        # Audit-visible grant context, never the token itself.
+        _append_event(conn, task_id, "gate_token_issued", {
+            "issued_at": now, "board": board_slug, "action": action,
+        })
     return token
 
 
@@ -6582,7 +6639,7 @@ def issue_and_notify_gate_token(
     persisted with nobody holding the plaintext. Rescue path in both
     cases: ``hermes kanban gate <id> off`` (interactive CLI only).
     """
-    token = issue_gate_token(conn, task_id)
+    token = issue_gate_token(conn, task_id, action="unblock", board=board)
     if token is None:
         return False
     delivered = send_gate_token_ntfy(task_id, token, board=board)
@@ -6619,7 +6676,10 @@ def set_human_gate(
         else:
             conn.execute(
                 "UPDATE tasks SET human_gate = 0, gate_token_hash = NULL, "
-                "gate_token_issued_at = NULL WHERE id = ?",
+                "gate_token_issued_at = NULL, gate_token_board = NULL, "
+                "gate_token_task_id = NULL, gate_token_action = NULL, "
+                "gate_failed_attempts = 0, gate_failure_window_started_at = NULL, "
+                "gate_locked_until = NULL WHERE id = ?",
                 (task_id,),
             )
         _append_event(conn, task_id, "gate_set", {"on": bool(on), "actor": actor})
@@ -6661,12 +6721,34 @@ def _assert_human_gate_open(
     invalidate a token a legitimate holder still has.
     """
     row = conn.execute(
-        "SELECT human_gate, gate_token_hash, gate_token_issued_at FROM tasks "
-        "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+        "SELECT human_gate, gate_token_hash, gate_token_issued_at, "
+        "gate_token_board, gate_token_task_id, gate_token_action, "
+        "gate_failed_attempts, gate_failure_window_started_at, gate_locked_until "
+        "FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
         (task_id,),
     ).fetchone()
     if row is None or not row["human_gate"]:
         return False
+
+    now = int(time.time())
+    cfg = _human_gate_config()
+    locked_until = int(row["gate_locked_until"] or 0)
+    if locked_until > now:
+        raise GateTokenError(f"{task_id} human-gate is temporarily locked")
+    if locked_until:
+        # A completed lockout opens a fresh attempt window rather than
+        # immediately re-locking on the next typo from the old window.
+        conn.execute(
+            "UPDATE tasks SET gate_failed_attempts = 0, "
+            "gate_failure_window_started_at = NULL, gate_locked_until = NULL "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        row = dict(row)
+        row["gate_failed_attempts"] = 0
+        row["gate_failure_window_started_at"] = None
+        row["gate_locked_until"] = None
+
     stored_hash = row["gate_token_hash"]
     if not stored_hash:
         raise GateTokenError(
@@ -6674,32 +6756,58 @@ def _assert_human_gate_open(
             "(or the ntfy push failed) — wait for the push, or run "
             f"`hermes kanban gate {task_id} off` to release it"
         )
-    try:
-        from hermes_cli.config import load_config
 
-        gate_cfg = (load_config().get("kanban") or {}).get("human_gate") or {}
-        ttl = max(30, min(int(gate_cfg.get("token_ttl_seconds", 600)), 3600))
-    except (TypeError, ValueError, AttributeError):
-        ttl = 600
+    # A scoped board is the caller's explicit routing context.  Use it even
+    # when the corresponding board directory is not visible through this
+    # connection: falling back to ``default`` here would turn a malformed or
+    # stale cross-board call into a valid grant replay.
+    scoped_board = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    current_board = _normalize_board_slug(scoped_board) if scoped_board else get_current_board()
+    failure_reason = None
     issued_at = row["gate_token_issued_at"]
-    if not issued_at or int(time.time()) - int(issued_at) > ttl:
-        _log.warning(
-            "human_gate token expired task=%s action=%s board=%s",
-            task_id, action, get_current_board(),
+    if not issued_at or now - int(issued_at) > cfg["token_ttl_seconds"]:
+        failure_reason = "token has expired"
+    elif row["gate_token_board"] != current_board:
+        failure_reason = "token was issued for a different board"
+    elif row["gate_token_task_id"] != task_id:
+        failure_reason = "token was issued for a different task"
+    elif row["gate_token_action"] != action:
+        failure_reason = "token was issued for a different action"
+    elif not token or not hmac.compare_digest(hash_gate_token(token), stored_hash):
+        failure_reason = "token was rejected"
+
+    if failure_reason:
+        window_start = int(row["gate_failure_window_started_at"] or 0)
+        attempts = int(row["gate_failed_attempts"] or 0)
+        if not window_start or now - window_start > cfg["failure_window_seconds"]:
+            window_start, attempts = now, 0
+        attempts += 1
+        new_locked_until = (
+            now + cfg["lockout_seconds"]
+            if attempts >= cfg["max_failed_attempts"] else None
         )
-        raise GateTokenError(f"{task_id} human-gate token has expired")
-    if not token or not hmac.compare_digest(hash_gate_token(token), stored_hash):
+        conn.execute(
+            "UPDATE tasks SET gate_failed_attempts = ?, "
+            "gate_failure_window_started_at = ?, gate_locked_until = ? WHERE id = ?",
+            (attempts, window_start, new_locked_until, task_id),
+        )
+        _append_event(conn, task_id, "gate_token_rejected", {
+            "action": action, "board": current_board,
+            "reason": failure_reason, "locked_until": new_locked_until,
+        })
         _log.warning(
-            "human_gate token rejected task=%s action=%s board=%s",
-            task_id, action, get_current_board(),
+            "human_gate grant rejected task=%s action=%s board=%s reason=%s",
+            task_id, action, current_board, failure_reason,
         )
         raise GateTokenError(
-            f"{task_id} is human-gated: the correct one-time token "
-            f"(delivered via ntfy) is required to {action} it"
+            f"{task_id} is human-gated: {failure_reason}", persist_failure=True
         )
+
     conn.execute(
-        "UPDATE tasks SET gate_token_hash = NULL, gate_token_issued_at = NULL "
-        "WHERE id = ?",
+        "UPDATE tasks SET gate_token_hash = NULL, gate_token_issued_at = NULL, "
+        "gate_token_board = NULL, gate_token_task_id = NULL, gate_token_action = NULL, "
+        "gate_failed_attempts = 0, gate_failure_window_started_at = NULL, "
+        "gate_locked_until = NULL WHERE id = ?",
         (task_id,),
     )
     return True

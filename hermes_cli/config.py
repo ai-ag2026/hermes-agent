@@ -1498,6 +1498,8 @@ DEFAULT_CONFIG = {
         "human_gate": {
             "token_ttl_seconds": 600,
             "max_failed_attempts": 5,
+            "failure_window_seconds": 300,
+            "lockout_seconds": 300,
         },
     },
 

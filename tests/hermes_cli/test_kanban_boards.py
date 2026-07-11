@@ -508,6 +508,45 @@ class TestWorkerSpawnEnv:
         env = self._spawn_capture_env(fresh_home, monkeypatch, effort=None)
         assert "HERMES_REASONING_EFFORT" not in env
 
+    def test_dispatch_once_scrubs_inherited_task_env(self, fresh_home, monkeypatch):
+        captured = {}
+        profile_home = fresh_home / "profiles" / "teknium"
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text("toolsets: [kanban]\n", encoding="utf-8")
+
+        class FakeProc:
+            pid = 123
+
+        def fake_popen(_cmd, *args, **kwargs):
+            captured["env"] = kwargs["env"]
+            return FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda _home: [])
+        for key, value in {
+            "HERMES_KANBAN_TASK": "parent",
+            "HERMES_KANBAN_RUN_ID": "999",
+            "HERMES_KANBAN_GOAL_MODE": "1",
+            "HERMES_KANBAN_RESUME": "1",
+            "HERMES_REASONING_EFFORT": "high",
+            "HERMES_TENANT": "old",
+            "TERMINAL_CWD": "/old",
+        }.items():
+            monkeypatch.setenv(key, value)
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="child", assignee="teknium")
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+            result = kb.dispatch_once(conn, board="default", max_spawn=1)
+        assert [item[0] for item in result.spawned] == [tid]
+        env = captured["env"]
+        assert env["HERMES_KANBAN_TASK"] == tid
+        assert "HERMES_KANBAN_GOAL_MODE" not in env
+        assert "HERMES_KANBAN_RESUME" not in env
+        assert "HERMES_REASONING_EFFORT" not in env
+        assert "HERMES_TENANT" not in env
+        assert env["TERMINAL_CWD"] == env["HERMES_KANBAN_WORKSPACE"]
+        assert env["TERMINAL_CWD"] != "/old"
+
 
 # ---------------------------------------------------------------------------
 # CLI surface
