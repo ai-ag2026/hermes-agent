@@ -8239,6 +8239,12 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    self_modify_gated: list[tuple[str, str]] = field(default_factory=list)
+    """Ready tasks routed to blocked+human_gate by the self-modification
+    governance gate, as ``(task_id, reason)`` pairs. The card would change
+    how Hermes itself runs (config/profiles/systemd/agent code/plugins/skills)
+    and must be human-approved before it can be dispatched. See
+    ``classify_self_modification`` / ``kanban.self_modify_gate``."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -9522,6 +9528,99 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+# ---------------------------------------------------------------------------
+# Self-modification governance gate (bounded autonomy)
+# ---------------------------------------------------------------------------
+# A card whose work would change how Hermes *itself* runs — its live config,
+# worker profiles, systemd units, agent code, or runtime plugins/skills — must
+# not be dispatched to an autonomous worker without a human approving that
+# specific change first. This is the constitutional limit that keeps the
+# board's autonomy from turning on the board itself (the 2026-07-11 nightly
+# self-containerization). It reuses Human-Gate v1: a matching ready card is
+# routed to blocked+human_gate, surfaces in the cockpit/Telegram with a plain-
+# language reason, and dispatches only after a human taps approve. Work on the
+# operator's own projects / client repos / docs is NOT gated — even when it
+# writes code. The line is "does it change the Hermes runtime?", not "does it
+# write code?".
+
+_SELF_MODIFY_DEFAULT_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"\.hermes/config\.yaml", "live config.yaml"),
+    (r"(^|[\s`'\"])config\.yaml\b.{0,40}(profile|gateway|hermes|toolset)", "config.yaml"),
+    (r"\.hermes/\.env\b", "runtime .env"),
+    (r"profiles?/[\w.-]+/(config\.yaml|soul)|\bworker[ -]?profiles?\b", "worker profile"),
+    (r"\bsystemctl\b|\bsystemd\b|hermes-[\w-]+\.service", "systemd unit"),
+    (r"\bhermes-agent\b", "hermes-agent runtime/code"),
+    (r"\.hermes/plugins/|\bplugins/tars-|\btars-config-guard\b|\btars-workflow\b", "runtime plugin"),
+    (r"\.hermes/skills/", "runtime skill"),
+    (r"\bagent-hooks\b", "agent hook"),
+    (r"\bdisabled_toolsets\b|\bdocker_image\b|containeriz|docker_mount_|worker[ -]containment", "worker containment/toolset"),
+    (r"restart\b.{0,20}\b(gateway|webui)\b|\b(gateway|webui)\b.{0,15}\brestart", "gateway/webui restart"),
+    (r"\.hermes/kanban\.db\b|\bkanban_db\b|\bdispatch(er|_once)\b", "kanban runtime"),
+    (r"config-guard", "config guard"),
+)
+
+
+def _self_modify_gate_enabled() -> bool:
+    """Whether the self-modification human gate is active. ``kanban.self_modify_gate``
+    in config, default True. Fails closed (gate on) when config can't be read."""
+    try:
+        return bool((load_config().get("kanban") or {}).get("self_modify_gate", True))
+    except Exception:
+        return True
+
+
+def _self_modify_patterns() -> list[tuple[Any, str]]:
+    """Compiled default patterns plus any operator additions from
+    ``kanban.self_modify_patterns`` (list of regex strings)."""
+    compiled: list[tuple[Any, str]] = [
+        (re.compile(rx, re.IGNORECASE), label) for rx, label in _SELF_MODIFY_DEFAULT_PATTERNS
+    ]
+    try:
+        extra = (load_config().get("kanban") or {}).get("self_modify_patterns") or []
+        for item in extra:
+            if isinstance(item, str) and item.strip():
+                try:
+                    compiled.append((re.compile(item, re.IGNORECASE), "custom pattern"))
+                except re.error:
+                    pass
+    except Exception:
+        pass
+    return compiled
+
+
+def classify_self_modification(task) -> Optional[str]:
+    """Return a short reason label if *task* would modify the Hermes runtime,
+    else None.
+
+    Scans the card's title + body, and treats a worktree/dir card whose repo
+    is the agent runtime as self-modifying regardless of prose. Content-based
+    and fail-OPEN on error (returns None): the only consumer adds a human
+    approval step, so a miss degrades to the prior behavior, never a crash.
+    High-precision by design — patterns target runtime surfaces (``config.yaml``
+    under ``~/.hermes``, worker profiles, systemd, ``hermes-agent``, runtime
+    plugins/skills, agent hooks, containment), so ordinary project/client work
+    does not match. False positives cost one approval tap; false negatives cost
+    an unreviewed runtime change, so the bias is deliberately toward gating."""
+    try:
+        wp = getattr(task, "workspace_path", None)
+        if wp and re.search(r"hermes-agent(\b|/)", str(wp), re.IGNORECASE):
+            return "hermes-agent worktree"
+        parts = []
+        if getattr(task, "title", None):
+            parts.append(str(task.title))
+        if getattr(task, "body", None):
+            parts.append(str(task.body))
+        haystack = "\n".join(parts)
+        if not haystack.strip():
+            return None
+        for rx, label in _self_modify_patterns():
+            if rx.search(haystack):
+                return label
+    except Exception:
+        return None
+    return None
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -10091,6 +10190,38 @@ def _dispatch_once_locked(
                         ):
                             result.auto_blocked.append(row["id"])
             continue
+        # Self-modification governance gate (bounded autonomy): a ready card
+        # that would change how Hermes itself runs is routed to blocked+
+        # human_gate so a human approves before it can be dispatched. A ready
+        # card already carrying human_gate=1 has passed the gate — it could
+        # only have reached 'ready' via a token-authorized unblock — so it
+        # falls through and dispatches normally (approve-once-per-card).
+        # Reuses Human-Gate v1: the block surfaces in the cockpit / Telegram
+        # with the plain-language reason and a one-tap approve.
+        if not dry_run and _self_modify_gate_enabled():
+            _sm_task = get_task(conn, row["id"])
+            if _sm_task is not None and not getattr(_sm_task, "human_gate", 0):
+                _sm_reason = classify_self_modification(_sm_task)
+                if _sm_reason:
+                    if block_task(
+                        conn,
+                        row["id"],
+                        reason="self-modification gate: " + _sm_reason,
+                        kind="needs_input",
+                        human_gate=True,
+                        human_summary=(
+                            "Diese Karte will an Hermes selbst etwas ändern ("
+                            + _sm_reason + "). Autonome Ausführung ist gesperrt, "
+                            "bis du sie freigibst."
+                        ),
+                        human_action=(
+                            "Prüfe die Karte; tippe im Cockpit auf „Gate & weiter“ "
+                            "(oder den Telegram-Gate-Button), wenn diese "
+                            "Laufzeit-Änderung gewollt ist."
+                        ),
+                    ):
+                        result.self_modify_gated.append((row["id"], _sm_reason))
+                    continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
