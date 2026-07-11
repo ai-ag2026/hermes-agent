@@ -3578,6 +3578,14 @@ def test_resolve_hermes_argv_hermes_bin_bare_name_uses_path(monkeypatch, tmp_pat
     path_hermes.parent.mkdir()
     path_hermes.write_text("right\n", encoding="utf-8")
     path_hermes.chmod(path_hermes.stat().st_mode | stat.S_IXUSR)
+    real_access = os.access
+    monkeypatch.setattr(
+        os,
+        "access",
+        lambda path, mode: (
+            True if os.path.abspath(path) == str(path_hermes) and mode == os.X_OK else real_access(path, mode)
+        ),
+    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PATH", str(path_hermes.parent))
     monkeypatch.setenv("HERMES_BIN", "hermes")
