@@ -599,6 +599,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
     p_block.add_argument(
+        "--human-summary", default=None,
+        help=(
+            "Laien-Zusammenfassung (1-3 Sätze, keine Pfade/IDs) — wird vom "
+            "Telegram-Relay statt des technischen Grunds vorangestellt. "
+            "Für Worker-Tools Pflicht; im CLI optional."
+        ),
+    )
+    p_block.add_argument(
+        "--human-action", default=None,
+        help=(
+            "Ein Satz: was der Operator konkret tun soll. Für Worker-Tools "
+            "Pflicht; im CLI optional."
+        ),
+    )
+    p_block.add_argument(
         "--human-gate", action="store_true",
         help=(
             "Hard-gate this card: unblocking it requires a one-time token "
@@ -2141,6 +2156,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 kind=kind,
                 expected_run_id=_worker_run_id_for(tid),
                 human_gate=human_gate,
+                human_summary=getattr(args, "human_summary", None),
+                human_action=getattr(args, "human_action", None),
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)

@@ -6841,6 +6841,8 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     human_gate: Optional[bool] = None,
+    human_summary: Optional[str] = None,
+    human_action: Optional[str] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6874,6 +6876,14 @@ def block_task(
     Meaningless (ignored) for the ``dependency`` and loop-breaker
     ``triage`` routes, which never sit in ``blocked`` for a human.
 
+    ``human_summary`` / ``human_action`` (optional) are the layman-facing
+    counterpart to the technical ``reason``: 1–3 plain-language sentences on
+    what went wrong and what the operator should do. They are stored verbatim
+    in the block event payload so notification relays (Telegram/ntfy) can
+    lead with them instead of the technical reason. Enforcement that workers
+    supply them lives in the ``kanban_block`` tool handler, not here — the
+    kernel accepts blocks without them (CLI/legacy callers).
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -6881,6 +6891,13 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+
+    def _with_human_fields(payload: dict) -> dict:
+        if human_summary and str(human_summary).strip():
+            payload["human_summary"] = str(human_summary).strip()
+        if human_action and str(human_action).strip():
+            payload["human_action"] = str(human_action).strip()
+        return payload
 
     # Dependency waits are a complete transition of their own. Keep the hook
     # outside ``write_txn`` so subscribers can only observe committed state.
@@ -6918,7 +6935,7 @@ def block_task(
                 conn,
                 task_id,
                 "dependency_wait",
-                {"reason": reason, "kind": kind},
+                _with_human_fields({"reason": reason, "kind": kind}),
                 run_id=run_id,
             )
             blocked_task = get_task(conn, task_id)
@@ -6989,12 +7006,12 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "block_loop_detected",
-                {
+                _with_human_fields({
                     "reason": reason,
                     "kind": kind,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
-                },
+                }),
                 run_id=run_id,
             )
             routed_to = "triage"
@@ -7053,7 +7070,9 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                _with_human_fields(
+                    {"reason": reason, "kind": kind, "recurrences": recurrences}
+                ),
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)

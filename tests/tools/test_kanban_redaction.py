@@ -120,16 +120,27 @@ def test_kanban_block_reason_scrubbed_jwt(worker_env):
         ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
         ".dozjgNryP4J3jVmNHl0w5N_5NjP1-iXkpHgcth826Iw"
     )
-    kt._handle_block({"reason": f"Bearer {jwt}"})
+    out = kt._handle_block({
+        "reason": f"Bearer {jwt}",
+        "human_summary": f"Zugang klemmt, Token Bearer {jwt} abgelaufen.",
+        "human_action": "Bitte neuen Zugang bereitstellen.",
+    })
+    assert json.loads(out).get("ok") is True
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, worker_env)
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' "
+            "ORDER BY id DESC LIMIT 1", (worker_env,),
+        ).fetchone()
     finally:
         conn.close()
     # block_task stores reason as run.summary
     assert run is not None
     stored = run.summary or ""
     assert jwt not in stored
+    # human_summary is pushed to Telegram — must be scrubbed as well
+    assert jwt not in (ev[0] or "")
 
 
 # ---------------------------------------------------------------------------

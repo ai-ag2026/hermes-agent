@@ -962,6 +962,28 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    # Layman-notification contract (2026-07-11): every block that surfaces
+    # to a human MUST carry a plain-language summary + concrete operator
+    # action. The Telegram relay leads with these; the technical ``reason``
+    # stays on the board. 'dependency' never reaches a human, so it is
+    # exempt. Enforced here (worker tool surface) and deliberately NOT in
+    # the kernel/CLI, so human operators can still block without ceremony.
+    human_summary = str(args.get("human_summary") or "").strip()
+    human_action = str(args.get("human_action") or "").strip()
+    if kind != "dependency" and (not human_summary or not human_action):
+        return tool_error(
+            "human_summary und human_action sind Pflicht (außer bei "
+            "kind='dependency'): human_summary = 1-3 deutsche Sätze in "
+            "Alltagssprache OHNE Pfade/IDs/Fachbegriffe, was das Problem "
+            "ist; human_action = ein Satz, was der Operator konkret tun "
+            "soll. Rufe kanban_block erneut mit beiden Feldern auf."
+        )
+    human_summary = (
+        redact_sensitive_text(human_summary, force=True) if human_summary else None
+    )
+    human_action = (
+        redact_sensitive_text(human_action, force=True) if human_action else None
+    )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1000,6 +1022,8 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                human_summary=human_summary,
+                human_action=human_action,
             )
             if not ok:
                 return tool_error(
@@ -1711,6 +1735,28 @@ KANBAN_BLOCK_SCHEMA = {
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "human_summary": {
+                "type": "string",
+                "description": (
+                    "REQUIRED unless kind='dependency'. 1-3 kurze deutsche "
+                    "Sätze für einen Nicht-Techniker: Was ist das Problem, "
+                    "in Alltagssprache? KEINE Pfade, IDs, Stacktraces oder "
+                    "Fachbegriffe — die stehen schon in ``reason``. Diese "
+                    "Zusammenfassung wird dem Operator per Telegram "
+                    "gepusht."
+                ),
+            },
+            "human_action": {
+                "type": "string",
+                "description": (
+                    "REQUIRED unless kind='dependency'. Ein Satz: Was soll "
+                    "der Operator (Manfred) jetzt konkret tun? Z.B. eine "
+                    "Entscheidung treffen, einen Zugang freischalten, eine "
+                    "Datei bereitstellen. Wenn er nichts tun kann/muss, "
+                    "schreibe das explizit (dann ist kanban_block aber "
+                    "vermutlich das falsche Werkzeug)."
                 ),
             },
             "board": _board_schema_prop(),

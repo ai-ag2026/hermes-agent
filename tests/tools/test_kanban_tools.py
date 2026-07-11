@@ -790,13 +790,60 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
 
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({
+        "reason": "need clarification",
+        "human_summary": "Mir fehlt eine Entscheidung, wie es weitergehen soll.",
+        "human_action": "Bitte kurz entscheiden und die Karte entsperren.",
+    })
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
         assert kb.get_task(conn, worker_env).status == "blocked"
+        # Layman-notification contract: both fields must land verbatim in the
+        # blocked event payload — that's where the Telegram relay reads them.
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' "
+            "ORDER BY id DESC LIMIT 1", (worker_env,),
+        ).fetchone()
+        payload = json.loads(ev[0])
+        assert payload["human_summary"].startswith("Mir fehlt")
+        assert payload["human_action"].startswith("Bitte kurz")
+    finally:
+        conn.close()
+
+
+def test_block_requires_human_fields_for_human_facing_kinds(worker_env):
+    """Blocks that surface to a human must carry the layman summary+action;
+    without them the tool errors and the task stays untouched (2026-07-11
+    layman-notification contract)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    for args in (
+        {"reason": "stuck"},
+        {"reason": "stuck", "kind": "needs_input"},
+        {"reason": "stuck", "kind": "needs_input", "human_summary": "Nur Summary."},
+        {"reason": "stuck", "kind": "needs_input", "human_action": "Nur Action."},
+    ):
+        d = json.loads(kt._handle_block(args))
+        assert "human_summary" in d.get("error", ""), args
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_dependency_kind_exempt_from_human_fields(worker_env):
+    """kind='dependency' never reaches a human — no layman fields needed."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_block({"reason": "waiting on t_x", "kind": "dependency"})
+    assert json.loads(out).get("ok") is True
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "todo"
     finally:
         conn.close()
 
@@ -844,7 +891,9 @@ def test_block_goal_mode_rejects_missing_kind(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
-    out = kt._handle_block({"reason": "giving up"})
+    out = kt._handle_block({"reason": "giving up",
+                        "human_summary": "Ich komme nicht weiter.",
+                        "human_action": "Bitte entscheiden."})
     d = json.loads(out)
     assert "error" in d
     assert "goal_mode" in d["error"]
@@ -864,7 +913,9 @@ def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
     for kind in ("capability", "transient"):
-        out = kt._handle_block({"reason": "blocked", "kind": kind})
+        out = kt._handle_block({"reason": "blocked", "kind": kind,
+                        "human_summary": "Ich komme nicht weiter.",
+                        "human_action": "Bitte entscheiden."})
         d = json.loads(out)
         assert "error" in d, f"kind={kind} should be rejected for goal_mode"
 
@@ -903,7 +954,9 @@ def test_block_goal_mode_allows_needs_input_kind(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
-    out = kt._handle_block({"reason": "need a decision from the user", "kind": "needs_input"})
+    out = kt._handle_block({"reason": "need a decision from the user", "kind": "needs_input",
+                        "human_summary": "Ich brauche eine Entscheidung von dir.",
+                        "human_action": "Bitte Frage beantworten und entsperren."})
     d = json.loads(out)
     assert d.get("ok") is True
 
@@ -915,10 +968,12 @@ def test_block_goal_mode_allows_needs_input_kind(monkeypatch, tmp_path):
 
 
 def test_block_non_goal_mode_task_unaffected_by_new_gate(worker_env):
-    """The new gate only applies to goal_mode tasks — plain tasks must keep
-    blocking freely with no kind, exactly as before this fix."""
+    """The goal-mode kind gate only applies to goal_mode tasks — plain tasks
+    may still block with no kind (they do need the layman fields)."""
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({"reason": "need clarification",
+                            "human_summary": "Mir fehlt eine Info.",
+                            "human_action": "Bitte kurz antworten."})
     assert json.loads(out).get("ok") is True
 
 
@@ -2169,6 +2224,8 @@ def test_board_param_routes_block_to_alt_board(multi_board_env):
         "task_id": alt_seed,
         "reason": "need input on alt board",
         "board": "alt",
+        "human_summary": "Mir fehlt eine Info auf dem Alt-Board.",
+        "human_action": "Bitte kurz antworten.",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -2612,7 +2669,8 @@ def test_unblock_tool_passes_token_through_but_cannot_set_gate(monkeypatch, work
         other = kb.create_task(conn, title="other task", assignee="test-worker")
     finally:
         conn.close()
-    out3 = kt._handle_block({"task_id": other, "reason": "x", "human_gate": True})
+    out3 = kt._handle_block({"task_id": other, "reason": "x", "human_gate": True,
+                         "human_summary": "Testfall.", "human_action": "Nichts."})
     assert json.loads(out3).get("ok") is True
     conn = kb.connect()
     try:
