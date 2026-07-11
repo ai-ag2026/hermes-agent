@@ -77,8 +77,8 @@ def _build_codex_gpt5_autoraise_notice(autoraise: Dict[str, Any]) -> str:
     include the exact opt-back-out command.
     """
     model = str(autoraise.get("model") or "gpt-5.4/5.5").strip().lower().rsplit("/", 1)[-1]
-    # gpt-5.3-codex-spark has a native 128K window; the gpt-5.4/5.5 family is
-    # capped at 272K by the Codex OAuth backend.
+    # gpt-5.3-codex-spark has a native 128K window; the gpt-5.4/5.5/5.6 family
+    # is capped at 272K by the Codex OAuth backend.
     cap = "128K" if model.startswith("gpt-5.3-codex-spark") else "272K"
     from_pct = int(round(autoraise["from"] * 100))
     to_pct = int(round(autoraise["to"] * 100))
@@ -302,6 +302,7 @@ def init_agent(
     notice_callback: callable = None,
     notice_clear_callback: callable = None,
     event_callback: Optional[Callable[[str, dict], None]] = None,
+    reaction_callback: Optional[Callable[[str], None]] = None,
     max_tokens: int = None,
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
@@ -535,6 +536,7 @@ def init_agent(
     agent.notice_callback = notice_callback
     agent.notice_clear_callback = notice_clear_callback
     agent.event_callback = event_callback
+    agent.reaction_callback = reaction_callback
     agent.tool_gen_callback = tool_gen_callback
 
     
@@ -1570,6 +1572,16 @@ def init_agent(
     compression_in_place = is_truthy_value(
         _compression_cfg.get("in_place"), default=False
     )
+    codex_app_server_auto_compaction = str(
+        _compression_cfg.get("codex_app_server_auto", "native") or "native"
+    ).lower()
+    if codex_app_server_auto_compaction not in {"native", "hermes", "off"}:
+        _ra().logger.warning(
+            "Invalid compression.codex_app_server_auto=%r; using 'native'. "
+            "Valid values are: native, hermes, off.",
+            codex_app_server_auto_compaction,
+        )
+        codex_app_server_auto_compaction = "native"
 
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
@@ -1824,6 +1836,7 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
+    agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
 
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).
