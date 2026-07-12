@@ -7461,6 +7461,105 @@ def _migrate_pending_action_lifecycle(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_action_fingerprint ON task_pending_actions(fingerprint, state)")
 
 
+def _pending_action_after_persist_hook() -> None:
+    """Private no-op fault-injection seam for transaction rollback tests."""
+
+
+def record_pending_action_and_block(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    command: str,
+    summary: str,
+    profile: str,
+    workspace: str,
+    expires_at: int,
+) -> dict[str, Any]:
+    """Atomically persist one exact action and park its running origin."""
+    now = int(time.time())
+    profile = (profile or "").strip()
+    workspace = str(Path(workspace).resolve()) if workspace else ""
+    if run_id is None or not profile or not workspace:
+        raise ValueError("exact action requires run_id, profile, and workspace")
+    if int(expires_at) <= now:
+        raise ValueError("pending action expiry must be in the future")
+    command_hash = _pending_action_hash(command)
+    mutation_kind = _pending_action_mutation_kind(command)
+    fingerprint = _pending_action_fingerprint(
+        board_identity=_pending_action_board_identity(conn), task_id=task_id, run_id=run_id,
+        command_hash=command_hash, mutation_kind=mutation_kind, profile=profile, workspace=workspace,
+    )
+    result: dict[str, Any]
+    hook_assignee: Optional[str] = None
+    with write_txn(conn):
+        # Read-only classification comes first: rejected stale origins must not
+        # even materialize another task's expiries. A settled retry is likewise
+        # returned without projection/version/event drift.
+        task = conn.execute("SELECT status, current_run_id, assignee FROM tasks WHERE id=?", (task_id,)).fetchone()
+        run = conn.execute("SELECT task_id, status, ended_at, profile FROM task_runs WHERE id=?", (int(run_id),)).fetchone()
+        existing = conn.execute(
+            "SELECT * FROM task_pending_actions WHERE task_id=? AND run_id=? AND state IN ('pending','approved') ORDER BY id DESC LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
+        reused = existing is not None and str(existing["fingerprint"] or "") == fingerprint
+        settled_retry = (reused and task is not None and task["status"] == "blocked"
+                         and task["current_run_id"] is None and run is not None
+                         and run["task_id"] == task_id and run["status"] == "blocked"
+                         and run["ended_at"] is not None and run["profile"] == profile)
+        fresh_origin = (task is not None and task["status"] == "running"
+                        and task["current_run_id"] == int(run_id) and task["assignee"] == profile
+                        and run is not None and run["task_id"] == task_id and run["status"] == "running"
+                        and run["ended_at"] is None and run["profile"] == profile)
+        if settled_retry:
+            action = _pending_action_from_row(existing)
+            attention = conn.execute("SELECT id FROM task_attentions WHERE task_id=? AND action_id=? AND type='exact_action' ORDER BY id DESC LIMIT 1", (task_id, action.id)).fetchone()
+            result = {"action_id": action.id, "attention_id": int(attention["id"]), "attention_status": action.state, "reused": True}
+        else:
+            if not fresh_origin:
+                raise ValueError("pending approval origin run is stale or mismatched")
+            _materialize_expired_actions(conn, now)
+            existing = conn.execute(
+                "SELECT * FROM task_pending_actions WHERE task_id=? AND run_id=? AND state IN ('pending','approved') ORDER BY id DESC LIMIT 1",
+                (task_id, int(run_id)),
+            ).fetchone()
+            reused = existing is not None and str(existing["fingerprint"] or "") == fingerprint
+            if existing is not None and not reused:
+                raise ValueError("origin run already has a different active exact action")
+            if reused:
+                action = _pending_action_from_row(existing)
+            else:
+                cur = conn.execute(
+                    "INSERT INTO task_pending_actions (task_id, run_id, command_hash, fingerprint, mutation_kind, summary, profile, workspace, created_at, expires_at, state, version, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?)",
+                    (task_id, int(run_id), command_hash, fingerprint, mutation_kind, PENDING_ACTION_OPERATOR_SUMMARY, profile, workspace, now, int(expires_at), now),
+                )
+                action = _pending_action_from_row(conn.execute("SELECT * FROM task_pending_actions WHERE id=?", (int(cur.lastrowid),)).fetchone())
+                _append_event(conn, task_id, "terminal_approval_pending", {"action_id": action.id, "mutation_kind": mutation_kind, "summary": PENDING_ACTION_OPERATOR_SUMMARY, "expires_at": int(expires_at)}, run_id=int(run_id))
+            _upsert_exact_action_attention(conn, action.id, task_id, fingerprint, now)
+            _pending_action_after_persist_hook()
+            if conn.execute(
+                "UPDATE tasks SET status='blocked', current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, block_kind='needs_input', block_recurrences=CASE WHEN block_kind='needs_input' THEN block_recurrences+1 ELSE 1 END WHERE id=? AND status='running' AND current_run_id=?",
+                (task_id, int(run_id)),
+            ).rowcount != 1:
+                raise RuntimeError("approval task transition lost ownership")
+            if conn.execute(
+                "UPDATE task_runs SET status='blocked', outcome='blocked', ended_at=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=? AND task_id=? AND status='running' AND ended_at IS NULL",
+                (now, int(run_id), task_id),
+            ).rowcount != 1:
+                raise RuntimeError("approval origin run transition lost ownership")
+            if not reused:
+                _append_event(conn, task_id, "blocked", {"kind": "needs_input", "reason": "terminal_approval_required", "action_id": action.id}, run_id=int(run_id))
+            attention = conn.execute("SELECT id FROM task_attentions WHERE task_id=? AND action_id=? AND type='exact_action' ORDER BY id DESC LIMIT 1", (task_id, action.id)).fetchone()
+            result = {"action_id": action.id, "attention_id": int(attention["id"]), "attention_status": action.state, "reused": reused}
+            hook_assignee = str(task["assignee"])
+    if hook_assignee is not None:
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked", task_id, board=get_current_board(), assignee=hook_assignee,
+            run_id=int(run_id), reason="terminal_approval_required",
+        )
+    return result
+
+
 def record_pending_action(
     conn: sqlite3.Connection,
     *,

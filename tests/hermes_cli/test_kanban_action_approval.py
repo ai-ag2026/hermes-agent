@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -34,6 +35,16 @@ def _create_running_task(monkeypatch: pytest.MonkeyPatch) -> str:
         monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
         return task_id
+
+
+def _atomic_snapshot(conn, task_id: str, run_id: int) -> dict[str, list[tuple]]:
+    return {
+        "task": [tuple(row) for row in conn.execute("SELECT status, current_run_id, claim_lock, claim_expires, worker_pid, block_kind, block_recurrences FROM tasks WHERE id=?", (task_id,))],
+        "run": [tuple(row) for row in conn.execute("SELECT status, outcome, ended_at, claim_lock, claim_expires, worker_pid FROM task_runs WHERE id=?", (run_id,))],
+        "actions": [tuple(row) for row in conn.execute("SELECT * FROM task_pending_actions WHERE task_id=? ORDER BY id", (task_id,))],
+        "attentions": [tuple(row) for row in conn.execute("SELECT * FROM task_attentions WHERE task_id=? ORDER BY id", (task_id,))],
+        "events": [tuple(row) for row in conn.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task_id,))],
+    }
 
 
 def test_exact_action_hash_preserves_raw_unicode_and_newline_bytes() -> None:
@@ -263,11 +274,7 @@ def test_terminal_guard_round_trip_records_and_consumes_exact_action(
         action = kb.get_pending_action(conn, task_id)
         assert action is not None
         task = kb.get_task(conn, task_id)
-        assert task is not None
-        assert kb.block_task(
-            conn, task_id, kind="needs_input", reason="terminal approval required",
-            expected_run_id=task.current_run_id,
-        )
+        assert task is not None and task.status == "blocked" and task.current_run_id is None
         assert kb.approve_pending_action_and_unblock(conn, task_id, action.id)
 
     with kb.connect() as conn:
@@ -799,15 +806,136 @@ def test_terminal_pending_action_atomically_ends_run_blocks_and_surfaces_one_att
         assert task is not None and task.status == "blocked"
         assert task.current_run_id is None
         run = kb.latest_run(conn, task_id)
-        assert run is not None and run.outcome == "blocked"
+        assert run is not None and run.status == run.outcome == "blocked" and run.ended_at is not None
+        assert (task.claim_lock, task.claim_expires, task.worker_pid) == (None, None, None)
+        assert (run.claim_lock, run.claim_expires, run.worker_pid) == (None, None, None)
         assert conn.execute(
-            "SELECT COUNT(*) FROM task_pending_actions WHERE task_id=? "
+            "SELECT COUNT(*) FROM task_pending_actions WHERE task_id=? AND state='pending' "
             "AND consumed_at IS NULL AND cancelled_at IS NULL", (task_id,),
         ).fetchone()[0] == 1
-        assert len([
-            event for event in kb.list_events(conn, task_id=task_id)
-            if event.kind == "terminal_approval_pending"
-        ]) == 1
+        attention_rows = conn.execute(
+            "SELECT action_id FROM task_attentions WHERE task_id=? AND type='exact_action'", (task_id,),
+        ).fetchall()
+        assert len(attention_rows) == 1
+        events = kb.list_events(conn, task_id=task_id)
+        pending = [event for event in events if event.kind == "terminal_approval_pending"]
+        blocked = [event for event in events if event.kind == "blocked"]
+        assert len(pending) == len(blocked) == 1
+        assert pending[0].payload["action_id"] == blocked[0].payload["action_id"] == attention_rows[0]["action_id"]
+
+
+def test_atomic_pending_action_clears_claims_and_cannot_be_reclaimed_or_claimed(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        origin_run_id = task.current_run_id
+        # These fields are in-memory claim-spawn metadata. block_task does not
+        # clear them, so this equivalent terminal transition must not either.
+        task.worker_session_id = "worker-session-must-survive"
+        task.resume_requested = True
+        conn.execute(
+            "UPDATE tasks SET claim_lock=?, claim_expires=?, worker_pid=? WHERE id=?",
+            ("claimed-before-terminal-action", 1, 424242, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET claim_lock=?, claim_expires=?, worker_pid=? WHERE id=?",
+            ("claimed-before-terminal-action", 1, 424242, origin_run_id),
+        )
+        result = kb.record_pending_action_and_block(
+            conn, task_id=task_id, run_id=origin_run_id, command=command,
+            summary="untrusted", profile="backend-eng", workspace=str(isolated_board),
+            expires_at=2_000_000_000,
+        )
+        current, run = kb.get_task(conn, task_id), kb.latest_run(conn, task_id)
+        assert current is not None and current.status == "blocked" and current.current_run_id is None
+        assert (current.claim_lock, current.claim_expires, current.worker_pid) == (None, None, None)
+        assert run is not None and run.id == origin_run_id
+        assert run.status == run.outcome == "blocked" and run.ended_at is not None
+        assert (run.claim_lock, run.claim_expires, run.worker_pid) == (None, None, None)
+        assert task.worker_session_id == "worker-session-must-survive"
+        assert task.resume_requested is True
+        assert kb.claim_task(conn, task_id, claimer="bypass") is None
+        assert kb.recompute_ready(conn) == 0
+        assert kb.release_stale_claims(conn, signal_fn=lambda *_args, **_kwargs: None) == 0
+        final = kb.get_task(conn, task_id)
+        assert final is not None and final.status == "blocked" and final.current_run_id is None
+        assert kb.get_pending_action(conn, task_id) is not None
+        attention = kb.get_current_attention(conn, task_id, now=1_900_000_000)
+        assert attention is not None and attention.id == result["attention_id"]
+
+
+def test_atomic_guard_result_and_durable_payloads_are_redacted(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import approval
+
+    task_id = _create_running_task(monkeypatch)
+    raw_command = "git push --force-with-lease=refs/heads/topic:abcdef1 RAW_COMMAND_MARKER fork HEAD:topic"
+    profile_marker = "PROFILE_MARKER_UNIQUE"
+    workspace = isolated_board / "ABSOLUTE_WORKSPACE_MARKER"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_PROFILE", profile_marker)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (profile_marker, task_id))
+        conn.execute("UPDATE task_runs SET profile=? WHERE id=?", (profile_marker, task.current_run_id))
+    _configure_terminal_pending_guard(monkeypatch, raw_command)
+
+    result = approval.check_all_command_guards(raw_command, "local")
+    assert result["status"] == "pending_approval"
+    assert set(result["kanban_approval"]) == {"action_id", "attention_id", "attention_status", "reused"}
+    assert result["kanban_approval"]["attention_status"] == "pending"
+    with kb.connect() as conn:
+        action = kb.get_pending_action(conn, task_id)
+        attention = kb.get_current_attention(conn, task_id)
+        events = kb.list_events(conn, task_id=task_id)
+        assert action is not None and attention is not None
+        durable_public = json.dumps(
+            {
+                "kanban_approval": result["kanban_approval"],
+                "attention": repr(attention),
+                "events": [{"kind": event.kind, "payload": event.payload} for event in events],
+            },
+            sort_keys=True,
+        )
+        for secret in (raw_command, action.command_hash, action.fingerprint, profile_marker, str(workspace.resolve())):
+            assert secret not in durable_public
+        pending = next(event for event in events if event.kind == "terminal_approval_pending")
+        blocked = next(event for event in events if event.kind == "blocked")
+        assert set(pending.payload) == {"action_id", "mutation_kind", "summary", "expires_at"}
+        assert set(blocked.payload) == {"kind", "reason", "action_id"}
+
+
+def test_guard_persistence_failure_never_returns_pending_or_queues_request(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import approval
+
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    queued = Mock()
+    monkeypatch.setattr(approval, "submit_pending", queued)
+    monkeypatch.setattr(approval, "_record_kanban_pending_action", lambda *_args, **_kwargs: None)
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["status"] == "blocked"
+    assert result.get("approval_pending") is not True
+    queued.assert_not_called()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+        assert task is not None and task.status == "running" and task.current_run_id is not None
+        assert run is not None and run.status == "running" and run.ended_at is None
+        assert conn.execute("SELECT COUNT(*) FROM task_pending_actions WHERE task_id=?", (task_id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 0
+        assert not [event for event in kb.list_events(conn, task_id=task_id) if event.kind in {"terminal_approval_pending", "blocked"}]
 
 
 def test_guard_response_crash_boundary_leaves_actionable_blocked_operator_entity(
@@ -829,6 +957,154 @@ def test_guard_response_crash_boundary_leaves_actionable_blocked_operator_entity
             event.kind == "blocked" and (event.payload or {})["kind"] == "needs_input"
             for event in kb.list_events(conn, task_id=task_id)
         )
+
+
+def test_atomic_pending_action_wrong_current_run_is_complete_global_noop(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    monkeypatch.setattr(kb.time, "time", lambda: 1_000)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task and task.current_run_id
+        origin_run_id = task.current_run_id
+        other_task = kb.create_task(conn, title="foreign origin", assignee="backend-eng")
+        foreign = kb.claim_task(conn, other_task, claimer="foreign-worker")
+        assert foreign and foreign.current_run_id
+        expiry_task = kb.create_task(conn, title="independent expiry", assignee="backend-eng")
+        expired_origin = kb.claim_task(conn, expiry_task, claimer="expiry-worker")
+        assert expired_origin and expired_origin.current_run_id
+        expired_action = kb.record_pending_action(
+            conn, task_id=expiry_task, run_id=expired_origin.current_run_id,
+            command="git push --force-with-lease=refs/heads/expiry:abcdef1 fork HEAD:expiry",
+            summary="untrusted", profile="backend-eng", workspace=str(isolated_board), expires_at=1_001,
+        )
+        before = _atomic_snapshot(conn, task_id, origin_run_id)
+        expiry_before = _atomic_snapshot(conn, expiry_task, expired_origin.current_run_id)
+        materialize = Mock(wraps=kb._materialize_expired_actions)
+        hook = Mock()
+        monkeypatch.setattr(kb, "_materialize_expired_actions", materialize)
+        monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", hook)
+        monkeypatch.setattr(kb.time, "time", lambda: 1_002)
+        with pytest.raises(ValueError, match="stale"):
+            kb.record_pending_action_and_block(conn, task_id=task_id, run_id=foreign.current_run_id,
+                command="git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic", summary="untrusted", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        assert _atomic_snapshot(conn, task_id, origin_run_id) == before
+        assert _atomic_snapshot(conn, expiry_task, expired_origin.current_run_id) == expiry_before
+        assert conn.execute("SELECT * FROM task_pending_actions WHERE id=?", (expired_action.id,)).fetchone()["state"] == "pending"
+    materialize.assert_not_called()
+    hook.assert_not_called()
+
+
+def test_atomic_pending_action_fault_after_persist_rolls_back_everything(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    lifecycle = Mock()
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", lifecycle)
+    monkeypatch.setattr(kb, "_pending_action_after_persist_hook", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task and task.current_run_id
+        origin_run_id = task.current_run_id
+        before = _atomic_snapshot(conn, task_id, origin_run_id)
+        with pytest.raises(RuntimeError, match="boom"):
+            kb.record_pending_action_and_block(conn, task_id=task_id, run_id=origin_run_id,
+                command="git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic", summary="untrusted", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        assert _atomic_snapshot(conn, task_id, origin_run_id) == before
+    lifecycle.assert_not_called()
+
+
+def test_atomic_pending_action_identical_retry_reuses_ids_without_extra_events(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task and task.current_run_id
+        origin_run_id = task.current_run_id
+        first = kb.record_pending_action_and_block(conn, task_id=task_id, run_id=origin_run_id, command=command, summary="untrusted", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        before_retry = _atomic_snapshot(conn, task_id, origin_run_id)
+        second = kb.record_pending_action_and_block(conn, task_id=task_id, run_id=origin_run_id, command=command, summary="untrusted", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        assert second["action_id"] == first["action_id"] and second["attention_id"] == first["attention_id"]
+        assert first["reused"] is False and second["reused"] is True
+        assert _atomic_snapshot(conn, task_id, origin_run_id) == before_retry
+
+
+def test_atomic_pending_action_block_hook_fires_once_after_commit_and_retry_is_silent(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    observed: list[tuple[str, str, dict[str, object]]] = []
+
+    def capture(event: str, hooked_task_id: str, **fields: object) -> None:
+        with kb.connect() as observer:
+            task = kb.get_task(observer, hooked_task_id)
+            run = kb.latest_run(observer, hooked_task_id)
+            action = kb.get_pending_action(observer, hooked_task_id)
+            attention = kb.get_current_attention(observer, hooked_task_id, now=1_900_000_000)
+        assert task is not None and task.status == "blocked" and task.current_run_id is None
+        assert run is not None and run.status == run.outcome == "blocked" and run.ended_at is not None
+        assert action is not None and action.state == "pending"
+        assert attention is not None and attention.action_id == action.id
+        observed.append((event, hooked_task_id, fields))
+
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", capture)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        origin_run_id = task.current_run_id
+        first = kb.record_pending_action_and_block(
+            conn, task_id=task_id, run_id=origin_run_id, command=command, summary="untrusted",
+            profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000,
+        )
+        second = kb.record_pending_action_and_block(
+            conn, task_id=task_id, run_id=origin_run_id, command=command, summary="untrusted",
+            profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000,
+        )
+    assert second == {**first, "reused": True}
+    assert len(observed) == 1
+    event, hooked_task_id, fields = observed[0]
+    assert (event, hooked_task_id) == ("kanban_task_blocked", task_id)
+    assert fields["assignee"] == "backend-eng"
+    assert fields["run_id"] == origin_run_id
+    assert fields["reason"] == "terminal_approval_required"
+
+
+def test_atomic_pending_action_parallel_calls_converge_without_partial_state(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task and task.current_run_id
+        origin_run_id = task.current_run_id
+    barrier, results, failures = threading.Barrier(2), [], []
+    def call() -> None:
+        try:
+            with kb.connect() as conn:
+                barrier.wait(timeout=5)
+                results.append(kb.record_pending_action_and_block(conn, task_id=task_id, run_id=origin_run_id, command="git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic", summary="untrusted", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000))
+        except BaseException as exc:
+            failures.append(exc)
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for thread in threads: thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    assert not failures and len(results) == 2
+    assert {result["reused"] for result in results} == {False, True}
+    assert len({result["action_id"] for result in results}) == len({result["attention_id"] for result in results}) == 1
+    with kb.connect() as conn:
+        task, run = kb.get_task(conn, task_id), kb.latest_run(conn, task_id)
+        assert task and task.status == "blocked" and task.current_run_id is None
+        assert run and run.id == origin_run_id and run.status == run.outcome == "blocked" and run.ended_at
+        assert conn.execute("SELECT COUNT(*) FROM task_pending_actions WHERE task_id=? AND state IN ('pending','approved')", (task_id,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=? AND type='exact_action'", (task_id,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='terminal_approval_pending'", (task_id,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='blocked'", (task_id,)).fetchone()[0] == 1
 
 
 def test_human_gate_token_survives_other_unblock_precondition_failure(

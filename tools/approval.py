@@ -2559,8 +2559,8 @@ def _consume_kanban_action_grant(command: str) -> bool:
         return False
 
 
-def _record_kanban_pending_action(command: str, summary: str) -> None:
-    """Best-effort durable bridge from terminal approval to the worker card."""
+def _record_kanban_pending_action(command: str, summary: str) -> dict | None:
+    """Atomically park a Kanban worker behind an exact-action approval."""
     task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
     if not task_id or not workspace:
@@ -2570,7 +2570,7 @@ def _record_kanban_pending_action(command: str, summary: str) -> None:
         run_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
         run_id = int(run_raw) if run_raw else None
         with contextlib.closing(kanban_db.connect()) as conn:
-            kanban_db.record_pending_action(
+            return kanban_db.record_pending_action_and_block(
                 conn,
                 task_id=task_id,
                 run_id=run_id,
@@ -2581,7 +2581,8 @@ def _record_kanban_pending_action(command: str, summary: str) -> None:
                 expires_at=int(time.time()) + 86400,
             )
     except Exception as exc:
-        logger.warning("Could not persist Kanban pending action: %s", exc)
+        logger.warning("Could not atomically persist Kanban pending action: %s", exc)
+        return None
 
 
 def check_all_command_guards(command: str, env_type: str,
@@ -2932,7 +2933,9 @@ def check_all_command_guards(command: str, env_type: str,
         from agent.redact import redact_sensitive_text
         _disp_command = redact_sensitive_text(command)
         _disp_combined_desc = redact_sensitive_text(combined_desc)
-        _record_kanban_pending_action(command, _disp_combined_desc)
+        _kanban_pending = _record_kanban_pending_action(command, _disp_combined_desc)
+        if os.environ.get("HERMES_KANBAN_TASK", "").strip() and _kanban_pending is None:
+            return {"approved": False, "status": "blocked", "message": "BLOCKED: exact approval could not be durably recorded."}
         submit_pending(session_key, {
             "command": _disp_command,
             "pattern_key": primary_key,
@@ -2949,6 +2952,7 @@ def check_all_command_guards(command: str, env_type: str,
             "message": (
                 f"⚠️ {_disp_combined_desc}. Asking the user for approval.\n\n**Command:**\n```\n{_disp_command}\n```"
             ),
+            "kanban_approval": _kanban_pending,
         }
 
     # CLI interactive: single combined prompt
