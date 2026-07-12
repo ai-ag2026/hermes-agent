@@ -1402,6 +1402,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     gate_token_board      TEXT,
     gate_token_task_id    TEXT,
     gate_token_action     TEXT,
+    -- Human-Gate v2: a grant is additionally bound to the canonical,
+    -- versioned governance scope.  These fields are deliberately absent from
+    -- Task and public projections; they are authorization state only.
+    gate_scope_hash        TEXT,
+    gate_scope_version     INTEGER,
+    -- Internal-only declarations.  No worker tool accepts these fields.
+    governance_target_ref  TEXT,
+    governance_mutation_class TEXT,
     gate_failed_attempts  INTEGER NOT NULL DEFAULT 0,
     gate_failure_window_started_at INTEGER,
     gate_locked_until     INTEGER
@@ -2545,6 +2553,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         ("gate_token_board", "gate_token_board TEXT"),
         ("gate_token_task_id", "gate_token_task_id TEXT"),
         ("gate_token_action", "gate_token_action TEXT"),
+        ("gate_scope_hash", "gate_scope_hash TEXT"),
+        ("gate_scope_version", "gate_scope_version INTEGER"),
+        ("governance_target_ref", "governance_target_ref TEXT"),
+        ("governance_mutation_class", "governance_mutation_class TEXT"),
         ("gate_failed_attempts", "gate_failed_attempts INTEGER NOT NULL DEFAULT 0"),
         ("gate_failure_window_started_at", "gate_failure_window_started_at INTEGER"),
         ("gate_locked_until", "gate_locked_until INTEGER"),
@@ -6984,6 +6996,87 @@ def hash_gate_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+GOVERNANCE_SCOPE_VERSION = 1
+
+# Internal control-plane declarations.  They deliberately never appear in Task
+# projections or public create/tool/dashboard arguments.
+VALID_GOVERNANCE_MUTATION_CLASSES = frozenset({
+    "live-config", "worker-profile", "systemd-unit", "agent-runtime",
+    "runtime-plugin", "runtime-skill", "runtime-containment", "custom-pattern",
+})
+_GOVERNANCE_TARGET_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@+:-]{0,254}$")
+
+
+def _validate_governance_declarations(*, target_ref: str, mutation_class: str) -> tuple[str, str]:
+    """Validate dispatcher-only governance declarations fail-closed."""
+    target = str(target_ref or "").strip()
+    klass = str(mutation_class or "").strip()
+    if not _GOVERNANCE_TARGET_REF_RE.fullmatch(target):
+        raise ValueError("invalid internal governance target ref")
+    if klass not in VALID_GOVERNANCE_MUTATION_CLASSES:
+        raise ValueError("invalid internal governance mutation class")
+    return target, klass
+
+
+def _set_internal_governance_declarations(
+    conn: sqlite3.Connection, task_id: str, *, target_ref: str, mutation_class: str
+) -> None:
+    """Private dispatcher writer; caller must own the surrounding transaction."""
+    target, klass = _validate_governance_declarations(
+        target_ref=target_ref, mutation_class=mutation_class
+    )
+    cur = conn.execute(
+        "UPDATE tasks SET governance_target_ref = ?, governance_mutation_class = ? "
+        "WHERE id = ?",
+        (target, klass, task_id),
+    )
+    if cur.rowcount != 1:
+        raise ValueError("unknown task for internal governance declaration")
+
+
+def _normalise_governance_text(value: Optional[str]) -> str:
+    """Apply the *only* formatting-insensitive governance normalization."""
+    return (value or "").replace("\r\n", "\n").rstrip("\n")
+
+
+def governance_scope_hash(
+    conn: sqlite3.Connection, task_id: str, *, board: Optional[str] = None
+) -> str:
+    """Return the private SHA-256 binding for a card's governance scope.
+
+    Callers must be inside their write transaction when using this for an
+    authorization decision. The manifest is intentionally never returned,
+    emitted, or logged.
+    """
+    row = conn.execute(
+        "SELECT id, title, body, workspace_kind, workspace_path, project_id, "
+        "branch_name, governance_target_ref, governance_mutation_class "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        raise GateTokenError(f"unknown human-gated task {task_id}")
+    board_slug = _normalize_board_slug(board) or get_current_board()
+    # Bind to the connection's actual main DB as well as its routing slug.
+    # Environment/context overrides cannot replay a grant across DB boards.
+    db_rows = conn.execute("PRAGMA database_list").fetchall()
+    db_path = next((str(r[2]) for r in db_rows if r[1] == "main"), "")
+    manifest = {
+        "board": {"slug": board_slug, "db_path": os.path.realpath(db_path) if db_path else ""},
+        "body": _normalise_governance_text(row["body"]),
+        "mutation_class": row["governance_mutation_class"] or "",
+        "project_anchor": row["project_id"] or "",
+        "scope_version": GOVERNANCE_SCOPE_VERSION,
+        "target_ref": row["governance_target_ref"] or row["branch_name"] or "",
+        "task_id": row["id"],
+        "title": _normalise_governance_text(row["title"]),
+        "workspace_anchor": row["workspace_path"] or "",
+        "workspace_kind": row["workspace_kind"] or "",
+    }
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def issue_gate_token(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7009,12 +7102,15 @@ def issue_gate_token(
         if row is None or row["status"] != "blocked" or not row["human_gate"]:
             return None
         board_slug = _normalize_board_slug(board) or get_current_board()
+        scope_hash = governance_scope_hash(conn, task_id, board=board_slug)
         conn.execute(
             "UPDATE tasks SET gate_token_hash = ?, gate_token_issued_at = ?, "
             "gate_token_board = ?, gate_token_task_id = ?, gate_token_action = ?, "
+            "gate_scope_hash = ?, gate_scope_version = ?, "
             "gate_failed_attempts = 0, gate_failure_window_started_at = NULL, "
             "gate_locked_until = NULL WHERE id = ?",
-            (hash_gate_token(token), now, board_slug, task_id, action, task_id),
+            (hash_gate_token(token), now, board_slug, task_id, action,
+             scope_hash, GOVERNANCE_SCOPE_VERSION, task_id),
         )
         # Audit-visible grant context, never the token itself.
         _append_event(conn, task_id, "gate_token_issued", {
@@ -7168,6 +7264,7 @@ def set_human_gate(
                 "UPDATE tasks SET human_gate = 0, gate_token_hash = NULL, "
                 "gate_token_issued_at = NULL, gate_token_board = NULL, "
                 "gate_token_task_id = NULL, gate_token_action = NULL, "
+                "gate_scope_hash = NULL, gate_scope_version = NULL, "
                 "gate_failed_attempts = 0, gate_failure_window_started_at = NULL, "
                 "gate_locked_until = NULL WHERE id = ?",
                 (task_id,),
@@ -7213,6 +7310,7 @@ def _assert_human_gate_open(
     row = conn.execute(
         "SELECT human_gate, gate_token_hash, gate_token_issued_at, "
         "gate_token_board, gate_token_task_id, gate_token_action, "
+        "gate_scope_hash, gate_scope_version, "
         "gate_failed_attempts, gate_failure_window_started_at, gate_locked_until "
         "FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
         (task_id,),
@@ -7263,10 +7361,23 @@ def _assert_human_gate_open(
         failure_reason = "token was issued for a different task"
     elif row["gate_token_action"] != action:
         failure_reason = "token was issued for a different action"
+    elif (
+        row["gate_scope_version"] != GOVERNANCE_SCOPE_VERSION
+        or not row["gate_scope_hash"]
+        or not hmac.compare_digest(
+            row["gate_scope_hash"], governance_scope_hash(conn, task_id, board=current_board)
+        )
+    ):
+        # Safe, enumerable reason only: never expose the manifest or its hash.
+        failure_reason = "governance_scope_changed"
     elif not token or not hmac.compare_digest(hash_gate_token(token), stored_hash):
         failure_reason = "token was rejected"
 
     if failure_reason:
+        # Scope drift is not a bad human attempt: durable state, including the
+        # still-unconsumed token, remains byte-for-byte unchanged.
+        if failure_reason == "governance_scope_changed":
+            raise GateTokenError(f"{task_id} is human-gated: governance scope changed")
         window_start = int(row["gate_failure_window_started_at"] or 0)
         attempts = int(row["gate_failed_attempts"] or 0)
         if not window_start or now - window_start > cfg["failure_window_seconds"]:
@@ -7290,12 +7401,15 @@ def _assert_human_gate_open(
             task_id, action, current_board, failure_reason,
         )
         raise GateTokenError(
-            f"{task_id} is human-gated: {failure_reason}", persist_failure=True
+            f"{task_id} is human-gated: "
+            f"{'governance scope changed' if failure_reason == 'governance_scope_changed' else failure_reason}",
+            persist_failure=True,
         )
 
     conn.execute(
         "UPDATE tasks SET gate_token_hash = NULL, gate_token_issued_at = NULL, "
         "gate_token_board = NULL, gate_token_task_id = NULL, gate_token_action = NULL, "
+        "gate_scope_hash = NULL, gate_scope_version = NULL, "
         "gate_failed_attempts = 0, gate_failure_window_started_at = NULL, "
         "gate_locked_until = NULL WHERE id = ?",
         (task_id,),
@@ -8066,6 +8180,8 @@ def block_task(
     attention_type: Optional[str] = None,
     reason_code: Optional[str] = None,
     cause_scope: Optional[dict[str, str]] = None,
+    _governance_target_ref: Optional[str] = None,
+    _governance_mutation_class: Optional[str] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -8131,6 +8247,13 @@ def block_task(
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
+        )
+    if (_governance_target_ref is None) != (_governance_mutation_class is None):
+        raise ValueError("internal governance declarations require target and class")
+    if _governance_target_ref is not None:
+        _validate_governance_declarations(
+            target_ref=_governance_target_ref,
+            mutation_class=_governance_mutation_class or "",
         )
     if not trusted_internal:
         _enforce_worker_block_gates(conn, task_id, kind)
@@ -8345,6 +8468,13 @@ def block_task(
                 )
             if cur.rowcount != 1:
                 return False
+            if _governance_target_ref is not None:
+                _set_internal_governance_declarations(
+                    conn,
+                    task_id,
+                    target_ref=_governance_target_ref,
+                    mutation_class=_governance_mutation_class or "",
+                )
             conn.execute(
                 "UPDATE tasks SET block_cause_fingerprint=?, block_reason_code=?, block_cause_version=? WHERE id=?",
                 (cause_fingerprint, reason_code, BLOCK_CAUSE_VERSION if cause_fingerprint else None, task_id),
@@ -10863,6 +10993,26 @@ def _self_modify_gate_enabled() -> bool:
         return True
 
 
+def _self_modify_mutation_class(reason: str) -> str:
+    """Map classifier labels to the closed internal governance vocabulary."""
+    lowered = reason.casefold()
+    if "profile" in lowered:
+        return "worker-profile"
+    if "systemd" in lowered or "restart" in lowered:
+        return "systemd-unit"
+    if "plugin" in lowered or "hook" in lowered:
+        return "runtime-plugin"
+    if "skill" in lowered:
+        return "runtime-skill"
+    if "containment" in lowered or "toolset" in lowered:
+        return "runtime-containment"
+    if "config" in lowered or ".env" in lowered:
+        return "live-config"
+    if "runtime" in lowered or "kanban" in lowered:
+        return "agent-runtime"
+    return "custom-pattern"
+
+
 def _self_modify_patterns() -> list[tuple[Any, str]]:
     """Compiled default patterns plus any operator additions from
     ``kanban.self_modify_patterns`` (list of regex strings)."""
@@ -11526,6 +11676,10 @@ def _dispatch_once_locked(
                             "(oder den Telegram-Gate-Button), wenn diese "
                             "Laufzeit-Änderung gewollt ist."
                         ),
+                        _governance_target_ref=(
+                            (_sm_task.branch_name or "").strip() or f"task/{row['id']}"
+                        ),
+                        _governance_mutation_class=_self_modify_mutation_class(_sm_reason),
                     ):
                         result.self_modify_gated.append((row["id"], _sm_reason))
                     continue

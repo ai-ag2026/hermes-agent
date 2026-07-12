@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import multiprocessing
 import os
 import shutil
@@ -6016,6 +6017,243 @@ def test_human_gate_grant_binds_board_task_and_action(kanban_home):
             assert kb.unblock_task(conn, first, token=token) is True
 
 
+def test_governance_gate_token_binds_current_canonical_scope(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="gated", body="preserve **exact** bytes", assignee="worker",
+            workspace_kind="worktree", workspace_path="/repo/.worktrees/gated",
+            branch_name="governance/gated",
+        )
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+        row = conn.execute(
+            "SELECT gate_scope_hash, gate_scope_version FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert token and row["gate_scope_version"] == kb.GOVERNANCE_SCOPE_VERSION
+        assert row["gate_scope_hash"] == kb.governance_scope_hash(conn, tid)
+        assert "gate_scope_hash" not in vars(kb.get_task(conn, tid))
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("body", "materially changed"),
+        ("workspace_path", "/different/repo"),
+        ("branch_name", "governance/other"),
+        ("governance_mutation_class", "runtime-restart"),
+    ],
+)
+def test_governance_gate_rejects_token_after_material_scope_change(kanban_home, column, value):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="gated", body="original", assignee="worker",
+            workspace_kind="worktree", workspace_path="/repo/.worktrees/gated",
+            branch_name="governance/gated",
+        )
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+        before = conn.execute(
+            "SELECT gate_token_hash FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()["gate_token_hash"]
+        before_events = [e.kind for e in kb.list_events(conn, tid)]
+        conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (value, tid))
+        with pytest.raises(kb.GateTokenError, match="governance scope changed"):
+            kb.unblock_task(conn, tid, token=token)
+        row = conn.execute(
+            "SELECT status, gate_token_hash FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["status"] == "blocked" and row["gate_token_hash"] == before
+        assert [e.kind for e in kb.list_events(conn, tid)] == before_events
+
+
+def test_governance_gate_token_survives_formatting_only_body_normalization(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", body="line one\r\nline two\r\n\r\n", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", ("line one\nline two\n", tid))
+        assert kb.unblock_task(conn, tid, token=token) is True
+
+
+def test_governance_gate_scope_change_requires_fresh_token(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", body="old", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        stale = kb.issue_gate_token(conn, tid)
+        conn.execute("UPDATE tasks SET body = 'new' WHERE id = ?", (tid,))
+        with pytest.raises(kb.GateTokenError, match="governance scope changed"):
+            kb.unblock_task(conn, tid, token=stale)
+        fresh = kb.issue_gate_token(conn, tid)
+        assert fresh and kb.unblock_task(conn, tid, token=fresh) is True
+
+
+def test_legacy_human_gate_token_without_scope_binding_fails_closed(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+        conn.execute(
+            "UPDATE tasks SET gate_scope_hash = NULL, gate_scope_version = NULL WHERE id = ?", (tid,)
+        )
+        with pytest.raises(kb.GateTokenError, match="governance scope changed"):
+            kb.unblock_task(conn, tid, token=token)
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+
+def _governance_snapshot(conn, task_id):
+    """Stable durable state used by P4b no-op/rollback contracts."""
+    task = tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+    events = [tuple(r) for r in conn.execute(
+        "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task_id,)
+    ).fetchall()]
+    runs = [tuple(r) for r in conn.execute(
+        "SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (task_id,)
+    ).fetchall()]
+    return task, events, runs
+
+
+@pytest.mark.parametrize("column,value", [
+    ("title", "renamed intent"),
+    ("workspace_kind", "dir"),
+    ("project_id", "different-project"),
+])
+def test_governance_scope_matrix_rejects_material_card_changes(kanban_home, column, value):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", body="body", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+        before = _governance_snapshot(conn, tid)
+        # These are durable card fields with no public editor API; this is an
+        # explicit storage-layer characterization of the scope contract.
+        conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, tid))
+        with pytest.raises(kb.GateTokenError, match="governance scope changed"):
+            kb.unblock_task(conn, tid, token=token)
+        after = _governance_snapshot(conn, tid)
+        assert after[0][0] == before[0][0]  # task identity is stable
+        assert after[1:] == before[1:]      # no event/run/hook-visible effect
+        assert conn.execute("SELECT gate_token_hash FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+
+
+def test_governance_internal_writer_is_closed_and_scope_bound(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(
+            conn, tid, reason="x", kind="needs_input", human_gate=True,
+            _governance_target_ref="refs/heads/main",
+            _governance_mutation_class="agent-runtime",
+        )
+        token = kb.issue_gate_token(conn, tid)
+        row = conn.execute("SELECT governance_target_ref, governance_mutation_class FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert tuple(row) == ("refs/heads/main", "agent-runtime")
+        with pytest.raises(ValueError):
+            kb._set_internal_governance_declarations(
+                conn, tid, target_ref="bad ref with spaces", mutation_class="agent-runtime"
+            )
+        kb._set_internal_governance_declarations(
+            conn, tid, target_ref="refs/heads/repaired", mutation_class="agent-runtime"
+        )
+        with pytest.raises(kb.GateTokenError, match="governance scope changed"):
+            kb.unblock_task(conn, tid, token=token)
+
+
+def test_governance_scope_negative_lifecycle_controls_do_not_invalidate(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", body="body", assignee="worker", priority=1)
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+        conn.execute(
+            "UPDATE tasks SET priority=9, assignee='other', skills='[\\\"x\\\"]', "
+            "task_class='hard', max_runtime_seconds=12 WHERE id=?", (tid,)
+        )
+        assert kb.unblock_task(conn, tid, token=token) is True
+
+
+def test_governance_scope_fault_after_consume_rolls_back_everything(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+        before = _governance_snapshot(conn, tid)
+        original = kb._append_event
+        def boom(*args, **kwargs):
+            if len(args) > 2 and args[2] == "unblocked":
+                raise RuntimeError("injected")
+            return original(*args, **kwargs)
+        monkeypatch.setattr(kb, "_append_event", boom)
+        with pytest.raises(RuntimeError, match="injected"):
+            kb.unblock_task(conn, tid, token=token)
+        assert _governance_snapshot(conn, tid) == before
+
+
+def test_governance_scope_parallel_consume_has_exactly_one_winner(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+    barrier = threading.Barrier(2)
+    outcomes = []
+    def consume():
+        with kb.connect() as other:
+            barrier.wait(timeout=5)
+            outcomes.append(kb.unblock_task(other, tid, token=token))
+    threads = [threading.Thread(target=consume) for _ in range(2)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join(timeout=10)
+    assert outcomes.count(True) == 1 and outcomes.count(False) == 1
+
+
+
+def test_governance_scope_change_vs_consume_is_serialized_fail_closed(kanban_home):
+    """Real independent writers: drift wins => old grant never authorizes."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", body="before", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+    entered = threading.Event()
+    release = threading.Event()
+    outcome = []
+    def drift():
+        with kb.connect() as writer, kb.write_txn(writer):
+            writer.execute("UPDATE tasks SET body='after' WHERE id=?", (tid,))
+            entered.set()
+            assert release.wait(5)
+    def consume():
+        with kb.connect() as reader:
+            try:
+                outcome.append(kb.unblock_task(reader, tid, token=token))
+            except kb.GateTokenError as exc:
+                outcome.append(type(exc).__name__)
+    writer = threading.Thread(target=drift)
+    writer.start(); assert entered.wait(5)
+    consumer = threading.Thread(target=consume); consumer.start()
+    release.set(); writer.join(timeout=10); consumer.join(timeout=10)
+    assert outcome == ["GateTokenError"]
+    with kb.connect() as conn:
+        row = conn.execute("SELECT status, gate_token_hash FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] == "blocked" and row["gate_token_hash"]
+
+
+def test_governance_scope_public_and_durable_surfaces_redact_internal_values(kanban_home, caplog):
+    secret_ref = "refs/heads/private-governance-anchor"
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True,
+                      _governance_target_ref=secret_ref,
+                      _governance_mutation_class="agent-runtime")
+        token = kb.issue_gate_token(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert secret_ref not in repr(vars(task))
+        events_before = json.dumps([e.payload for e in kb.list_events(conn, tid)])
+        assert secret_ref not in events_before and token not in events_before
+        kb._set_internal_governance_declarations(
+            conn, tid, target_ref="refs/heads/changed", mutation_class="agent-runtime"
+        )
+        with pytest.raises(kb.GateTokenError, match="governance scope changed"):
+            kb.unblock_task(conn, tid, token=token)
+        assert secret_ref not in caplog.text and token not in caplog.text
+
+
 def test_human_gate_failed_attempt_lockout_persists_across_connections(kanban_home, monkeypatch):
     monkeypatch.setattr(kb, "_human_gate_config", lambda: {
         "token_ttl_seconds": 600, "max_failed_attempts": 2,
@@ -6410,7 +6648,9 @@ def test_human_gate_migration_idempotent_on_legacy_db(tmp_path, monkeypatch):
 
     with kb.connect(db_path) as c1:
         cols = {r["name"] for r in c1.execute("PRAGMA table_info(tasks)")}
-        assert {"human_gate", "gate_token_hash", "gate_token_issued_at"} <= cols
+        assert {"human_gate", "gate_token_hash", "gate_token_issued_at", "gate_scope_hash", "gate_scope_version", "governance_target_ref", "governance_mutation_class"} <= cols
+        assert c1.execute("SELECT title FROM tasks WHERE id = 't-legacy'").fetchone()["title"] == "T"
+        assert c1.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         legacy_task = kb.get_task(c1, "t-legacy")
         assert legacy_task.human_gate is False  # safe default for a pre-existing row
 
@@ -6419,6 +6659,129 @@ def test_human_gate_migration_idempotent_on_legacy_db(tmp_path, monkeypatch):
     with kb.connect(db_path) as c2:
         cols2 = {r["name"] for r in c2.execute("PRAGMA table_info(tasks)")}
         assert {"human_gate", "gate_token_hash", "gate_token_issued_at"} <= cols2
+
+
+def test_p4b_legacy_human_gate_fixture_migrates_fail_closed_then_reissues_once(
+    tmp_path, monkeypatch, caplog
+):
+    """Real pre-P4b Human-Gate schema: token metadata exists, scope columns do not."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    db_path = home / "legacy-p4b.db"
+    task_id, token = "t_legacy_gate", "legacy-plaintext-token"
+    private_body, private_workspace = "raw legacy body", "/private/workspace"
+    issued_at = int(time.time())
+
+    # This is the P4a tasks shape with exactly P4b's four columns absent;
+    # the historical token binding, run and event are created before any P4b
+    # initializer touches the file (no new-helper fixture normalization).
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, assignee TEXT,
+            status TEXT NOT NULL, priority INTEGER DEFAULT 0, created_by TEXT,
+            created_at INTEGER NOT NULL, started_at INTEGER, completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch', workspace_path TEXT,
+            branch_name TEXT, project_id TEXT, claim_lock TEXT, claim_expires INTEGER,
+            tenant TEXT, result TEXT, idempotency_key TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0, worker_pid INTEGER,
+            last_failure_error TEXT, max_runtime_seconds INTEGER, last_heartbeat_at INTEGER,
+            current_run_id INTEGER, workflow_template_id TEXT, current_step_key TEXT,
+            skills TEXT, model_override TEXT, task_class TEXT, effort TEXT,
+            max_retries INTEGER, goal_mode INTEGER NOT NULL DEFAULT 0,
+            goal_max_turns INTEGER, session_id TEXT, block_kind TEXT,
+            block_recurrences INTEGER NOT NULL DEFAULT 0,
+            block_cause_fingerprint TEXT, block_reason_code TEXT,
+            block_cause_version INTEGER, completion_contract TEXT,
+            human_gate INTEGER NOT NULL DEFAULT 0, gate_token_hash TEXT,
+            gate_token_issued_at INTEGER, gate_token_board TEXT,
+            gate_token_task_id TEXT, gate_token_action TEXT,
+            gate_failed_attempts INTEGER NOT NULL DEFAULT 0,
+            gate_failure_window_started_at INTEGER, gate_locked_until INTEGER
+        );
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+            run_id INTEGER, kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL
+        );
+        CREATE TABLE task_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+            profile TEXT, step_key TEXT, status TEXT NOT NULL, claim_lock TEXT,
+            claim_expires INTEGER, worker_pid INTEGER, max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER, last_activity_at INTEGER,
+            last_semantic_progress_at INTEGER, worker_start_ticks INTEGER,
+            d_state_since INTEGER, resource_sample TEXT,
+            termination_pending_since INTEGER, started_at INTEGER NOT NULL,
+            ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT, error TEXT
+        );
+    """)
+    legacy.execute(
+        """INSERT INTO tasks (id, title, body, assignee, status, created_at,
+            workspace_kind, workspace_path, branch_name, claim_lock, claim_expires,
+            current_run_id, human_gate, gate_token_hash, gate_token_issued_at,
+            gate_token_board, gate_token_task_id, gate_token_action)
+           VALUES (?, 'legacy gated', ?, 'legacy', 'blocked', 101, 'dir', ?,
+                   'legacy/main', NULL, NULL, 73, 1, ?, ?,
+                   'default', ?, 'unblock')""",
+        (task_id, private_body, private_workspace, kb.hash_gate_token(token), issued_at, task_id),
+    )
+    legacy.execute("INSERT INTO task_runs (id, task_id, status, started_at, summary) VALUES (73, ?, 'blocked', 102, 'historical run')", (task_id,))
+    legacy.execute("INSERT INTO task_events (id, task_id, run_id, kind, payload, created_at) VALUES (41, ?, 73, 'blocked', '{\"historical\":true}', 103)", (task_id,))
+    legacy.execute("INSERT INTO tasks (id, title, status, created_at, workspace_kind, human_gate) VALUES ('t_legacy_plain', 'legacy plain', 'blocked', 104, 'scratch', 0)")
+    legacy.commit()
+    legacy.close()
+
+    kb.init_db(db_path)  # public/real migration path
+    with kb.connect(db_path) as conn:
+        assert {"gate_scope_hash", "gate_scope_version", "governance_target_ref", "governance_mutation_class"} <= {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        historical = (
+            tuple(conn.execute("SELECT id, title, body, workspace_path, claim_lock, current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()),
+            tuple(conn.execute("SELECT id, task_id, run_id, kind, payload, created_at FROM task_events WHERE id=41").fetchone()),
+            tuple(conn.execute("SELECT id, task_id, status, started_at, summary FROM task_runs WHERE id=73").fetchone()),
+        )
+        assert historical == (
+            (task_id, "legacy gated", private_body, private_workspace, None, 73),
+            (41, task_id, 73, "blocked", '{"historical":true}', 103),
+            (73, task_id, "blocked", 102, "historical run"),
+        )
+        before_reject = _governance_snapshot(conn, task_id)
+        with caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
+            with pytest.raises(kb.GateTokenError) as error:
+                kb.unblock_task(conn, task_id, token=token)
+        assert "governance scope changed" in str(error.value)
+        assert _governance_snapshot(conn, task_id) == before_reject
+        mismatch_surfaces = "\n".join((
+            str(error.value), caplog.text,
+            json.dumps([e.payload for e in kb.list_events(conn, task_id)]),
+        ))
+        # Task body/workspace are established public card fields; the P4b
+        # boundary is that the mismatch itself and public Task projection do
+        # not introduce token/hash/scope-declaration data.
+        for secret in (token, kb.hash_gate_token(token), private_body, private_workspace):
+            assert secret not in mismatch_surfaces
+        public_task = repr(vars(kb.get_task(conn, task_id)))
+        for marker in ("gate_token_hash", "gate_scope_hash", "governance_target_ref", "governance_mutation_class"):
+            assert marker not in public_task
+        # New controlled issuance binds current scope, redeems exactly once.
+        fresh = kb.issue_gate_token(conn, task_id)
+        assert fresh and kb.unblock_task(conn, task_id, token=fresh) is True
+        assert kb.unblock_task(conn, task_id, token=fresh) is False
+        assert kb.unblock_task(conn, "t_legacy_plain", actor="operator", reason="unchanged") is True
+        # The consumed grant's cleared binding is itself durable state; second
+        # init must not resurrect a legacy token or rewrite historical rows.
+        retained_scope = tuple(conn.execute(
+            "SELECT gate_scope_hash, gate_scope_version FROM tasks WHERE id=?", (task_id,)
+        ).fetchone())
+
+    kb.init_db(db_path)  # second public init must be idempotent
+    with kb.connect(db_path) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert tuple(conn.execute("SELECT id, title, body, workspace_path, claim_lock FROM tasks WHERE id=?", (task_id,)).fetchone()) == historical[0][:5]
+        assert tuple(conn.execute("SELECT gate_scope_hash, gate_scope_version FROM tasks WHERE id=?", (task_id,)).fetchone()) == retained_scope
+        assert tuple(conn.execute("SELECT id, task_id, run_id, kind, payload, created_at FROM task_events WHERE id=41").fetchone()) == historical[1]
+        assert tuple(conn.execute("SELECT id, task_id, started_at, summary FROM task_runs WHERE id=73").fetchone()) == (historical[2][0], historical[2][1], historical[2][3], historical[2][4])
 
 
 # ---------------------------------------------------------------------------

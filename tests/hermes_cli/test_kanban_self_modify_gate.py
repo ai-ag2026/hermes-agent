@@ -83,6 +83,12 @@ def test_self_modify_card_is_gated_not_spawned(isolated_kanban_home):
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
         assert task.human_gate
+        token = kb.issue_gate_token(conn, tid)
+        assert token
+        row = conn.execute("SELECT gate_scope_hash, gate_scope_version, governance_target_ref, governance_mutation_class FROM tasks WHERE id = ?", (tid,)).fetchone()
+        assert row["gate_scope_hash"] and row["gate_scope_version"] == kb.GOVERNANCE_SCOPE_VERSION
+        assert row["governance_target_ref"] == f"task/{tid}"
+        assert row["governance_mutation_class"] == "live-config"
         # The blocked event carries the layman fields for the cockpit/Telegram.
         import json
         ev = conn.execute(
