@@ -104,15 +104,38 @@ def test_collector_readonly_trace_delivery_gauge_and_bad_board(tmp_path: Path, m
     assert not any(token in " ".join(traced).upper() for token in ("BEGIN IMMEDIATE", "INSERT", "UPDATE", "DELETE"))
 
 
+@pytest.mark.parametrize("filename", ["shadow #?.db", "shadow % space.db"])
+def test_collector_uri_escapes_readonly_db_path(tmp_path: Path, filename: str) -> None:
+    now = 10_000
+    path = tmp_path / filename
+    kb.init_db(path)
+    conn = sqlite3.connect(path)
+    _task(conn, "live")
+    _typed(conn, "live", "decision", now)
+    conn.commit()
+    before = {table: conn.execute(f"SELECT * FROM {table}").fetchall() for table in ("tasks", "task_attentions", "task_pending_actions", "task_runs", "kanban_attention_deliveries", "task_events")}
+    conn.close()
+
+    metrics = _collect_attention_storm_metrics_readonly(path, now)
+
+    verify = sqlite3.connect(path)
+    after = {table: verify.execute(f"SELECT * FROM {table}").fetchall() for table in before}
+    verify.close()
+    assert metrics is not None
+    assert metrics.active_human_required == 1
+    assert after == before
+
+
 def test_warning_dedupe_and_safe_aggregate_log(caplog) -> None:
     cfg = {"shadow_enabled": True, "active_human_required_threshold": 1}
     one = evaluate_backpressure_shadow(AttentionStormMetrics(active_human_required=1), cfg)
     changed = evaluate_backpressure_shadow(AttentionStormMetrics(new_attention_5m=1), {**cfg, "new_attention_5m_threshold": 1})
-    seen: dict[str, int] = {}
-    assert _should_emit_shadow_warning(seen, one, 100, 300)
-    assert not _should_emit_shadow_warning(seen, one, 101, 300)
-    assert _should_emit_shadow_warning(seen, changed, 101, 300)
-    assert _should_emit_shadow_warning(seen, one, 400, 300)
+    seen: dict[tuple[str, str], int] = {}
+    assert _should_emit_shadow_warning(seen, "board-a", one, 100, 300)
+    assert _should_emit_shadow_warning(seen, "board-b", one, 100, 300)
+    assert not _should_emit_shadow_warning(seen, "board-a", one, 101, 300)
+    assert _should_emit_shadow_warning(seen, "board-a", changed, 101, 300)
+    assert _should_emit_shadow_warning(seen, "board-a", one, 400, 300)
     from gateway.kanban_watchers import _log_shadow_warning
     _log_shadow_warning(one)
     text = caplog.text
@@ -196,7 +219,7 @@ def test_duplicate_suppression_shadow_is_board_scoped(monkeypatch: pytest.Monkey
     monkeypatch.setattr(db, "has_spawnable_review", lambda conn: False)
     monkeypatch.setattr(db, "dispatch_once", lambda *a, **kw: SimpleNamespace(spawned=[], crashed=[], timed_out=[], auto_blocked=[], reclaimed=0, promoted=0))
     monkeypatch.setattr(watchers, "_collect_attention_storm_metrics_readonly", lambda path, now: AttentionStormMetrics())
-    monkeypatch.setattr(watchers, "_should_emit_shadow_warning", lambda _seen, decision, *_args: decision.action == "pause_new_fanout")
+    monkeypatch.setattr(watchers, "_should_emit_shadow_warning", lambda _seen, _board_slug, decision, *_args: decision.action == "pause_new_fanout")
     monkeypatch.setattr(watchers, "_log_shadow_warning", decisions.append)
 
     async def immediate_to_thread(fn, *args, **kwargs):

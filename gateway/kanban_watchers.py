@@ -16,6 +16,7 @@ import math
 import os
 import sqlite3
 import time
+from urllib.parse import quote
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Optional
@@ -130,7 +131,8 @@ def _collect_attention_storm_metrics_readonly(db_path: str | Path, now: int) -> 
     """Collect authoritative aggregates via a read-only SQLite connection only."""
     conn: sqlite3.Connection | None = None
     try:
-        conn = sqlite3.connect(f"file:{Path(db_path).expanduser()}?mode=ro", uri=True, timeout=1.0)
+        path = Path(db_path).expanduser().resolve()
+        conn = sqlite3.connect(f"file:{quote(str(path), safe='/')}?mode=ro", uri=True, timeout=1.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=ON")
         conn.execute("PRAGMA busy_timeout=1000")
@@ -157,13 +159,14 @@ def _collect_attention_storm_metrics_readonly(db_path: str | Path, now: int) -> 
             conn.close()
 
 
-def _should_emit_shadow_warning(last_warning: dict[str, int], decision: BackpressureShadowDecision, now: int, cooldown: int) -> bool:
+def _should_emit_shadow_warning(last_warning: dict[tuple[str, str], int], board_slug: str, decision: BackpressureShadowDecision, now: int, cooldown: int) -> bool:
     if decision.action != "pause_new_fanout":
         return False
-    previous = last_warning.get(decision.fingerprint)
+    key = (board_slug, decision.fingerprint)
+    previous = last_warning.get(key)
     if previous is not None and now - previous < cooldown:
         return False
-    last_warning[decision.fingerprint] = now
+    last_warning[key] = now
     return True
 
 
@@ -1376,7 +1379,7 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
-        shadow_last_warning: dict[str, int] = {}
+        shadow_last_warning: dict[tuple[str, str], int] = {}
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1702,7 +1705,7 @@ class GatewayKanbanWatchersMixin:
                         )
                         decision = evaluate_backpressure_shadow(metrics, shadow_cfg.__dict__)
                         if _should_emit_shadow_warning(
-                            shadow_last_warning, decision, now, shadow_cfg.warning_cooldown_seconds,
+                            shadow_last_warning, board_slug, decision, now, shadow_cfg.warning_cooldown_seconds,
                         ):
                             _log_shadow_warning(decision)
             except Exception:
