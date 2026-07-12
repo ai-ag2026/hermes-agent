@@ -3176,6 +3176,8 @@ class TestSharedBoardPaths:
         # `-p <profile>` flag rewrites HERMES_HOME.
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
+        shared_gh_config = tmp_path / ".config" / "gh"
+        shared_gh_config.mkdir(parents=True)
         self._set_home(monkeypatch, tmp_path, default_home)
 
         captured = {}
@@ -3215,6 +3217,7 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        assert env["GH_CONFIG_DIR"] == str(shared_gh_config)
 
 
 # ---------------------------------------------------------------------------

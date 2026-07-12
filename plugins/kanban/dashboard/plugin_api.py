@@ -867,6 +867,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     # Re-open a blocked/scheduled task, or just an explicit status set.
                     current = kanban_db.get_task(conn, task_id)
                     if current and current.status in ("blocked", "scheduled"):
+                        pending_action = kanban_db.get_pending_action(conn, task_id)
+                        if pending_action is not None:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "This card is waiting for an exact terminal action approval; "
+                                    "use approve-terminal-action before resuming it"
+                                ),
+                            )
                         ok = kanban_db.unblock_task(conn, task_id)
                     else:
                         # Direct status write for drag-drop (todo -> ready etc).

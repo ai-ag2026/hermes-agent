@@ -59,6 +59,58 @@ def client(kanban_home):
     return TestClient(app)
 
 
+def test_exact_terminal_action_requires_combined_approval_and_resume(client, tmp_path):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "publish", "assignee": "backend-eng"},
+    ).json()["task"]
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task["id"], claimer="test")
+        assert claimed is not None
+        action = kb.record_pending_action(
+            conn,
+            task_id=task["id"],
+            run_id=claimed.current_run_id,
+            command="git push --force-with-lease fork HEAD:topic",
+            summary="git push --force-with-lease to topic",
+            profile="backend-eng",
+            workspace=str(workspace),
+            expires_at=int(time.time()) + 600,
+        )
+        assert kb.block_task(
+            conn, task["id"], kind="needs_input",
+            reason="terminal approval required",
+            expected_run_id=claimed.current_run_id,
+        )
+
+    plain = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": "ready"},
+    )
+    assert plain.status_code == 409
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert detail["pending_terminal_action"]["id"] == action.id
+    assert "git push --force-with-lease" in detail["pending_terminal_action"]["summary"]
+
+    approved = client.post(
+        f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action",
+        json={"action_id": action.id},
+    )
+    assert approved.status_code == 200, approved.text
+    with kb.connect() as conn:
+        resumed = kb.get_task(conn, task["id"])
+        assert resumed is not None and resumed.status == "ready"
+        assert resumed.current_run_id is None
+
+    replay = client.post(
+        f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action",
+        json={"action_id": action.id},
+    )
+    assert replay.status_code == 409
+
+
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------

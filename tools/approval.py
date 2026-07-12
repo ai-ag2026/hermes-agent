@@ -8,6 +8,7 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+import contextlib
 import contextvars
 import fnmatch
 import functools
@@ -2534,6 +2535,52 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+def _consume_kanban_action_grant(command: str) -> bool:
+    """Consume a durable exact-action grant when running as a Kanban worker."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+    if not task_id or not workspace:
+        return False
+    try:
+        from hermes_cli import kanban_db
+        with contextlib.closing(kanban_db.connect()) as conn:
+            return kanban_db.consume_approved_action(
+                conn,
+                task_id=task_id,
+                command=command,
+                profile=os.environ.get("HERMES_PROFILE", "default"),
+                workspace=workspace,
+            )
+    except Exception as exc:
+        logger.warning("Kanban action grant lookup failed closed: %s", exc)
+        return False
+
+
+def _record_kanban_pending_action(command: str, summary: str) -> None:
+    """Best-effort durable bridge from terminal approval to the worker card."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+    if not task_id or not workspace:
+        return
+    try:
+        from hermes_cli import kanban_db
+        run_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+        run_id = int(run_raw) if run_raw else None
+        with contextlib.closing(kanban_db.connect()) as conn:
+            kanban_db.record_pending_action(
+                conn,
+                task_id=task_id,
+                run_id=run_id,
+                command=command,
+                summary=summary,
+                profile=os.environ.get("HERMES_PROFILE", "default"),
+                workspace=workspace,
+                expires_at=int(time.time()) + 86400,
+            )
+    except Exception as exc:
+        logger.warning("Could not persist Kanban pending action: %s", exc)
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -2581,6 +2628,13 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
+
+    # Kanban grants are consume-once and action-bound. They are checked only
+    # after unconditional hardline/deny floors, so operator approval cannot
+    # bypass commands that are never approvable.
+    if _consume_kanban_action_grant(command):
+        return {"approved": True, "message": None,
+                "user_approved": True, "kanban_action_grant": True}
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
@@ -2875,6 +2929,7 @@ def check_all_command_guards(command: str, env_type: str,
         from agent.redact import redact_sensitive_text
         _disp_command = redact_sensitive_text(command)
         _disp_combined_desc = redact_sensitive_text(combined_desc)
+        _record_kanban_pending_action(command, _disp_combined_desc)
         submit_pending(session_key, {
             "command": _disp_command,
             "pattern_key": primary_key,
