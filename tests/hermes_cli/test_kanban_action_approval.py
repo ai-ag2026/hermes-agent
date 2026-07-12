@@ -110,6 +110,36 @@ def test_action_grant_is_exact_expiring_and_consume_once(
         assert action.fingerprint not in repr(event_payloads)
 
 
+def test_pending_action_persists_only_constant_operator_summary(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    untrusted_summary = "credential-fragment=do-not-persist"
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        action = kb.record_pending_action(
+            conn,
+            task_id=task_id,
+            run_id=task.current_run_id,
+            command="git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic",
+            summary=untrusted_summary,
+            profile="backend-eng",
+            workspace=str(isolated_board),
+            expires_at=2_000_000_000,
+        )
+        row = conn.execute(
+            "SELECT summary FROM task_pending_actions WHERE id = ?", (action.id,),
+        ).fetchone()
+        events = kb.list_events(conn, task_id=task_id)
+
+    assert action.summary == kb.PENDING_ACTION_OPERATOR_SUMMARY
+    assert row["summary"] == kb.PENDING_ACTION_OPERATOR_SUMMARY
+    assert untrusted_summary not in repr(events)
+    assert kb.PENDING_ACTION_OPERATOR_SUMMARY in repr(events)
+
+
 def test_tampered_fingerprint_cannot_be_approved(
     isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

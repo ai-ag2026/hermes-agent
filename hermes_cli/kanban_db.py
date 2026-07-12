@@ -144,6 +144,7 @@ GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
+PENDING_ACTION_OPERATOR_SUMMARY = "An exact terminal action is awaiting approval."
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -7332,13 +7333,10 @@ def record_pending_action(
     now = int(time.time())
     command_hash = _pending_action_hash(command)
     mutation_kind = _pending_action_mutation_kind(command)
-    try:
-        from agent.redact import redact_sensitive_text  # type: ignore[import-not-found]
-
-        summary = redact_sensitive_text(summary or "terminal command approval")
-    except Exception:
-        summary = summary or "terminal command approval"
-    summary = summary[:500]
+    # Approval descriptions originate at the command boundary. Persist only a
+    # fixed operator prompt so redaction configuration or failure can never
+    # turn the durable DB/event log into a command or credential side channel.
+    summary = PENDING_ACTION_OPERATOR_SUMMARY
     profile = profile or "default"
     workspace = str(Path(workspace).resolve())
     expires_at = int(expires_at)

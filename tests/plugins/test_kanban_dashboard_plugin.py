@@ -92,7 +92,7 @@ def test_exact_terminal_action_requires_combined_approval_and_resume(client, tmp
 
     detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
     assert detail["pending_terminal_action"]["id"] == action.id
-    assert "git push --force-with-lease" in detail["pending_terminal_action"]["summary"]
+    assert detail["pending_terminal_action"]["summary"] == kb.PENDING_ACTION_OPERATOR_SUMMARY
 
     approved = client.post(
         f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action",
