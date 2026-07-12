@@ -290,6 +290,7 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     # profile's telegram bot.
     runner._profile_adapters = {"beta": {Platform.DISCORD: other_adapter}}
     runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "beta"
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 

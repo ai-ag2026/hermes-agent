@@ -1624,6 +1624,8 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     notifier_profile TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    active        INTEGER NOT NULL DEFAULT 1,
+    generation    INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -1650,6 +1652,7 @@ CREATE TABLE IF NOT EXISTS kanban_attention_deliveries (
     chat_id           TEXT NOT NULL,
     thread_id         TEXT NOT NULL DEFAULT '',
     notifier_profile  TEXT,
+    subscription_generation INTEGER NOT NULL DEFAULT 1,
     state             TEXT NOT NULL DEFAULT 'pending'
                       CHECK(state IN ('pending','sending','delivered','cancelled')),
     attempts          INTEGER NOT NULL DEFAULT 0,
@@ -2487,6 +2490,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "lease_version",
             "lease_version INTEGER NOT NULL DEFAULT 0",
         )
+    if delivery_cols and "subscription_generation" not in delivery_cols:
+        _add_column_if_missing(
+            conn, "kanban_attention_deliveries", "subscription_generation",
+            "subscription_generation INTEGER NOT NULL DEFAULT 1",
+        )
 
     action_cols = {
         row["name"] for row in conn.execute("PRAGMA table_info(task_pending_actions)")
@@ -2815,6 +2823,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
+        if "active" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "active", "active INTEGER NOT NULL DEFAULT 1"
+            )
+        if "generation" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "generation", "generation INTEGER NOT NULL DEFAULT 1"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2943,7 +2959,8 @@ _REBUILD_SPECS = {
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
         " notifier_profile TEXT, created_at INTEGER NOT NULL,"
-        " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " last_event_id INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,"
+        " generation INTEGER NOT NULL DEFAULT 1,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -8432,10 +8449,10 @@ def get_current_attention(conn: sqlite3.Connection, task_id: str, *, now: Option
 def sync_attention_deliveries(
     conn: sqlite3.Connection, *, task_ids: Sequence[str], now: Optional[int] = None,
 ) -> dict[str, int]:
-    """Project current attention x notify subscription into durable deliveries.
+    """Project current attention x *active* subscription into durable deliveries.
 
-    Rows which no longer match the current projection are terminally cancelled.
-    This is intentionally idempotent and is safe to call from every watcher tick.
+    Subscription generation is an ABA fence: resubscribing the same channel
+    re-arms exactly its old row while an old sender can no longer finish it.
     """
     now = int(time.time()) if now is None else int(now)
     ids = list(dict.fromkeys(str(x) for x in task_ids))
@@ -8445,29 +8462,20 @@ def sync_attention_deliveries(
         for task_id in ids:
             attention = current.get(task_id)
             if attention is None:
-                cur = conn.execute(
-                    "UPDATE kanban_attention_deliveries SET state='cancelled', lease_until=NULL, updated_at=? "
-                    "WHERE task_id=? AND state IN ('pending','sending')", (now, task_id),
-                )
+                cur = conn.execute("UPDATE kanban_attention_deliveries SET state='cancelled', lease_until=NULL, updated_at=? WHERE task_id=? AND state IN ('pending','sending')", (now, task_id))
                 cancelled += cur.rowcount
                 continue
-            cur = conn.execute(
-                "UPDATE kanban_attention_deliveries SET state='cancelled', lease_until=NULL, updated_at=? "
-                "WHERE task_id=? AND state IN ('pending','sending') AND "
-                "(attention_id<>? OR attention_version<>?)",
-                (now, task_id, attention.id, attention.version),
-            )
+            cur = conn.execute("UPDATE kanban_attention_deliveries SET state='cancelled', lease_until=NULL, updated_at=? WHERE task_id=? AND state IN ('pending','sending') AND (attention_id<>? OR attention_version<>?)", (now, task_id, attention.id, attention.version))
             cancelled += cur.rowcount
-            subs = conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id=?", (task_id,)).fetchall()
+            subs = conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id=? AND active=1", (task_id,)).fetchall()
             for sub in subs:
-                cur = conn.execute(
-                    "INSERT OR IGNORE INTO kanban_attention_deliveries "
-                    "(task_id,attention_id,attention_version,platform,chat_id,thread_id,notifier_profile,updated_at) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (task_id, attention.id, attention.version, sub['platform'], sub['chat_id'],
-                     sub['thread_id'] or '', sub['notifier_profile'], now),
-                )
-                if cur.rowcount:
+                key = (task_id, attention.id, attention.version, sub['platform'], sub['chat_id'], sub['thread_id'] or '')
+                row = conn.execute("SELECT subscription_generation FROM kanban_attention_deliveries WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=?", key).fetchone()
+                if row is None:
+                    conn.execute("INSERT INTO kanban_attention_deliveries (task_id,attention_id,attention_version,platform,chat_id,thread_id,notifier_profile,subscription_generation,updated_at) VALUES (?,?,?,?,?,?,?,?,?)", (*key, sub['notifier_profile'], int(sub['generation']), now))
+                    created += 1
+                elif int(row['subscription_generation']) != int(sub['generation']):
+                    conn.execute("UPDATE kanban_attention_deliveries SET notifier_profile=?, subscription_generation=?, state='pending', attempts=0, lease_version=lease_version+1, lease_until=NULL, delivered_at=NULL, last_error=NULL, updated_at=? WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=?", (sub['notifier_profile'], int(sub['generation']), now, *key))
                     created += 1
                 else:
                     suppressed += 1
@@ -8512,6 +8520,14 @@ def claim_attention_delivery(
         ).fetchone()
         if row is None or row['state'] in ('delivered', 'cancelled'):
             return None
+        sub = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? "
+            "AND active=1 AND generation=?",
+            (task_id, platform, chat_id, thread_id or '', int(row['subscription_generation'])),
+        ).fetchone()
+        if sub is None:
+            conn.execute("UPDATE kanban_attention_deliveries SET state='cancelled', lease_until=NULL, updated_at=? WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? AND state IN ('pending','sending')", (now, *key))
+            return None
         if row['state'] == 'sending' and (row['lease_until'] or 0) > now:
             return None
         cur = conn.execute(
@@ -8529,22 +8545,19 @@ def claim_attention_delivery(
 
 def finish_attention_delivery(conn: sqlite3.Connection, delivery: Mapping[str, Any], *, success: bool,
                               now: Optional[int] = None) -> bool:
-    """CAS a lease to delivered or retry-pending; never persist exception prose."""
+    """CAS a lease to delivered or retry-pending, fenced by subscription generation."""
     now = int(time.time()) if now is None else int(now)
     key = tuple(delivery[x] for x in ('task_id','attention_id','attention_version','platform','chat_id','thread_id'))
     try:
         lease_version = int(delivery['lease_version'])
+        subscription_generation = int(delivery['subscription_generation'])
     except (KeyError, TypeError, ValueError):
         return False
     with write_txn(conn):
         if success:
-            cur = conn.execute("UPDATE kanban_attention_deliveries SET state='delivered', delivered_at=?, lease_until=NULL, last_error=NULL, updated_at=? "
-                               "WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? AND state='sending' AND lease_version=?",
-                               (now, now, *key, lease_version))
+            cur = conn.execute("UPDATE kanban_attention_deliveries SET state='delivered', delivered_at=?, lease_until=NULL, last_error=NULL, updated_at=? WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? AND state='sending' AND lease_version=? AND subscription_generation=?", (now, now, *key, lease_version, subscription_generation))
         else:
-            cur = conn.execute("UPDATE kanban_attention_deliveries SET state='pending', lease_until=NULL, last_error='send_failed', updated_at=? "
-                               "WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? AND state='sending' AND lease_version=?",
-                               (now, *key, lease_version))
+            cur = conn.execute("UPDATE kanban_attention_deliveries SET state='pending', lease_until=NULL, last_error='send_failed', updated_at=? WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? AND state='sending' AND lease_version=? AND subscription_generation=?", (now, *key, lease_version, subscription_generation))
         return cur.rowcount == 1
 
 
@@ -13666,42 +13679,28 @@ def add_notify_sub(
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
 ) -> None:
-    """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    """Register a channel, reactivating a tombstone with a new ABA generation."""
     now = int(time.time())
+    thread = thread_id or ""
     with write_txn(conn):
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
-        )
-        if notifier_profile:
-            # Self-heal legacy rows that predate notifier ownership by
-            # backfilling only when the existing value is unset.
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET notifier_profile = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (notifier_profile IS NULL OR notifier_profile = '')
-                """,
-                (notifier_profile, task_id, platform, chat_id, thread_id or ""),
-            )
+        row = conn.execute("SELECT active FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?", (task_id, platform, chat_id, thread)).fetchone()
+        if row is None:
+            conn.execute("INSERT INTO kanban_notify_subs (task_id,platform,chat_id,thread_id,user_id,notifier_profile,created_at,active,generation) VALUES (?,?,?,?,?,?,?,?,1)", (task_id, platform, chat_id, thread, user_id, notifier_profile, now, 1))
+        elif not int(row['active']):
+            conn.execute("UPDATE kanban_notify_subs SET active=1, generation=generation+1, user_id=COALESCE(?, user_id), notifier_profile=COALESCE(?, notifier_profile) WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?", (user_id, notifier_profile, task_id, platform, chat_id, thread))
+        elif notifier_profile:
+            conn.execute("UPDATE kanban_notify_subs SET notifier_profile=? WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? AND (notifier_profile IS NULL OR notifier_profile='')", (notifier_profile, task_id, platform, chat_id, thread))
 
 
 def list_notify_subs(
-    conn: sqlite3.Connection, task_id: Optional[str] = None,
+    conn: sqlite3.Connection, task_id: Optional[str] = None, *, include_inactive: bool = False,
 ) -> list[dict]:
+    where = "" if include_inactive else " WHERE active=1"
+    params: tuple[Any, ...] = ()
     if task_id is not None:
-        rows = conn.execute(
-            "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
-    return [dict(r) for r in rows]
+        where = (" WHERE task_id=?" if include_inactive else " WHERE task_id=? AND active=1")
+        params = (task_id,)
+    return [dict(r) for r in conn.execute("SELECT * FROM kanban_notify_subs" + where, params).fetchall()]
 
 
 def remove_notify_sub(
@@ -13712,13 +13711,17 @@ def remove_notify_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
 ) -> bool:
+    """Deactivate (rather than delete) a channel and cancel its current generation."""
+    now = int(time.time())
+    thread = thread_id or ""
     with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM kanban_notify_subs WHERE task_id = ? "
-            "AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (task_id, platform, chat_id, thread_id or ""),
-        )
-    return cur.rowcount > 0
+        row = conn.execute("SELECT generation FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? AND active=1", (task_id, platform, chat_id, thread)).fetchone()
+        if row is None:
+            return False
+        generation = int(row['generation'])
+        conn.execute("UPDATE kanban_notify_subs SET active=0 WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? AND active=1", (task_id, platform, chat_id, thread))
+        conn.execute("UPDATE kanban_attention_deliveries SET state='cancelled', lease_until=NULL, lease_version=lease_version+1, updated_at=? WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? AND subscription_generation=? AND state IN ('pending','sending')", (now, task_id, platform, chat_id, thread, generation))
+        return True
 
 
 def unseen_events_for_sub(

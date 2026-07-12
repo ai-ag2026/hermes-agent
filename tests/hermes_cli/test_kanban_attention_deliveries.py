@@ -118,3 +118,42 @@ def test_attention_delivery_migrates_immediately_previous_table_shape(tmp_path, 
     assert tuple(delivery) == ("old-task", 0)
     assert conn.execute("SELECT id FROM tasks WHERE id='old-task'").fetchone()[0] == "old-task"
     conn.close()
+
+
+def test_subscription_reactivation_rearms_only_its_generation(tmp_path, monkeypatch):
+    tid, attention = _attention_with_sub(tmp_path, monkeypatch, channels=2)
+    conn = kb.connect()
+    kb.sync_attention_deliveries(conn, task_ids=[tid], now=100)
+    delivered = kb.claim_attention_delivery(conn, task_id=tid, attention_id=attention.id, attention_version=attention.version, platform="telegram", chat_id="chat-0", now=101)
+    assert delivered and kb.finish_attention_delivery(conn, delivered, success=True, now=102)
+    assert kb.remove_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-0")
+    kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-0")
+    kb.sync_attention_deliveries(conn, task_ids=[tid], now=103)
+    row = conn.execute("SELECT state, subscription_generation FROM kanban_attention_deliveries WHERE task_id=? AND chat_id='chat-0'", (tid,)).fetchone()
+    other = conn.execute("SELECT state FROM kanban_attention_deliveries WHERE task_id=? AND chat_id='chat-1'", (tid,)).fetchone()
+    assert tuple(row) == ("pending", 2)
+    assert other["state"] == "pending"
+    assert kb.list_notify_subs(conn, tid)[0]["generation"] == 2
+    conn.close()
+
+
+def test_subscription_active_idempotence_thread_normalization_and_unsubscribe_fence(tmp_path, monkeypatch):
+    tid, attention = _attention_with_sub(tmp_path, monkeypatch)
+    conn = kb.connect()
+    kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-0", thread_id="")
+    assert kb.list_notify_subs(conn, tid)[0]["generation"] == 1
+    kb.sync_attention_deliveries(conn, task_ids=[tid], now=100)
+    claim = kb.claim_attention_delivery(conn, task_id=tid, attention_id=attention.id, attention_version=attention.version, platform="telegram", chat_id="chat-0", thread_id=None, now=101)
+    assert claim
+    assert kb.remove_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-0", thread_id="")
+    assert kb.claim_attention_delivery(conn, task_id=tid, attention_id=attention.id, attention_version=attention.version, platform="telegram", chat_id="chat-0", now=102) is None
+    assert not kb.finish_attention_delivery(conn, claim, success=True, now=102)
+    assert kb.list_notify_subs(conn, tid) == []
+    assert len(kb.list_notify_subs(conn, tid, include_inactive=True)) == 1
+    kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-0", thread_id=None)
+    kb.sync_attention_deliveries(conn, task_ids=[tid], now=103)
+    fresh = kb.claim_attention_delivery(conn, task_id=tid, attention_id=attention.id, attention_version=attention.version, platform="telegram", chat_id="chat-0", now=104)
+    assert fresh and fresh["subscription_generation"] == 2
+    assert not kb.finish_attention_delivery(conn, claim, success=True, now=105)
+    assert kb.finish_attention_delivery(conn, fresh, success=True, now=105)
+    conn.close()

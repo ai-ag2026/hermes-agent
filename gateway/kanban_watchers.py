@@ -446,18 +446,6 @@ class GatewayKanbanWatchersMixin:
                     duplicate_suppressed_by_board: dict[str, int] = {}
                     deliveries: list[dict] = []
                     attention_deliveries: list[dict] = []
-                    active_platforms = {
-                        getattr(platform, "value", str(platform)).lower()
-                        for platform in self.adapters.keys()
-                    }
-                    if not active_platforms:
-                        logger.debug("kanban notifier: no connected adapters; skipping tick")
-                        return {
-                            "events": deliveries,
-                            "attentions": attention_deliveries,
-                            "duplicate_suppressed_by_board": duplicate_suppressed_by_board,
-                        }
-
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
                     # HERMES_KANBAN_DB pins the board path; without this guard
@@ -542,21 +530,20 @@ class GatewayKanbanWatchersMixin:
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
-                                owner_profile = sub.get("notifier_profile") or None
-                                if owner_profile and owner_profile != notifier_profile:
-                                    _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                    if not _owner_adapters:
-                                        logger.debug(
-                                            "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
-                                            sub.get("task_id"), owner_profile, notifier_profile,
-                                        )
-                                        continue
+                                # A watcher claims only its own profile's subscriptions.
+                                # Legacy NULL/empty ownership remains the default profile.
+                                owner_profile = (sub.get("notifier_profile") or "default").strip() or "default"
+                                if owner_profile != notifier_profile:
+                                    continue
                                 platform = (sub.get("platform") or "").lower()
-                                if platform not in active_platforms:
-                                    logger.debug(
-                                        "kanban notifier: subscription for %s on %s skipped; adapter not connected",
-                                        sub.get("task_id"), platform or "<missing>",
-                                    )
+                                try:
+                                    plat = _Platform(platform)
+                                except ValueError:
+                                    continue
+                                # Resolve through the profile-bound chokepoint: within
+                                # this owning watcher, a secondary adapter may deliver,
+                                # but never via the default adapter as fallback.
+                                if self._authorization_adapter(plat, owner_profile) is None:
                                     continue
                                 current_attention = _kb.get_current_attention(conn, sub["task_id"])
                                 if current_attention is not None and current_attention.requires_human_action:
@@ -962,8 +949,15 @@ class GatewayKanbanWatchersMixin:
         try:
             _kb.sync_attention_deliveries(conn, task_ids=[str(delivery["task_id"])])
             current = _kb.get_current_attention(conn, str(delivery["task_id"]))
+            subscribed = conn.execute(
+                "SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? "
+                "AND active=1 AND generation=?",
+                (str(delivery["task_id"]), delivery["platform"], delivery["chat_id"],
+                 delivery.get("thread_id") or "", int(delivery["subscription_generation"])),
+            ).fetchone()
             return bool(
-                current is not None
+                subscribed is not None
+                and current is not None
                 and current.id == int(delivery["attention_id"])
                 and current.version == int(delivery["attention_version"])
                 and current.requires_human_action
