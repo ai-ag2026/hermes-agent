@@ -1260,7 +1260,7 @@ class PendingAction:
 
 @dataclass(frozen=True)
 class Attention:
-    """Safe current-operator projection of one exact action."""
+    """Safe current-operator projection of one exact action or typed blocker."""
 
     id: int
     task_id: str
@@ -1270,9 +1270,19 @@ class Attention:
     created_at: int
     state: str
     version: int
-    expires_at: int
+    expires_at: Optional[int]
     requires_human_action: bool
     approvable: bool
+
+
+@dataclass(frozen=True)
+class ResolvePendingActionResult:
+    """Safe resolve outcome for HTTP 404/409/410 mapping without raw bindings."""
+
+    status: str
+
+    def __bool__(self) -> bool:
+        return self.status == "resolved"
 
 
 @dataclass
@@ -6304,6 +6314,9 @@ def _complete_task_locked(
             )
         if cur.rowcount != 1:
             return False
+        _cancel_active_actions_for_terminal_task(
+            conn, task_id, now=now, reason="task_completed",
+        )
         for manifest in artifact_manifest:
             _persist_completion_artifact_manifest(conn, manifest)
         run_id = _end_run(
@@ -7540,10 +7553,35 @@ def _pending_action_fingerprint_valid(
 
 
 def _materialize_expired_actions(conn: sqlite3.Connection, now: int) -> None:
+    # ``task_attentions`` is a current projection, not action history. Remove
+    # projections before their actions become terminal so technical replacements
+    # cannot survive expiry as durable ghosts.
+    conn.execute(
+        "DELETE FROM task_attentions WHERE type IN ('capability','transient') AND action_id IN ("
+        "SELECT id FROM task_pending_actions "
+        "WHERE state IN ('pending','approved') AND expires_at <= ?)",
+        (now,),
+    )
     conn.execute(
         "UPDATE task_pending_actions SET state='expired', version=version+1, updated_at=? "
         "WHERE state IN ('pending','approved') AND expires_at <= ?", (now, now),
     )
+
+
+def _delete_attention_for_action(conn: sqlite3.Connection, task_id: str, action_id: int) -> None:
+    """Delete the current projection for one action; history remains on the action."""
+    # Exact-action rows have a stable identity and are rebound by a later
+    # request; only replacement projections must be removed at terminal action
+    # transitions.
+    conn.execute(
+        "DELETE FROM task_attentions WHERE task_id=? AND action_id=? "
+        "AND type IN ('capability','transient')",
+        (task_id, int(action_id)),
+    )
+
+
+def _attention_cleanup_hook() -> None:
+    """Private in-transaction fault seam for projection-cleanup rollback tests."""
 
 
 def _upsert_exact_action_attention(conn: sqlite3.Connection, action_id: int, task_id: str, fingerprint: str, now: int) -> None:
@@ -7795,6 +7833,8 @@ def record_pending_action(
                 (now, now, existing["id"], existing["version"]),
             )
             if cur.rowcount == 1:
+                _delete_attention_for_action(conn, task_id, int(existing["id"]))
+                _attention_cleanup_hook()
                 _append_event(conn, task_id, "terminal_approval_cancelled", {"action_id": int(existing["id"]), "reason": "superseded"}, run_id=run_id)
         try:
             cur = conn.execute(
@@ -7984,6 +8024,8 @@ def consume_approved_action(
         )
         if cur.rowcount != 1:
             return False
+        _delete_attention_for_action(conn, task_id, int(row["id"]))
+        _attention_cleanup_hook()
         _append_event(
             conn, task_id, "terminal_approval_consumed",
             {"action_id": int(row["id"]), "run_id": int(run_id)},
@@ -7993,22 +8035,32 @@ def consume_approved_action(
 
 
 def get_current_attention(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None) -> Optional[Attention]:
-    """Return the safe live projection; lifecycle fields come from its action."""
+    """Return the one live operator projection, never reconstructed from events."""
     now = int(time.time()) if now is None else int(now)
     row = conn.execute(
-        "SELECT a.*, x.id AS attention_id, x.type, x.created_at AS attention_created_at "
-        "FROM task_attentions x JOIN task_pending_actions a ON a.id=x.action_id "
-        "JOIN tasks t ON t.id=x.task_id "
+        "SELECT x.id AS attention_id, x.action_id, x.type, x.summary, "
+        "x.created_at AS attention_created_at, a.state AS action_state, "
+        "a.version AS action_version, a.expires_at "
+        "FROM task_attentions x JOIN tasks t ON t.id=x.task_id "
+        "LEFT JOIN task_pending_actions a ON a.id=x.action_id "
         "WHERE x.task_id=? AND t.status NOT IN ('done','archived') "
-        "AND a.state IN ('pending','approved') AND a.expires_at>? ORDER BY x.id DESC LIMIT 1",
-        (task_id, now),
+        "AND ((x.type='exact_action' AND a.state IN ('pending','approved') AND a.expires_at>?) "
+        "OR (x.type IN ('capability','transient') AND a.state='approved' AND a.expires_at>?)) "
+        "ORDER BY x.id DESC LIMIT 1",
+        (task_id, now, now),
     ).fetchone()
     if row is None:
         return None
-    return Attention(id=int(row["attention_id"]), task_id=task_id, action_id=int(row["id"]), type=row["type"],
-                     summary=row["summary"],
-                     created_at=int(row["attention_created_at"]), state=row["state"], version=int(row["version"]),
-                     expires_at=int(row["expires_at"]), requires_human_action=True, approvable=row["state"] == "pending")
+    exact = row["type"] == "exact_action"
+    return Attention(
+        id=int(row["attention_id"]), task_id=task_id, action_id=int(row["action_id"]),
+        type=row["type"], summary=row["summary"],
+        created_at=int(row["attention_created_at"]),
+        state=row["action_state"] if exact else "pending",
+        version=int(row["action_version"]), expires_at=int(row["expires_at"]),
+        requires_human_action=(row["action_state"] == "pending") if exact else row["type"] == "capability",
+        approvable=exact and row["action_state"] == "pending",
+    )
 
 
 def finalize_goal_block_or_reuse_current_attention(
@@ -8084,19 +8136,180 @@ def _goal_finalizer_after_task_update_hook() -> None:
     """Private in-transaction fault seam for finalizer rollback tests."""
 
 
-def resolve_pending_action(conn: sqlite3.Connection, task_id: str, action_id: int, *, now: Optional[int] = None) -> bool:
-    """Terminal fail-closed resolution without consuming an exact command."""
+def _technical_attention_after_replace_hook() -> None:
+    """Private in-transaction fault seam for technical replacement rollback tests."""
+
+
+def block_approved_action_for_technical_failure(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    action_id: int,
+    expected_run_id: int,
+    attention_type: str,
+    reason_code: str,
+    cause_scope: Optional[dict[str, str]] = None,
+    now: Optional[int] = None,
+) -> bool:
+    """Atomically replace a waiting grant's projection with one typed failure.
+
+    The approved exact action remains internal and valid for an explicit retry;
+    the technical projection is the sole current operator-facing attention.
+    """
+    if attention_type not in {"capability", "transient"}:
+        raise ValueError("technical replacement requires capability or transient attention")
     now = int(time.time()) if now is None else int(now)
     with write_txn(conn):
         _materialize_expired_actions(conn, now)
-        row = conn.execute("SELECT * FROM task_pending_actions WHERE id=? AND task_id=?", (action_id, task_id)).fetchone()
-        if row is None or row["state"] not in ("pending", "approved"):
+        fingerprint = _block_cause_fingerprint(
+            conn, task_id=task_id, attention_type=attention_type,
+            reason_code=reason_code, scope=cause_scope,
+        )
+        assert fingerprint is not None
+        action = conn.execute(
+            "SELECT * FROM task_pending_actions WHERE id=? AND task_id=? "
+            "AND state='approved' AND expires_at>?",
+            (int(action_id), task_id, now),
+        ).fetchone()
+        task = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if action is None or task is None or task["status"] != "running" or task["current_run_id"] != int(expected_run_id):
             return False
-        return conn.execute(
-            "UPDATE task_pending_actions SET state='resolved', resolved_at=?, updated_at=?, version=version+1 "
-            "WHERE id=? AND version=? AND state IN ('pending','approved')",
-            (now, now, action_id, row["version"]),
-        ).rowcount == 1
+        run = conn.execute(
+            "SELECT status, ended_at FROM task_runs WHERE id=? AND task_id=?",
+            (int(expected_run_id), task_id),
+        ).fetchone()
+        if run is None or run["status"] != "running" or run["ended_at"] is not None:
+            return False
+        if conn.execute(
+            "UPDATE tasks SET status='blocked', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, block_kind=? WHERE id=? "
+            "AND status='running' AND current_run_id=?",
+            (attention_type, task_id, int(expected_run_id)),
+        ).rowcount != 1:
+            return False
+        if conn.execute(
+            "UPDATE task_runs SET status='blocked', outcome='blocked', ended_at=?, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=? "
+            "AND task_id=? AND status='running' AND ended_at IS NULL",
+            (now, int(expected_run_id), task_id),
+        ).rowcount != 1:
+            return False
+        # action_id stays bound internally, but only the technical projection is visible.
+        conn.execute("DELETE FROM task_attentions WHERE task_id=?", (task_id,))
+        conn.execute(
+            "INSERT INTO task_attentions (task_id, action_id, type, cause_fingerprint, summary, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (task_id, int(action_id), attention_type, fingerprint,
+             "A technical worker failure requires attention.", now),
+        )
+        _technical_attention_after_replace_hook()
+        _append_event(conn, task_id, "blocked", {
+            "kind": attention_type, "attention_type": attention_type,
+            "reason_code": reason_code, "recurrences": 1,
+        }, run_id=int(expected_run_id))
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_blocked", task_id, board=get_current_board(),
+        run_id=int(expected_run_id), reason=reason_code,
+    )
+    return True
+
+
+def restore_approved_action_attention(
+    conn: sqlite3.Connection, task_id: str, action_id: int, *, now: Optional[int] = None,
+) -> bool:
+    """Explicit retry lifecycle step that re-projects a still-valid approved grant."""
+    now = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        _materialize_expired_actions(conn, now)
+        action = conn.execute(
+            "SELECT a.* FROM task_pending_actions a JOIN tasks t ON t.id=a.task_id "
+            "JOIN task_runs r ON r.id=a.run_id AND r.task_id=a.task_id "
+            "WHERE a.id=? AND a.task_id=? AND a.state='approved' AND a.expires_at>? "
+            "AND t.status='blocked' AND t.current_run_id IS NULL "
+            "AND t.claim_lock IS NULL AND t.claim_expires IS NULL AND t.worker_pid IS NULL "
+            "AND r.status='blocked' AND r.outcome='blocked' AND r.ended_at IS NOT NULL",
+            (int(action_id), task_id, now),
+        ).fetchone()
+        if action is None:
+            return False
+        technical = conn.execute(
+            "SELECT 1 FROM task_attentions WHERE task_id=? AND action_id=? "
+            "AND type IN ('capability','transient')", (task_id, int(action_id)),
+        ).fetchone()
+        if technical is None:
+            return False
+        conn.execute("DELETE FROM task_attentions WHERE task_id=?", (task_id,))
+        _upsert_exact_action_attention(conn, int(action_id), task_id, str(action["fingerprint"]), now)
+        return True
+
+
+def resolve_pending_action(
+    conn: sqlite3.Connection, task_id: str, action_id: int, *,
+    expected_version: Optional[int] = None, now: Optional[int] = None,
+) -> ResolvePendingActionResult:
+    """Atomically resolve a pending/approved action with safe HTTP semantics.
+
+    ``not_found`` maps to 404, an active version mismatch to 409, and an
+    expired/already-terminal action to 410.  Omitting ``expected_version`` is
+    retained only for legacy internal callers; public callers must provide it.
+    """
+    now = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        _materialize_expired_actions(conn, now)
+        row = conn.execute(
+            "SELECT * FROM task_pending_actions WHERE id=? AND task_id=?",
+            (int(action_id), task_id),
+        ).fetchone()
+        if row is None:
+            return ResolvePendingActionResult("not_found")
+        if row["state"] not in ("pending", "approved"):
+            return ResolvePendingActionResult("gone")
+        if expected_version is not None and int(expected_version) != int(row["version"]):
+            return ResolvePendingActionResult("conflict")
+        version = int(row["version"])
+        cur = conn.execute(
+            "UPDATE task_pending_actions SET state='resolved', resolved_at=?, "
+            "updated_at=?, version=version+1 WHERE id=? AND task_id=? AND "
+            "version=? AND state IN ('pending','approved')",
+            (now, now, int(action_id), task_id, version),
+        )
+        if cur.rowcount == 1:
+            _delete_attention_for_action(conn, task_id, int(action_id))
+            _attention_cleanup_hook()
+            return ResolvePendingActionResult("resolved")
+        settled = conn.execute(
+            "SELECT state, version FROM task_pending_actions WHERE id=? AND task_id=?",
+            (int(action_id), task_id),
+        ).fetchone()
+        if settled is None:
+            return ResolvePendingActionResult("not_found")
+        return ResolvePendingActionResult(
+            "gone" if settled["state"] not in ("pending", "approved") else "conflict"
+        )
+
+
+def _cancel_active_actions_for_terminal_task(
+    conn: sqlite3.Connection, task_id: str, *, now: int, reason: str,
+) -> None:
+    """Terminal tasks retain action history but never retain active projections."""
+    rows = conn.execute(
+        "SELECT id FROM task_pending_actions WHERE task_id=? AND state IN ('pending','approved')",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        action_id = int(row["id"])
+        if conn.execute(
+            "UPDATE task_pending_actions SET state='cancelled', cancelled_at=?, updated_at=?, version=version+1 "
+            "WHERE id=? AND state IN ('pending','approved')",
+            (now, now, action_id),
+        ).rowcount == 1:
+            _delete_attention_for_action(conn, task_id, action_id)
+            _attention_cleanup_hook()
+            _append_event(conn, task_id, "terminal_approval_cancelled", {
+                "action_id": action_id, "reason": reason,
+            })
 
 
 def _cancel_approved_pending_action(
@@ -8117,6 +8330,8 @@ def _cancel_approved_pending_action(
             (int(now), int(now), int(row["id"])),
         )
         if cur.rowcount == 1:
+            _delete_attention_for_action(conn, task_id, int(row["id"]))
+            _attention_cleanup_hook()
             _append_event(
                 conn, task_id, "terminal_approval_cancelled",
                 {"action_id": int(row["id"]), "reason": reason},
@@ -9103,20 +9318,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if cur.rowcount != 1:
             return False
         now = int(time.time())
-        pending = conn.execute(
-            "SELECT id FROM task_pending_actions WHERE task_id=? AND consumed_at IS NULL AND cancelled_at IS NULL",
-            (task_id,),
-        ).fetchall()
-        for action in pending:
-            conn.execute(
-                "UPDATE task_pending_actions SET cancelled_at=? WHERE id=? "
-                "AND consumed_at IS NULL AND cancelled_at IS NULL",
-                (now, int(action["id"])),
-            )
-            _append_event(
-                conn, task_id, "terminal_approval_cancelled",
-                {"action_id": int(action["id"]), "reason": "task_archived"},
-            )
+        _cancel_active_actions_for_terminal_task(
+            conn, task_id, now=now, reason="task_archived",
+        )
         # If archive happened while a run was still in flight (e.g. user
         # archived a running task from the dashboard), close that run with
         # outcome='reclaimed' so attempt history isn't orphaned.

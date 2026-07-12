@@ -361,6 +361,8 @@ def test_reblocked_resumed_run_cancels_unused_grant_and_restores_normal_unblock(
         action, resumed_run = _park_and_approve(
             conn, task_id, command, isolated_board,
         )
+        conn.execute("DELETE FROM task_attentions WHERE task_id=?", (task_id,))
+        conn.execute("INSERT INTO task_attentions (task_id, action_id, type, cause_fingerprint, summary, created_at) VALUES (?, ?, 'transient', 'reblock-cleanup', 'technical', 1)", (task_id, action.id))
         assert kb.block_task(
             conn, task_id, kind="needs_input", reason="different human decision",
             expected_run_id=resumed_run,
@@ -369,6 +371,7 @@ def test_reblocked_resumed_run_cancels_unused_grant_and_restores_normal_unblock(
         assert resolved is not None
         assert resolved.cancelled_at is not None
         assert resolved.consumed_at is None
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 0
         assert kb.get_pending_action(conn, task_id) is None
         assert kb.unblock_task(conn, task_id)
         current = kb.get_task(conn, task_id)
@@ -437,7 +440,7 @@ def test_terminal_same_identity_rebinds_stable_attention(
                                          summary="publish", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
         old_attention = kb.get_current_attention(conn, task_id)
         assert old_attention is not None
-        assert kb.resolve_pending_action(conn, task_id, first.id, now=1_900_000_000)
+        assert kb.resolve_pending_action(conn, task_id, first.id, expected_version=first.version, now=1_900_000_000)
         second = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command=command,
                                           summary="publish", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_100)
         current = kb.get_current_attention(conn, task_id)
@@ -2201,3 +2204,171 @@ def test_public_execute_code_variants_never_reuse_approved_exact_grant_and_later
         assert (consume_events[0].payload["action_id"], consume_events[0].run_id) == (
             action_a_id, resumed_after_variant.current_run_id,
         )
+
+
+def test_resolve_pending_action_reports_not_found_conflict_and_gone(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        action = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id,
+            command="resolve-cas-marker", summary="ignored", profile="backend-eng",
+            workspace=str(isolated_board), expires_at=2_000_000_000)
+        assert kb.resolve_pending_action(conn, task_id, action.id, expected_version=action.version + 1, now=1).status == "conflict"
+        assert kb.resolve_pending_action(conn, "foreign-task", action.id, expected_version=action.version, now=1).status == "not_found"
+        resolved = kb.resolve_pending_action(conn, task_id, action.id, expected_version=action.version, now=1)
+        assert resolved.status == "resolved" and resolved
+        assert kb.resolve_pending_action(conn, task_id, action.id, expected_version=action.version, now=1).status == "gone"
+        assert kb.get_current_attention(conn, task_id, now=1) is None
+
+
+def test_approved_action_technical_failure_replaces_current_projection_once(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        action, resumed_run = _park_and_approve(conn, task_id, "technical-replacement-marker", isolated_board)
+        before = kb.get_current_attention(conn, task_id, now=1_900_000_000)
+        assert before is not None and before.type == "exact_action" and before.state == "approved"
+        assert kb.block_approved_action_for_technical_failure(
+            conn, task_id=task_id, action_id=action.id, expected_run_id=resumed_run,
+            attention_type="capability", reason_code="missing_capability",
+            cause_scope={"capability": "tool"}, now=1_900_000_001,
+        )
+        current = kb.get_current_attention(conn, task_id, now=1_900_000_001)
+        internal = kb.get_pending_action_by_id(conn, task_id, action.id)
+        assert current is not None and current.type == "capability" and current.state == "pending"
+        assert internal is not None and internal.state == "approved"
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 1
+        assert kb.restore_approved_action_attention(conn, task_id, action.id, now=1_900_000_002)
+        restored = kb.get_current_attention(conn, task_id, now=1_900_000_002)
+        assert restored is not None and restored.type == "exact_action" and restored.state == "approved"
+
+
+def test_technical_replacement_fault_rolls_back_full_snapshot(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        action, resumed_run = _park_and_approve(conn, task_id, "technical-rollback-marker", isolated_board)
+        before = _atomic_snapshot(conn, task_id, resumed_run)
+        monkeypatch.setattr(kb, "_technical_attention_after_replace_hook", lambda: (_ for _ in ()).throw(RuntimeError("fault")))
+        with pytest.raises(RuntimeError, match="fault"):
+            kb.block_approved_action_for_technical_failure(
+                conn, task_id=task_id, action_id=action.id, expected_run_id=resumed_run,
+                attention_type="transient", reason_code="external_transient",
+                cause_scope={"subject": "external_service"}, now=1_900_000_001,
+            )
+        assert _atomic_snapshot(conn, task_id, resumed_run) == before
+
+
+def test_restore_technical_attention_requires_unclaimed_blocked_retry_lifecycle(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        action, resumed_run = _park_and_approve(conn, task_id, "restore-lifecycle-marker", isolated_board)
+        assert kb.block_approved_action_for_technical_failure(
+            conn, task_id=task_id, action_id=action.id, expected_run_id=resumed_run,
+            attention_type="capability", reason_code="missing_capability", now=1_900_000_001,
+        )
+        for status in ("done", "archived", "ready", "todo", "running"):
+            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+            before = _atomic_snapshot(conn, task_id, resumed_run)
+            assert not kb.restore_approved_action_attention(conn, task_id, action.id, now=1_900_000_002)
+            assert _atomic_snapshot(conn, task_id, resumed_run) == before
+        conn.execute("UPDATE tasks SET status='blocked', current_run_id=?, claim_lock='claimed' WHERE id=?", (resumed_run, task_id))
+        before = _atomic_snapshot(conn, task_id, resumed_run)
+        assert not kb.restore_approved_action_attention(conn, task_id, action.id, now=1_900_000_002)
+        assert _atomic_snapshot(conn, task_id, resumed_run) == before
+        conn.execute("DELETE FROM task_attentions WHERE task_id=?", (task_id,))
+        before = _atomic_snapshot(conn, task_id, resumed_run)
+        assert not kb.restore_approved_action_attention(conn, task_id, action.id, now=1_900_000_002)
+        assert _atomic_snapshot(conn, task_id, resumed_run) == before
+
+
+def test_technical_projection_is_deleted_on_expiry_resolve_and_cleanup_rollback(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        action, resumed_run = _park_and_approve(conn, task_id, "cleanup-marker", isolated_board)
+        assert kb.block_approved_action_for_technical_failure(
+            conn, task_id=task_id, action_id=action.id, expected_run_id=resumed_run,
+            attention_type="transient", reason_code="external_transient", now=1_900_000_001,
+        )
+        before = _atomic_snapshot(conn, task_id, resumed_run)
+        monkeypatch.setattr(kb, "_attention_cleanup_hook", lambda: (_ for _ in ()).throw(RuntimeError("cleanup fault")))
+        with pytest.raises(RuntimeError, match="cleanup fault"):
+            kb.resolve_pending_action(conn, task_id, action.id, now=1_900_000_002)
+        assert _atomic_snapshot(conn, task_id, resumed_run) == before
+        monkeypatch.setattr(kb, "_attention_cleanup_hook", lambda: None)
+        assert kb.resolve_pending_action(conn, task_id, action.id, now=1_900_000_002).status == "resolved"
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 0
+
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        action, resumed_run = _park_and_approve(conn, task_id, "expiry-cleanup-marker", isolated_board)
+        assert kb.block_approved_action_for_technical_failure(
+            conn, task_id=task_id, action_id=action.id, expected_run_id=resumed_run,
+            attention_type="capability", reason_code="missing_capability", now=1_900_000_001,
+        )
+        assert kb.resolve_pending_action(conn, task_id, action.id, now=2_000_000_000).status == "gone"
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 0
+
+
+def test_technical_projection_is_deleted_on_consume_done_and_archive(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = "terminal-cleanup-marker"
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        action, resumed_run = _park_and_approve(conn, task_id, command, isolated_board)
+        conn.execute("DELETE FROM task_attentions WHERE task_id=?", (task_id,))
+        conn.execute("INSERT INTO task_attentions (task_id, action_id, type, cause_fingerprint, summary, created_at) VALUES (?, ?, 'transient', 'consume-cleanup', 'technical', 1)", (task_id, action.id))
+        assert kb.consume_approved_action(conn, task_id=task_id, run_id=resumed_run, command=command,
+            profile="backend-eng", workspace=str(isolated_board), now=1_900_000_001)
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 0
+
+    for terminal in ("done", "archived"):
+        task_id = _create_running_task(monkeypatch)
+        with kb.connect() as conn:
+            action, resumed_run = _park_and_approve(conn, task_id, f"{terminal}-cleanup-marker", isolated_board)
+            assert kb.block_approved_action_for_technical_failure(
+                conn, task_id=task_id, action_id=action.id, expected_run_id=resumed_run,
+                attention_type="capability", reason_code="missing_capability", now=1_900_000_001,
+            )
+            assert (kb.complete_task(conn, task_id, summary="done") if terminal == "done" else kb.archive_task(conn, task_id))
+            assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 0
+            current = kb.get_pending_action_by_id(conn, task_id, action.id)
+            assert current is not None and current.state == "cancelled"
+
+
+def test_parallel_versioned_resolves_have_exactly_one_winner(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        action = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id,
+            command="parallel-resolve-cas-marker", summary="ignored", profile="backend-eng",
+            workspace=str(isolated_board), expires_at=2_000_000_000)
+    barrier, results = threading.Barrier(2), []
+    def resolve() -> None:
+        with kb.connect() as other:
+            barrier.wait(timeout=5)
+            results.append(kb.resolve_pending_action(
+                other, task_id, action.id, expected_version=action.version, now=1,
+            ).status)
+    workers = [threading.Thread(target=resolve) for _ in range(2)]
+    [worker.start() for worker in workers]
+    [worker.join(timeout=5) for worker in workers]
+    assert not any(worker.is_alive() for worker in workers)
+    assert sorted(results) == ["gone", "resolved"]
+    with kb.connect() as conn:
+        current = kb.get_pending_action_by_id(conn, task_id, action.id)
+        assert current is not None and (current.state, current.version) == ("resolved", action.version + 1)
+        assert kb.get_current_attention(conn, task_id, now=1) is None
