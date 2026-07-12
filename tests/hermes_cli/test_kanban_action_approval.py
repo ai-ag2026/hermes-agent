@@ -471,3 +471,30 @@ def test_stale_triage_projection_cannot_specify_or_auto_decompose(
     outcome = kanban_decompose.decompose_task(task_id)
     assert not outcome.ok
     assert "terminal action" in outcome.reason
+
+
+def test_pending_action_block_preserves_latest_human_guidance(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.record_pending_action(
+            conn, task_id=task_id, run_id=task.current_run_id,
+            command="git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic",
+            summary="git push", profile="backend-eng", workspace=str(isolated_board),
+            expires_at=2_000_000_000,
+        )
+        assert kb.block_task(
+            conn, task_id, reason="approval required", kind="needs_input",
+            expected_run_id=task.current_run_id,
+            human_summary="Exact publication approval is pending.",
+            human_action="Approve the displayed action, then resume.",
+        )
+        blocked = [
+            event for event in kb.list_events(conn, task_id=task_id)
+            if event.kind == "blocked"
+        ][-1]
+        assert blocked.payload["human_summary"] == "Exact publication approval is pending."
+        assert blocked.payload["human_action"] == "Approve the displayed action, then resume."

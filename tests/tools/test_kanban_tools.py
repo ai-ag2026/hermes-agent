@@ -63,6 +63,14 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_kanban_block_schema_exposes_human_guidance():
+    from tools.kanban_tools import KANBAN_BLOCK_SCHEMA
+
+    props = KANBAN_BLOCK_SCHEMA["parameters"]["properties"]
+    assert "human_summary" in props
+    assert "human_action" in props
+
+
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
     """Dispatcher-spawned workers must get lifecycle tools even when the
     assignee profile restricts enabled toolsets and does not list kanban.
