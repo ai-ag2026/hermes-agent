@@ -17,18 +17,50 @@ import pytest
 
 
 @pytest.fixture()
-def isolated_kanban_home(monkeypatch):
+def preserved_kanban_modules():
+    """Require the self-modify sandbox to leave collection-time imports intact."""
+    before = {
+        name: module
+        for name, module in sys.modules.items()
+        if name.startswith("hermes_cli") or name.startswith("hermes_state") or name == "hermes_constants"
+    }
+    yield
+    after = {
+        name: module
+        for name, module in sys.modules.items()
+        if name.startswith("hermes_cli") or name.startswith("hermes_state") or name == "hermes_constants"
+    }
+    assert after.keys() == before.keys()
+    assert all(after[name] is module for name, module in before.items())
+
+
+@pytest.fixture()
+def isolated_kanban_home(monkeypatch, preserved_kanban_modules):
     test_home = tempfile.mkdtemp(prefix="kanban_selfmod_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
+    module_names = [
+        name
+        for name in sys.modules
+        if name.startswith("hermes_cli") or name.startswith("hermes_state") or name == "hermes_constants"
+    ]
+    original_modules = {name: sys.modules[name] for name in module_names}
+    for name in module_names:
+        del sys.modules[name]
     from hermes_cli import kanban_db
     # Pretend every assignee resolves to a real profile so the dispatcher
     # reaches the gate instead of bucketing the card as non-spawnable.
     import hermes_cli.profiles as profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True, raising=False)
-    yield kanban_db, test_home
+    try:
+        yield kanban_db, test_home
+    finally:
+        for name in [
+            name
+            for name in sys.modules
+            if name.startswith("hermes_cli") or name.startswith("hermes_state") or name == "hermes_constants"
+        ]:
+            del sys.modules[name]
+        sys.modules.update(original_modules)
 
 
 def _spawn(*args, **kwargs):
