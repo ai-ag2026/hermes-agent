@@ -91,12 +91,13 @@ def test_exact_terminal_action_requires_combined_approval_and_resume(client, tmp
     assert plain.status_code == 409
 
     detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
-    assert detail["pending_terminal_action"]["id"] == action.id
-    assert detail["pending_terminal_action"]["summary"] == kb.PENDING_ACTION_OPERATOR_SUMMARY
+    attention = detail["attention"]
+    assert attention["state"] == "pending"
+    assert attention["operator_summary"] == kb.PENDING_ACTION_OPERATOR_SUMMARY
 
     approved = client.post(
         f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action",
-        json={"action_id": action.id},
+        json={"action_id": attention["id"], "version": attention["version"]},
     )
     assert approved.status_code == 200, approved.text
     with kb.connect() as conn:
@@ -106,9 +107,77 @@ def test_exact_terminal_action_requires_combined_approval_and_resume(client, tmp
 
     replay = client.post(
         f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action",
-        json={"action_id": action.id},
+        json={"action_id": attention["id"], "version": attention["version"]},
     )
-    assert replay.status_code == 409
+    assert replay.status_code == 410
+
+
+_ATTENTION_FIELDS = {
+    "id", "type", "requires_human_action", "approvable", "mutation_kind",
+    "state", "created_at", "expires_at", "version", "operator_summary",
+}
+
+
+def _pending_exact_action(client, tmp_path, *, board=None):
+    query = f"?board={board}" if board else ""
+    task = client.post(f"/api/plugins/kanban/tasks{query}", json={"title": "exact", "assignee": "worker"}).json()["task"]
+    workspace = tmp_path / (board or "default") / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    with kb.connect(board=board) as conn:
+        claimed = kb.claim_task(conn, task["id"], claimer="test")
+        assert claimed is not None
+        action = kb.record_pending_action(
+            conn, task_id=task["id"], run_id=claimed.current_run_id,
+            command="P5_RAW_COMMAND_MARKER", summary="P5_SUMMARY_MARKER",
+            profile="P5_PROFILE_MARKER", workspace=str(workspace), expires_at=int(time.time()) + 600,
+        )
+        assert kb.block_task(conn, task["id"], kind="needs_input", reason="P5_BLOCKER_MARKER", expected_run_id=claimed.current_run_id)
+    return task, action
+
+
+def _board_task(payload, task_id):
+    return next(t for col in payload["columns"] for t in col["tasks"] if t["id"] == task_id)
+
+
+def test_current_attention_contract_and_redaction(client, tmp_path):
+    task, action = _pending_exact_action(client, tmp_path)
+    board_task = _board_task(client.get("/api/plugins/kanban/board").json(), task["id"])
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    assert board_task["attention"] == detail["task"]["attention"]
+    assert set(detail["task"]["attention"]) == _ATTENTION_FIELDS
+    public = repr({"board": board_task, "detail": detail})
+    for marker in ("P5_RAW_COMMAND_MARKER", "P5_SUMMARY_MARKER", "P5_PROFILE_MARKER", "P5_BLOCKER_MARKER", action.command_hash, action.fingerprint):
+        assert marker not in public
+    assert "pending_terminal_action" not in public
+
+
+def test_versioned_attention_routes_and_named_board_isolation(client, tmp_path):
+    kb.create_board("other")
+    task, _ = _pending_exact_action(client, tmp_path)
+    other, _ = _pending_exact_action(client, tmp_path, board="other")
+    attention = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]["attention"]
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action?board=other", json={"action_id": attention["id"], "version": attention["version"]}).status_code == 404
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action", json={"action_id": attention["id"], "version": attention["version"] + 1}).status_code == 409
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action", json={"action_id": attention["id"], "version": attention["version"]}).status_code == 200
+    assert "attention" not in client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    # The resolved projection is no longer current; its opaque id is therefore
+    # a stale snapshot conflict rather than an authorization handle.
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action", json={"action_id": attention["id"], "version": attention["version"]}).status_code == 409
+    assert client.get(f"/api/plugins/kanban/tasks/{other['id']}?board=other").json()["task"]["attention"]["id"]
+    assert client.post(f"/api/plugins/kanban/tasks/{other['id']}/resolve-terminal-action?board=other", json={"action_id": True, "version": 1}).status_code == 422
+    assert client.post(f"/api/plugins/kanban/tasks/{other['id']}/resolve-terminal-action?board=other", json={"action_id": 1, "version": True}).status_code == 422
+
+
+def test_approved_current_attention_is_non_actionable_and_terminal_absent(client, tmp_path):
+    task, _ = _pending_exact_action(client, tmp_path)
+    pending = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]["attention"]
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action", json={"action_id": pending["id"], "version": pending["version"]}).status_code == 200
+    approved = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]["attention"]
+    assert approved["id"] == pending["id"] and approved["version"] == pending["version"] + 1
+    assert approved["state"] == "approved-awaiting-worker"
+    assert approved["requires_human_action"] is False and approved["approvable"] is False
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action", json={"action_id": approved["id"], "version": approved["version"]}).status_code == 200
+    assert "attention" not in client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
 
 
 # ---------------------------------------------------------------------------
