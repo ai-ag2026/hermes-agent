@@ -546,6 +546,17 @@ def get_task(
         # a second round-trip. Cards on /board carry a 200-char preview.
         full_summary = kanban_db.latest_summary(conn, task_id)
         task_d = _task_dict(task, latest_summary=full_summary)
+        pending_action = kanban_db.get_pending_action(conn, task_id)
+        if pending_action is not None:
+            # Dashboard clients need the opaque action id and lifecycle state,
+            # not command-derived material, hashes, profile or workspace data.
+            task_d["pending_terminal_action"] = {
+                "id": pending_action.id,
+                "mutation_kind": pending_action.mutation_kind,
+                "summary": pending_action.summary,
+                "expires_at": pending_action.expires_at,
+                "approved": pending_action.approved_at is not None,
+            }
         # Attach diagnostics so the drawer's Diagnostics section can
         # render recovery actions without a second round-trip.
         diags = _compute_task_diagnostics(conn, task_ids=[task_id])
