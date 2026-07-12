@@ -393,6 +393,52 @@ def test_duplicate_pending_request_reuses_one_record(
         ).fetchone()[0] == 1
 
 
+def test_approved_retry_is_stable_and_does_not_emit_second_pending_event(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        first = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command=command,
+                                         summary="publish", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="approval", expected_run_id=task.current_run_id)
+        assert kb.approve_pending_action(conn, task_id, first.id, now=1_900_000_000)
+        before = kb.get_pending_action_by_id(conn, task_id, first.id)
+        attention = kb.get_current_attention(conn, task_id, now=1_900_000_000)
+        assert before is not None and attention is not None
+        second = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command=command,
+                                          summary="publish", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_100)
+        after = kb.get_pending_action_by_id(conn, task_id, first.id)
+        current = kb.get_current_attention(conn, task_id, now=1_900_000_001)
+        assert after is not None and current is not None
+        assert (second.id, second.state, after.version, after.expires_at, current.id) == (first.id, "approved", before.version, before.expires_at, attention.id)
+        assert sum(e.kind == "terminal_approval_pending" for e in kb.list_events(conn, task_id=task_id)) == 1
+
+
+def test_terminal_same_identity_rebinds_stable_attention(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        first = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command=command,
+                                         summary="publish", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        old_attention = kb.get_current_attention(conn, task_id)
+        assert old_attention is not None
+        assert kb.resolve_pending_action(conn, task_id, first.id, now=1_900_000_000)
+        second = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command=command,
+                                          summary="publish", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_100)
+        current = kb.get_current_attention(conn, task_id)
+        historic = kb.get_pending_action_by_id(conn, task_id, first.id)
+        assert current is not None and historic is not None
+        assert historic.state == "resolved"
+        assert (current.id, current.action_id) == (old_attention.id, second.id)
+
+
 def test_parallel_consumers_only_one_wins(
     isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -419,6 +465,137 @@ def test_parallel_consumers_only_one_wins(
     for thread in threads:
         thread.join(timeout=5)
     assert sorted(results) == [False, True]
+    with kb.connect() as conn:
+        assert sum(e.kind == "terminal_approval_consumed" for e in kb.list_events(conn, task_id=task_id)) == 1
+
+
+def test_expired_pending_rerequest_rebinds_stable_attention(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = {"value": 50}
+    monkeypatch.setattr(kb.time, "time", lambda: now["value"])
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        first = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command=command,
+                                         summary="ignored", profile="backend-eng", workspace=str(isolated_board), expires_at=100)
+        attention = kb.get_current_attention(conn, task_id, now=50)
+        assert attention is not None
+        now["value"] = 101
+        second = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command=command,
+                                          summary="ignored", profile="backend-eng", workspace=str(isolated_board), expires_at=200)
+        old = kb.get_pending_action_by_id(conn, task_id, first.id)
+        current = kb.get_current_attention(conn, task_id, now=101)
+        assert old is not None and current is not None
+        assert (old.state, second.id != first.id, current.id, current.action_id) == ("expired", True, attention.id, second.id)
+
+
+def test_supersession_only_cancels_current_origin_action(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        first = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command=command,
+                                         summary="ignored", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        other_run = conn.execute("INSERT INTO task_runs (task_id,status,started_at,profile) VALUES (?, 'done', 1, 'backend-eng')", (task_id,)).lastrowid
+        other_hash = kb._pending_action_hash("historical-origin-marker")
+        other_fp = kb._pending_action_fingerprint(board_identity=kb._pending_action_board_identity(conn), task_id=task_id,
+            run_id=other_run, command_hash=other_hash, mutation_kind="terminal-command", profile="backend-eng", workspace=str(isolated_board.resolve()))
+        conn.execute("INSERT INTO task_pending_actions (task_id,run_id,command_hash,fingerprint,mutation_kind,summary,profile,workspace,created_at,expires_at,state,version,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?, 'pending',1,1)",
+            (task_id, other_run, other_hash, other_fp, "terminal-command", kb.PENDING_ACTION_OPERATOR_SUMMARY, "backend-eng", str(isolated_board.resolve()), 1, 2_000_000_000))
+        second = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command=command + " --new-identity",
+                                          summary="ignored", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        assert kb.get_pending_action_by_id(conn, task_id, first.id).state == "cancelled"
+        assert kb.get_pending_action_by_id(conn, task_id, second.id).state == "pending"
+        untouched = conn.execute("SELECT state FROM task_pending_actions WHERE run_id=?", (other_run,)).fetchone()
+        assert untouched["state"] == "pending"
+
+
+def test_parallel_same_identity_record_returns_one_action_and_event(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        run_id = kb.get_task(conn, task_id).current_run_id
+    barrier, ids, errors = threading.Barrier(2), [], []
+    def record() -> None:
+        try:
+            with kb.connect() as conn:
+                barrier.wait()
+                ids.append(kb.record_pending_action(conn, task_id=task_id, run_id=run_id,
+                    command="parallel-record-marker", summary="ignored", profile="backend-eng",
+                    workspace=str(isolated_board), expires_at=2_000_000_000).id)
+        except Exception as exc:  # test records unhandled SQLite races explicitly
+            errors.append(exc)
+    threads = [threading.Thread(target=record) for _ in range(2)]
+    [thread.start() for thread in threads]
+    [thread.join(timeout=5) for thread in threads]
+    assert not errors and sorted(ids) == [ids[0], ids[0]]
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_pending_actions WHERE task_id=? AND state='pending'", (task_id,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 1
+        assert sum(e.kind == "terminal_approval_pending" for e in kb.list_events(conn, task_id=task_id)) == 1
+
+
+def test_parallel_approval_grants_exactly_once(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        action = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command="parallel-approve-marker",
+                                          summary="ignored", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="approval", expected_run_id=task.current_run_id)
+    barrier, results, errors = threading.Barrier(2), [], []
+    def approve() -> None:
+        try:
+            with kb.connect() as conn:
+                barrier.wait()
+                results.append(kb.approve_pending_action(conn, task_id, action.id, now=1_900_000_000))
+        except Exception as exc:
+            errors.append(exc)
+    threads = [threading.Thread(target=approve) for _ in range(2)]
+    [thread.start() for thread in threads]
+    [thread.join(timeout=5) for thread in threads]
+    assert not errors and sorted(results) == [False, True]
+    with kb.connect() as conn:
+        assert sum(e.kind == "terminal_approval_granted" for e in kb.list_events(conn, task_id=task_id)) == 1
+
+
+@pytest.mark.parametrize("field,changed", [
+    ("run_id", 2), ("command_hash", "b" * 64), ("mutation_kind", "different-kind"),
+    ("profile", "identity-profile-two"), ("workspace", "/tmp/identity-workspace-two"),
+    ("board_identity", "/tmp/other-board.db"),
+])
+def test_pending_action_fingerprint_identity_fields_and_ttl(field, changed) -> None:
+    base = dict(board_identity="/tmp/identity-board.db", task_id="identity-task", run_id=1,
+                command_hash="a" * 64, mutation_kind="terminal-command", profile="identity-profile-one",
+                workspace="/tmp/identity-workspace-one")
+    original = kb._pending_action_fingerprint(**base)
+    assert original == kb._pending_action_fingerprint(**base, expires_at=9_999_999)
+    varied = dict(base)
+    varied[field] = changed
+    assert kb._pending_action_fingerprint(**varied) != original
+
+
+def test_public_attention_and_events_do_not_leak_exact_bindings(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    raw = "RAW_COMMAND_SECRET_MARKER_8a2f"
+    profile = "PROFILE_SECRET_MARKER_8a2f"
+    workspace = str((isolated_board / "WORKSPACE_SECRET_MARKER_8a2f").resolve())
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        action = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command=raw,
+                                          summary="ignored", profile=profile, workspace=workspace, expires_at=2_000_000_000)
+        attention = kb.get_current_attention(conn, task_id)
+        public = repr(attention) + repr(kb.list_events(conn, task_id=task_id))
+        for marker in (raw, action.command_hash, action.fingerprint, profile, workspace):
+            assert marker not in public
 
 
 def test_expiry_boundary_archive_and_workspace_drift_fail_closed(
@@ -530,6 +707,27 @@ def test_pending_action_block_preserves_latest_human_guidance(
         ][-1]
         assert blocked.payload["human_summary"] == "Exact publication approval is pending."
         assert blocked.payload["human_action"] == "Approve the displayed action, then resume."
+
+
+def test_package1_attention_projection_and_terminal_states(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        action = kb.record_pending_action(
+            conn, task_id=task_id, run_id=task.current_run_id, command=command,
+            summary="ignored", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000,
+        )
+        attention = kb.get_current_attention(conn, task_id, now=1)
+        assert attention is not None
+        assert attention.action_id == action.id and attention.type == "exact_action"
+        assert attention.summary == kb.PENDING_ACTION_OPERATOR_SUMMARY
+        assert action.command_hash not in repr(attention)
+        assert kb.resolve_pending_action(conn, task_id, action.id, now=2)
+        assert kb.get_current_attention(conn, task_id, now=2) is None
+        assert not kb.approve_pending_action(conn, task_id, action.id, now=3)
 
 
 # Package 0A — desired core contracts for the approval/attention repair.

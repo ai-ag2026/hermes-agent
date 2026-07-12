@@ -276,6 +276,154 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
+def test_connect_recreates_missing_pending_action_table_and_attention_projection(tmp_path):
+    db_path = tmp_path / "missing-pending-actions.db"
+    kb.init_db(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DROP TABLE task_attentions")
+        conn.execute("DROP TABLE task_pending_actions")
+    kb.init_db(db_path)
+    with kb.connect(db_path) as conn:
+        action_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_pending_actions)")}
+        attention_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_attentions)")}
+        indexes = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        assert {"state", "version", "updated_at", "resolved_at"} <= action_columns
+        assert {"action_id", "type", "cause_fingerprint"} <= attention_columns
+        assert {"uq_pending_action_active_identity", "uq_pending_action_active_origin"} <= indexes
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+
+
+def _install_v1_pending_action_fixture(db_path: Path) -> dict[str, object]:
+    """Build a real pre-lifecycle table, including V1 fingerprints."""
+    kb.init_db(db_path)
+    fixture: dict[str, object] = {"tasks": {}, "actions": {}}
+    with kb.connect(db_path) as conn:
+        board = kb._pending_action_board_identity(conn)
+        fixture["board"] = board
+        tasks = fixture["tasks"]
+        actions = fixture["actions"]
+        assert isinstance(tasks, dict) and isinstance(actions, dict)
+        for name in (
+            "pending", "approved", "duplicate", "invalid_no_run",
+            "invalid_no_kind", "invalid_no_fingerprint",
+        ):
+            task_id = kb.create_task(conn, title=name, assignee="legacy")
+            claimed = kb.claim_task(conn, task_id, claimer="legacy")
+            assert claimed is not None and claimed.current_run_id is not None
+            tasks[name] = {"run_id": claimed.current_run_id, "task_id": task_id}
+        conn.execute("DROP TABLE task_attentions")
+        conn.execute("DROP TABLE task_pending_actions")
+        conn.execute("""CREATE TABLE task_pending_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, run_id INTEGER,
+            command_hash TEXT NOT NULL, fingerprint TEXT, mutation_kind TEXT,
+            summary TEXT NOT NULL, profile TEXT NOT NULL, workspace TEXT NOT NULL,
+            created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, approved_at INTEGER,
+            consumed_at INTEGER)""")
+        def insert(name, *, task_name=None, approved=False, run_id="default", mutation_kind="terminal-command", fingerprint="valid"):
+            task = tasks[task_name or name]
+            assert isinstance(task, dict)
+            origin, task_id = task["run_id"], task["task_id"]
+            run_id = origin if run_id == "default" else run_id
+            expires = 2_000_000_000
+            profile = "legacy-profile"
+            workspace = str((db_path.parent / "legacy-workspace").resolve())
+            command = f"legacy-{name}-command"
+            command_hash = kb._pending_action_hash(command)
+            fp = fingerprint
+            if fp == "valid":
+                fp = kb._pending_action_fingerprint(board_identity=board, task_id=task_id, run_id=run_id,
+                    command_hash=command_hash, mutation_kind=mutation_kind or "terminal-command",
+                    profile=profile, workspace=workspace, expires_at=expires, version=1) if run_id is not None and mutation_kind is not None else None
+            action_id = conn.execute("INSERT INTO task_pending_actions (task_id,run_id,command_hash,fingerprint,mutation_kind,summary,profile,workspace,created_at,expires_at,approved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (task_id, run_id, command_hash, fp, mutation_kind, "legacy", profile, workspace, 10, expires, 20 if approved else None)).lastrowid
+            actions[name] = {"id": action_id, "task_id": task_id, "run_id": run_id, "command": command,
+                             "command_hash": command_hash, "fingerprint_v1": fp, "mutation_kind": mutation_kind,
+                             "profile": profile, "workspace": workspace, "expires_at": expires}
+        insert("pending")
+        insert("approved", approved=True)
+        insert("duplicate")
+        insert("duplicate_approved_low", task_name="duplicate", approved=True)
+        insert("duplicate_approved_high", task_name="duplicate", approved=True)
+        insert("invalid_no_run", run_id=None)
+        insert("invalid_no_kind", mutation_kind=None)
+        insert("invalid_no_fingerprint", fingerprint=None)
+    return fixture
+
+
+def test_v1_pending_action_migration_preserves_valid_history_and_is_idempotent(tmp_path):
+    db_path = tmp_path / "v1-actions.db"
+    fixture = _install_v1_pending_action_fixture(db_path)
+    tasks = fixture["tasks"]
+    actions = fixture["actions"]
+    assert isinstance(tasks, dict) and isinstance(actions, dict)
+    kb.init_db(db_path)
+    with kb.connect(db_path) as conn:
+        rows = conn.execute("SELECT id,task_id,state,version,fingerprint,resolved_at FROM task_pending_actions ORDER BY id").fetchall()
+        by_id = {row["id"]: row for row in rows}
+        assert by_id[actions["pending"]["id"]]["state"] == "pending"
+        assert by_id[actions["approved"]["id"]]["state"] == "approved"
+        assert by_id[actions["duplicate"]["id"]]["state"] == "cancelled"
+        assert by_id[actions["duplicate_approved_low"]["id"]]["state"] == "cancelled"
+        assert by_id[actions["duplicate_approved_high"]["id"]]["state"] == "approved"
+        assert actions["duplicate_approved_high"]["id"] > actions["duplicate_approved_low"]["id"]
+        invalid_actions = [actions[name] for name in ("invalid_no_run", "invalid_no_kind", "invalid_no_fingerprint")]
+        for action in invalid_actions:
+            row = by_id[action["id"]]
+            assert row["state"] == "resolved" and row["resolved_at"] is not None
+            assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE action_id=?", (action["id"],)).fetchone()[0] == 0
+            assert not kb.approve_pending_action(conn, action["task_id"], action["id"], now=100)
+            if action["run_id"] is None:
+                assert conn.execute("SELECT COUNT(*) FROM task_pending_actions WHERE id=? AND state='approved'", (action["id"],)).fetchone()[0] == 0
+            else:
+                conn.execute("UPDATE task_runs SET status='done', outcome='blocked', ended_at=30 WHERE id=?", (action["run_id"],))
+                resumed = conn.execute("INSERT INTO task_runs (task_id,status,started_at,profile) VALUES (?, 'running', 40, ?)", (action["task_id"], action["profile"])).lastrowid
+                conn.execute("UPDATE tasks SET status='running', current_run_id=? WHERE id=?", (resumed, action["task_id"]))
+                assert not kb.consume_approved_action(conn, task_id=action["task_id"], run_id=resumed, command=action["command"], profile=action["profile"], workspace=action["workspace"], now=100)
+        assert all(r["version"] == 1 for r in rows if r["state"] != "cancelled")
+        assert [r["version"] for r in rows if r["state"] == "cancelled"] == [2, 2]
+        assert all(len(r["fingerprint"] or "") == 64 for r in rows if r["state"] != "resolved")
+        active_names = ("pending", "approved", "duplicate_approved_high")
+        expected_attentions = []
+        for name in active_names:
+            action = actions[name]
+            expected_v2 = kb._pending_action_fingerprint(board_identity=fixture["board"], task_id=action["task_id"], run_id=action["run_id"], command_hash=action["command_hash"], mutation_kind=action["mutation_kind"], profile=action["profile"], workspace=action["workspace"])
+            assert by_id[action["id"]]["fingerprint"] == expected_v2
+            expected_attentions.append((action["task_id"], action["id"], "exact_action", expected_v2))
+        attentions = [tuple(row) for row in conn.execute("SELECT id,task_id,action_id,type,cause_fingerprint,summary,created_at FROM task_attentions ORDER BY id")]
+        assert len(attentions) == len(expected_attentions)
+        assert [(row[1], row[2], row[3], row[4]) for row in attentions] == sorted(expected_attentions)
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        snapshot = ([tuple(r) for r in rows], attentions)
+    kb.init_db(db_path)
+    with kb.connect(db_path) as conn:
+        again = ([tuple(r) for r in conn.execute("SELECT id,task_id,state,version,fingerprint,resolved_at FROM task_pending_actions ORDER BY id")], [tuple(r) for r in conn.execute("SELECT id,task_id,action_id,type,cause_fingerprint,summary,created_at FROM task_attentions ORDER BY id")])
+        assert again == snapshot
+
+
+def test_v1_approved_action_migrates_and_consumes_from_resumed_run(tmp_path):
+    db_path = tmp_path / "v1-consume.db"
+    fixture = _install_v1_pending_action_fixture(db_path)
+    actions = fixture["actions"]
+    assert isinstance(actions, dict)
+    kb.init_db(db_path)
+    approved = actions["approved"]
+    with kb.connect(db_path) as conn:
+        row = conn.execute("SELECT id,command_hash,fingerprint FROM task_pending_actions WHERE id=?", (approved["id"],)).fetchone()
+        assert row is not None
+        expected_v2 = kb._pending_action_fingerprint(board_identity=fixture["board"], task_id=approved["task_id"], run_id=approved["run_id"], command_hash=approved["command_hash"], mutation_kind=approved["mutation_kind"], profile=approved["profile"], workspace=approved["workspace"])
+        assert row["command_hash"] == kb._pending_action_hash(approved["command"])
+        assert row["fingerprint"] == expected_v2
+        assert row["fingerprint"] != approved["fingerprint_v1"]
+        conn.execute("UPDATE task_runs SET status='done', outcome='blocked', ended_at=30 WHERE id=?", (approved["run_id"],))
+        resumed = conn.execute("INSERT INTO task_runs (task_id,status,started_at,profile) VALUES (?, 'running', 40, ?)", (approved["task_id"], approved["profile"])).lastrowid
+        conn.execute("UPDATE tasks SET status='running', current_run_id=? WHERE id=?", (resumed, approved["task_id"]))
+        conn.commit()
+        assert kb.consume_approved_action(conn, task_id=approved["task_id"], run_id=resumed, command=approved["command"], profile=approved["profile"], workspace=approved["workspace"], now=100)
+        assert kb.get_pending_action_by_id(conn, approved["task_id"], row["id"]).state == "consumed"
+        events = conn.execute("SELECT kind FROM task_events WHERE task_id=? AND run_id=? AND kind='terminal_approval_consumed'", (approved["task_id"], resumed)).fetchall()
+        assert len(events) == 1
+
+
 # ---------------------------------------------------------------------------
 # Task creation + status inference
 # ---------------------------------------------------------------------------

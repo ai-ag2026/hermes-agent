@@ -1230,6 +1230,27 @@ class PendingAction:
     approved_at: Optional[int] = None
     consumed_at: Optional[int] = None
     cancelled_at: Optional[int] = None
+    state: str = "pending"
+    version: int = 1
+    updated_at: int = 0
+    resolved_at: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class Attention:
+    """Safe current-operator projection of one exact action."""
+
+    id: int
+    task_id: str
+    action_id: int
+    type: str
+    summary: str
+    created_at: int
+    state: str
+    version: int
+    expires_at: int
+    requires_human_action: bool
+    approvable: bool
 
 
 @dataclass
@@ -1431,11 +1452,26 @@ CREATE TABLE IF NOT EXISTS task_pending_actions (
     expires_at   INTEGER NOT NULL,
     approved_at  INTEGER,
     consumed_at  INTEGER,
-    cancelled_at INTEGER
+    cancelled_at INTEGER,
+    state        TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','approved','consumed','expired','cancelled','resolved')),
+    version      INTEGER NOT NULL DEFAULT 1,
+    updated_at   INTEGER NOT NULL DEFAULT 0,
+    resolved_at  INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_actions_task
     ON task_pending_actions(task_id, consumed_at, expires_at);
+
+CREATE TABLE IF NOT EXISTS task_attentions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id           TEXT NOT NULL,
+    action_id         INTEGER NOT NULL UNIQUE,
+    type              TEXT NOT NULL CHECK(type IN ('exact_action','decision','capability','transient','loop_triage','protocol','review')),
+    cause_fingerprint TEXT NOT NULL,
+    summary           TEXT NOT NULL,
+    created_at        INTEGER NOT NULL,
+    UNIQUE(task_id, cause_fingerprint)
+);
 
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
@@ -2282,6 +2318,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "task_pending_actions", "cancelled_at", "cancelled_at INTEGER"
         )
+    # Exact-action lifecycle is additive and remains authoritative; the linked
+    # attention row is deliberately only an operator projection.
+    if action_cols:
+        for name, definition in (
+            ("state", "state TEXT NOT NULL DEFAULT 'pending'"),
+            ("version", "version INTEGER NOT NULL DEFAULT 1"),
+            ("updated_at", "updated_at INTEGER NOT NULL DEFAULT 0"),
+            ("resolved_at", "resolved_at INTEGER"),
+        ):
+            if name not in action_cols:
+                _add_column_if_missing(conn, "task_pending_actions", name, definition)
+        _migrate_pending_action_lifecycle(conn)
 
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
@@ -7269,10 +7317,12 @@ def _pending_action_fingerprint(
     mutation_kind: str,
     profile: str,
     workspace: str,
-    expires_at: int,
+    expires_at: Optional[int] = None,
+    version: int = 2,
 ) -> str:
+    """Hash immutable exact-action bindings; expiry is mutable metadata."""
     manifest = {
-        "version": 1,
+        "version": version,
         "board": board_identity,
         "task_id": task_id,
         "origin_run_id": run_id,
@@ -7280,8 +7330,11 @@ def _pending_action_fingerprint(
         "mutation_kind": mutation_kind,
         "profile": profile,
         "workspace": workspace,
-        "expires_at": int(expires_at),
     }
+    if version == 1:
+        if expires_at is None:
+            raise ValueError("v1 fingerprint requires expires_at")
+        manifest["expires_at"] = int(expires_at)
     payload = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -7295,27 +7348,117 @@ def _pending_action_from_row(row: sqlite3.Row) -> PendingAction:
         summary=row["summary"], profile=row["profile"], workspace=row["workspace"],
         expires_at=int(row["expires_at"]),
         approved_at=row["approved_at"], consumed_at=row["consumed_at"],
-        cancelled_at=row["cancelled_at"],
+        cancelled_at=row["cancelled_at"], state=row["state"] if "state" in row.keys() else "pending",
+        version=int(row["version"] or 1) if "version" in row.keys() else 1,
+        updated_at=int(row["updated_at"] or row["created_at"]) if "updated_at" in row.keys() else int(row["created_at"]),
+        resolved_at=row["resolved_at"] if "resolved_at" in row.keys() else None,
     )
 
 
 def _pending_action_fingerprint_valid(
     conn: sqlite3.Connection, row: sqlite3.Row,
 ) -> bool:
-    fingerprint = str(row["fingerprint"] or "")
-    if not fingerprint:
+    # Security bindings are mandatory; legacy incomplete rows are historical,
+    # never active authorization candidates.
+    required = ("run_id", "command_hash", "mutation_kind", "profile", "workspace", "fingerprint")
+    if any(row[name] is None or str(row[name]) == "" for name in required):
         return False
-    expected = _pending_action_fingerprint(
-        board_identity=_pending_action_board_identity(conn),
-        task_id=row["task_id"],
-        run_id=int(row["run_id"]),
-        command_hash=row["command_hash"],
-        mutation_kind=row["mutation_kind"] or "terminal-command",
-        profile=row["profile"],
-        workspace=row["workspace"],
-        expires_at=int(row["expires_at"]),
+    try:
+        bindings = dict(
+            board_identity=_pending_action_board_identity(conn), task_id=row["task_id"],
+            run_id=int(row["run_id"]), command_hash=row["command_hash"],
+            mutation_kind=row["mutation_kind"], profile=row["profile"], workspace=row["workspace"],
+        )
+        v2 = _pending_action_fingerprint(**bindings)
+        v1 = _pending_action_fingerprint(**bindings, expires_at=int(row["expires_at"]), version=1)
+    except (TypeError, ValueError):
+        return False
+    return secrets.compare_digest(str(row["fingerprint"]), v2) or secrets.compare_digest(str(row["fingerprint"]), v1)
+
+
+def _materialize_expired_actions(conn: sqlite3.Connection, now: int) -> None:
+    conn.execute(
+        "UPDATE task_pending_actions SET state='expired', version=version+1, updated_at=? "
+        "WHERE state IN ('pending','approved') AND expires_at <= ?", (now, now),
     )
-    return secrets.compare_digest(fingerprint, expected)
+
+
+def _upsert_exact_action_attention(conn: sqlite3.Connection, action_id: int, task_id: str, fingerprint: str, now: int) -> None:
+    """Rebind the stable operator projection to the current action for a cause.
+
+    Exact-action history remains in ``task_pending_actions``.  The projection
+    intentionally has one stable identity per task/cause, so a fresh request
+    after a terminal action updates this row instead of being suppressed.
+    """
+    conn.execute(
+        "INSERT INTO task_attentions (task_id, action_id, type, cause_fingerprint, summary, created_at) "
+        "VALUES (?, ?, 'exact_action', ?, ?, ?) "
+        "ON CONFLICT(task_id, cause_fingerprint) DO UPDATE SET "
+        "action_id=excluded.action_id, type=excluded.type, summary=excluded.summary",
+        (task_id, action_id, fingerprint, PENDING_ACTION_OPERATOR_SUMMARY, now),
+    )
+
+
+def _migrate_pending_action_lifecycle(conn: sqlite3.Connection) -> None:
+    now = int(time.time())
+    with write_txn(conn):
+        _materialize_expired_actions(conn, now)
+        rows = conn.execute("SELECT * FROM task_pending_actions").fetchall()
+        for row in rows:
+            valid = _pending_action_fingerprint_valid(conn, row)
+            state = row["state"] or "pending"
+            if row["consumed_at"] is not None:
+                state = "consumed"
+            elif row["cancelled_at"] is not None:
+                state = "cancelled"
+            elif not valid:
+                state = "resolved"
+            elif row["approved_at"] is not None and int(row["expires_at"]) > now:
+                state = "approved"
+            elif int(row["expires_at"]) <= now:
+                state = "expired"
+            else:
+                state = "pending"
+            fingerprint = row["fingerprint"]
+            if valid:
+                bindings = dict(board_identity=_pending_action_board_identity(conn), task_id=row["task_id"], run_id=int(row["run_id"]), command_hash=row["command_hash"], mutation_kind=row["mutation_kind"], profile=row["profile"], workspace=row["workspace"])
+                fingerprint = _pending_action_fingerprint(**bindings)
+            conn.execute(
+                "UPDATE task_pending_actions SET state=?, version=COALESCE(version, 1), "
+                "updated_at=CASE WHEN COALESCE(updated_at, 0)=0 THEN COALESCE(cancelled_at, consumed_at, approved_at, created_at) ELSE updated_at END, "
+                "resolved_at=CASE WHEN ?='resolved' THEN COALESCE(resolved_at, ?) ELSE resolved_at END, fingerprint=? WHERE id=?",
+                (state, state, now, fingerprint, row["id"]),
+            )
+        # Pre-index legacy schemas could contain several active rows.  Keep one
+        # deterministic survivor per task/origin (approved before pending, then
+        # newest/largest id) and retain every loser as cancelled history.
+        active = conn.execute(
+            "SELECT * FROM task_pending_actions WHERE state IN ('pending','approved') "
+            "ORDER BY task_id, run_id, CASE state WHEN 'approved' THEN 0 ELSE 1 END, id DESC"
+        ).fetchall()
+        survivors: list[sqlite3.Row] = []
+        seen_origins: set[tuple[str, int]] = set()
+        for row in active:
+            key = (str(row["task_id"]), int(row["run_id"]))
+            if key in seen_origins:
+                conn.execute(
+                    "UPDATE task_pending_actions SET state='cancelled', cancelled_at=COALESCE(cancelled_at, ?), "
+                    "updated_at=?, version=version+1 WHERE id=? AND state IN ('pending','approved')",
+                    (now, now, row["id"]),
+                )
+            else:
+                seen_origins.add(key)
+                survivors.append(row)
+        # Project each active valid survivor.  The UPSERT deliberately retains
+        # an existing stable attention id while rebinding its action id.
+        for row in survivors:
+            current = conn.execute("SELECT * FROM task_pending_actions WHERE id=?", (row["id"],)).fetchone()
+            if current is not None and current["state"] in ("pending", "approved"):
+                _upsert_exact_action_attention(conn, int(current["id"]), str(current["task_id"]), str(current["fingerprint"]), now)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_action_active_identity ON task_pending_actions(task_id, run_id, command_hash, mutation_kind, profile, workspace) WHERE state IN ('pending','approved')")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_action_active_origin ON task_pending_actions(task_id, run_id) WHERE state IN ('pending','approved')")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_action_current ON task_pending_actions(task_id, state, expires_at, id DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_action_fingerprint ON task_pending_actions(fingerprint, state)")
 
 
 def record_pending_action(
@@ -7343,71 +7486,74 @@ def record_pending_action(
     if expires_at <= now:
         raise ValueError("pending action expiry must be in the future")
     fingerprint = _pending_action_fingerprint(
-        board_identity=_pending_action_board_identity(conn),
-        task_id=task_id,
-        run_id=run_id,
-        command_hash=command_hash,
-        mutation_kind=mutation_kind,
-        profile=profile,
-        workspace=workspace,
-        expires_at=expires_at,
+        board_identity=_pending_action_board_identity(conn), task_id=task_id, run_id=run_id,
+        command_hash=command_hash, mutation_kind=mutation_kind, profile=profile, workspace=workspace,
     )
     with write_txn(conn):
-        task = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
+        _materialize_expired_actions(conn, now)
+        task = conn.execute("SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if task is None:
             raise ValueError(f"task {task_id!r} does not exist")
-        if task["status"] != "running" or task["current_run_id"] != run_id:
-            raise ValueError("pending action must be recorded by the task's current run")
+        if run_id is None or not profile or not workspace:
+            raise ValueError("exact action requires run_id, profile, and workspace")
         existing = conn.execute(
-            "SELECT * FROM task_pending_actions WHERE task_id = ? AND run_id = ? "
-            "AND command_hash = ? AND fingerprint = ? AND profile = ? AND workspace = ? "
-            "AND approved_at IS NULL AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ? "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id, run_id, command_hash, fingerprint, profile, workspace, now),
+            "SELECT * FROM task_pending_actions WHERE task_id=? AND run_id=? AND state IN ('pending','approved') ORDER BY id DESC LIMIT 1",
+            (task_id, run_id),
         ).fetchone()
+        if existing is not None and str(existing["fingerprint"] or "") == fingerprint:
+            # A grant is immutable: retrying the exact identity must not extend
+            # TTL/version or manufacture another pending event.
+            if existing["state"] == "approved":
+                _upsert_exact_action_attention(conn, int(existing["id"]), task_id, fingerprint, now)
+                return _pending_action_from_row(existing)
+            cur = conn.execute(
+                "UPDATE task_pending_actions SET expires_at=MAX(expires_at, ?), updated_at=?, version=version+1 "
+                "WHERE id=? AND version=? AND state='pending'",
+                (expires_at, now, existing["id"], existing["version"]),
+            )
+            if cur.rowcount == 1:
+                refreshed = conn.execute("SELECT * FROM task_pending_actions WHERE id=?", (existing["id"],)).fetchone()
+                _upsert_exact_action_attention(conn, int(existing["id"]), task_id, fingerprint, now)
+                return _pending_action_from_row(refreshed)
+            # BEGIN IMMEDIATE normally serializes this path, but return a
+            # settled matching action on a genuine CAS race rather than raising
+            # a lifecycle exception or creating a duplicate row.
+            settled = conn.execute("SELECT * FROM task_pending_actions WHERE id=?", (existing["id"],)).fetchone()
+            if settled is not None and settled["state"] in ("pending", "approved") and str(settled["fingerprint"] or "") == fingerprint:
+                _upsert_exact_action_attention(conn, int(settled["id"]), task_id, fingerprint, now)
+                return _pending_action_from_row(settled)
+            raise RuntimeError("exact action refresh conflict")
+        if task["current_run_id"] != run_id or task["status"] != "running":
+            raise ValueError("pending action must be recorded by the task's current run")
         if existing is not None:
-            return _pending_action_from_row(existing)
-        superseded = conn.execute(
-            "SELECT id FROM task_pending_actions WHERE task_id = ? "
-            "AND consumed_at IS NULL AND cancelled_at IS NULL",
-            (task_id,),
-        ).fetchall()
-        for old in superseded:
-            conn.execute(
-                "UPDATE task_pending_actions SET cancelled_at = ? WHERE id = ? "
-                "AND consumed_at IS NULL AND cancelled_at IS NULL",
-                (now, int(old["id"])),
+            cur = conn.execute(
+                "UPDATE task_pending_actions SET state='cancelled', cancelled_at=?, updated_at=?, version=version+1 "
+                "WHERE id=? AND version=? AND state IN ('pending','approved')",
+                (now, now, existing["id"], existing["version"]),
             )
-            _append_event(
-                conn, task_id, "terminal_approval_cancelled",
-                {"action_id": int(old["id"]), "reason": "superseded"},
-                run_id=run_id,
+            if cur.rowcount == 1:
+                _append_event(conn, task_id, "terminal_approval_cancelled", {"action_id": int(existing["id"]), "reason": "superseded"}, run_id=run_id)
+        try:
+            cur = conn.execute(
+                "INSERT INTO task_pending_actions (task_id, run_id, command_hash, fingerprint, mutation_kind, summary, profile, workspace, created_at, expires_at, state, version, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?)",
+                (task_id, run_id, command_hash, fingerprint, mutation_kind, summary, profile, workspace, now, expires_at, now),
             )
-        cur = conn.execute(
-            "INSERT INTO task_pending_actions "
-            "(task_id, run_id, command_hash, fingerprint, mutation_kind, summary, profile, workspace, "
-            "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (task_id, run_id, command_hash, fingerprint, mutation_kind, summary,
-             profile, workspace, now, expires_at),
-        )
-        if cur.lastrowid is None:
-            raise RuntimeError("failed to persist pending action")
+        except sqlite3.IntegrityError as exc:
+            settled = conn.execute(
+                "SELECT * FROM task_pending_actions WHERE task_id=? AND run_id=? AND fingerprint=? "
+                "AND state IN ('pending','approved') ORDER BY id DESC LIMIT 1",
+                (task_id, run_id, fingerprint),
+            ).fetchone()
+            if settled is not None:
+                _upsert_exact_action_attention(conn, int(settled["id"]), task_id, fingerprint, now)
+                return _pending_action_from_row(settled)
+            raise RuntimeError("exact action creation conflict") from exc
         action_id = int(cur.lastrowid)
-        _append_event(
-            conn, task_id, "terminal_approval_pending",
-            {"action_id": action_id, "mutation_kind": mutation_kind,
-             "summary": summary, "profile": profile, "workspace": workspace,
-             "expires_at": expires_at},
-            run_id=run_id,
-        )
-    return PendingAction(
-        id=action_id, task_id=task_id, run_id=run_id,
-        command_hash=command_hash, fingerprint=fingerprint,
-        mutation_kind=mutation_kind, summary=summary, profile=profile,
-        workspace=workspace, expires_at=expires_at,
-    )
+        _upsert_exact_action_attention(conn, action_id, task_id, fingerprint, now)
+        _append_event(conn, task_id, "terminal_approval_pending", {"action_id": action_id, "mutation_kind": mutation_kind, "summary": summary, "expires_at": expires_at}, run_id=run_id)
+        row = conn.execute("SELECT * FROM task_pending_actions WHERE id=?", (action_id,)).fetchone()
+        return _pending_action_from_row(row)
 
 
 def get_pending_action(
@@ -7416,7 +7562,7 @@ def get_pending_action(
     now = int(time.time()) if now is None else int(now)
     row = conn.execute(
         "SELECT * FROM task_pending_actions WHERE task_id = ? "
-        "AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ? ORDER BY id DESC LIMIT 1",
+        "AND state IN ('pending','approved') AND expires_at > ? ORDER BY id DESC LIMIT 1",
         (task_id, now),
     ).fetchone()
     if row is None:
@@ -7442,22 +7588,22 @@ def approve_pending_action(
     """Grant one exact pending action; replay and expired grants fail closed."""
     now = int(time.time()) if now is None else int(now)
     with write_txn(conn):
+        _materialize_expired_actions(conn, now)
         row = conn.execute(
             "SELECT a.* FROM task_pending_actions a "
             "JOIN tasks t ON t.id = a.task_id "
             "JOIN task_runs r ON r.id = a.run_id AND r.task_id = a.task_id "
-            "WHERE a.id = ? AND a.task_id = ? AND a.approved_at IS NULL "
-            "AND a.consumed_at IS NULL AND a.cancelled_at IS NULL AND a.expires_at > ? "
+            "WHERE a.id = ? AND a.task_id = ? AND a.state = 'pending' AND a.expires_at > ? "
             "AND t.status = 'blocked' AND r.outcome = 'blocked'",
             (int(action_id), task_id, now),
         ).fetchone()
         if row is None or not _pending_action_fingerprint_valid(conn, row):
             return False
         cur = conn.execute(
-            "UPDATE task_pending_actions SET approved_at = ? "
-            "WHERE id = ? AND task_id = ? AND fingerprint = ? "
-            "AND approved_at IS NULL AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ?",
-            (now, int(action_id), task_id, row["fingerprint"], now),
+            "UPDATE task_pending_actions SET approved_at = ?, state='approved', updated_at=?, version=version+1 "
+            "WHERE id = ? AND task_id = ? AND fingerprint = ? AND version=? "
+            "AND state='pending' AND expires_at > ?",
+            (now, now, int(action_id), task_id, row["fingerprint"], row["version"], now),
         )
         if cur.rowcount != 1:
             return False
@@ -7475,6 +7621,7 @@ def approve_pending_action_and_unblock(
     """Atomically grant one exact action and return its blocked card to work."""
     now = int(time.time()) if now is None else int(now)
     with write_txn(conn):
+        _materialize_expired_actions(conn, now)
         task = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -7483,8 +7630,7 @@ def approve_pending_action_and_unblock(
         action = conn.execute(
             "SELECT a.* FROM task_pending_actions a "
             "JOIN task_runs r ON r.id = a.run_id AND r.task_id = a.task_id "
-            "WHERE a.id = ? AND a.task_id = ? AND a.approved_at IS NULL "
-            "AND a.consumed_at IS NULL AND a.cancelled_at IS NULL AND a.expires_at > ? "
+            "WHERE a.id = ? AND a.task_id = ? AND a.state='pending' AND a.expires_at > ? "
             "AND r.outcome = 'blocked'",
             (int(action_id), task_id, now),
         ).fetchone()
@@ -7497,10 +7643,9 @@ def approve_pending_action_and_unblock(
         ).fetchone()
         new_status = "todo" if undone_parent else "ready"
         cur = conn.execute(
-            "UPDATE task_pending_actions SET approved_at = ? "
-            "WHERE id = ? AND fingerprint = ? AND approved_at IS NULL "
-            "AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ?",
-            (now, int(action_id), action["fingerprint"], now),
+            "UPDATE task_pending_actions SET approved_at=?, state='approved', updated_at=?, version=version+1 "
+            "WHERE id=? AND fingerprint=? AND version=? AND state='pending' AND expires_at > ?",
+            (now, now, int(action_id), action["fingerprint"], action["version"], now),
         )
         if cur.rowcount != 1:
             return False
@@ -7537,14 +7682,14 @@ def consume_approved_action(
     mutation_kind = _pending_action_mutation_kind(command)
     workspace = str(Path(workspace).resolve())
     with write_txn(conn):
+        _materialize_expired_actions(conn, now)
         row = conn.execute(
             "SELECT a.* FROM task_pending_actions a "
             "JOIN tasks t ON t.id = a.task_id "
             "JOIN task_runs origin ON origin.id = a.run_id AND origin.task_id = a.task_id "
             "JOIN task_runs active ON active.id = ? AND active.task_id = a.task_id "
             "WHERE a.task_id = ? AND a.command_hash = ? AND a.mutation_kind = ? "
-            "AND a.profile = ? AND a.workspace = ? AND a.approved_at IS NOT NULL "
-            "AND a.consumed_at IS NULL AND a.cancelled_at IS NULL AND a.expires_at > ? "
+            "AND a.profile = ? AND a.workspace = ? AND a.state='approved' AND a.expires_at > ? "
             "AND t.status = 'running' AND t.current_run_id = active.id "
             "AND active.status = 'running' AND active.ended_at IS NULL "
             "AND active.profile = a.profile AND origin.outcome = 'blocked' "
@@ -7569,9 +7714,9 @@ def consume_approved_action(
         ):
             return False
         cur = conn.execute(
-            "UPDATE task_pending_actions SET consumed_at = ? "
-            "WHERE id = ? AND fingerprint = ? AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ?",
-            (now, int(row["id"]), expected_fingerprint, now),
+            "UPDATE task_pending_actions SET consumed_at=?, state='consumed', updated_at=?, version=version+1 "
+            "WHERE id=? AND fingerprint=? AND version=? AND state='approved' AND expires_at > ?",
+            (now, now, int(row["id"]), expected_fingerprint, row["version"], now),
         )
         if cur.rowcount != 1:
             return False
@@ -7581,6 +7726,38 @@ def consume_approved_action(
             run_id=int(run_id),
         )
         return True
+
+
+def get_current_attention(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None) -> Optional[Attention]:
+    """Return the safe live projection; lifecycle fields come from its action."""
+    now = int(time.time()) if now is None else int(now)
+    row = conn.execute(
+        "SELECT a.*, x.id AS attention_id, x.type, x.created_at AS attention_created_at "
+        "FROM task_attentions x JOIN task_pending_actions a ON a.id=x.action_id "
+        "WHERE x.task_id=? AND a.state IN ('pending','approved') AND a.expires_at>? ORDER BY x.id DESC LIMIT 1",
+        (task_id, now),
+    ).fetchone()
+    if row is None:
+        return None
+    return Attention(id=int(row["attention_id"]), task_id=task_id, action_id=int(row["id"]), type=row["type"],
+                     summary=row["summary"],
+                     created_at=int(row["attention_created_at"]), state=row["state"], version=int(row["version"]),
+                     expires_at=int(row["expires_at"]), requires_human_action=True, approvable=row["state"] == "pending")
+
+
+def resolve_pending_action(conn: sqlite3.Connection, task_id: str, action_id: int, *, now: Optional[int] = None) -> bool:
+    """Terminal fail-closed resolution without consuming an exact command."""
+    now = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        _materialize_expired_actions(conn, now)
+        row = conn.execute("SELECT * FROM task_pending_actions WHERE id=? AND task_id=?", (action_id, task_id)).fetchone()
+        if row is None or row["state"] not in ("pending", "approved"):
+            return False
+        return conn.execute(
+            "UPDATE task_pending_actions SET state='resolved', resolved_at=?, updated_at=?, version=version+1 "
+            "WHERE id=? AND version=? AND state IN ('pending','approved')",
+            (now, now, action_id, row["version"]),
+        ).rowcount == 1
 
 
 def _cancel_approved_pending_action(
@@ -7596,9 +7773,9 @@ def _cancel_approved_pending_action(
     ).fetchall()
     for row in rows:
         cur = conn.execute(
-            "UPDATE task_pending_actions SET cancelled_at = ? "
-            "WHERE id = ? AND consumed_at IS NULL AND cancelled_at IS NULL",
-            (int(now), int(row["id"])),
+            "UPDATE task_pending_actions SET cancelled_at = ?, state='cancelled', updated_at=?, version=version+1 "
+            "WHERE id = ? AND state='approved'",
+            (int(now), int(now), int(row["id"])),
         )
         if cur.rowcount == 1:
             _append_event(
