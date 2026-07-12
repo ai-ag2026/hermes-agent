@@ -130,6 +130,28 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# Cause identities are deliberately a separate, small vocabulary from routing
+# ``block_kind``.  Never derive these from prose: raw reasons commonly contain
+# credentials, paths, or model text and are not a safe durable identity.
+VALID_BLOCK_ATTENTION_TYPES = frozenset({"decision", "capability", "transient", "protocol", "review", "loop_triage"})
+VALID_BLOCK_REASON_CODES = frozenset({
+    "credential_choice", "publication_approval", "missing_capability",
+    "external_transient", "goal_closeout_missing", "review_required",
+})
+BLOCK_CAUSE_VERSION = 1
+# Typed causes may use only a tiny product vocabulary. Scope is identity
+# metadata, never an operator message: accepting arbitrary values here would
+# merely move a secret/path leak into an opaque fingerprint input.
+BLOCK_CAUSE_SCOPE_ENUMS: dict[tuple[str, str], dict[str, frozenset[str]]] = {
+    ("decision", "credential_choice"): {"required_decision": frozenset({"credential"})},
+    ("decision", "publication_approval"): {"required_decision": frozenset({"publication"})},
+    ("capability", "missing_capability"): {"capability": frozenset({"access", "credential", "tool"})},
+    ("transient", "external_transient"): {"subject": frozenset({"external_service"})},
+    ("protocol", "goal_closeout_missing"): {"protocol": frozenset({"goal_closeout"})},
+    ("review", "review_required"): {"subject": frozenset({"review"})},
+    ("loop_triage", "review_required"): {"subject": frozenset({"loop"})},
+}
+
 # Goal-mode tasks may only block with kinds that represent a genuine external
 # blocker the worker cannot resolve itself; everything else must route through
 # complete (where the goal judge gates). Canonical here (audit 2026-07-11,
@@ -1359,6 +1381,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Versioned typed cause identity for the recurrence chain.  NULL is
+    -- intentionally legacy/unknown and must never continue a prior chain.
+    block_cause_fingerprint TEXT,
+    block_reason_code     TEXT,
+    block_cause_version   INTEGER,
     completion_contract  TEXT,
     -- Human-Gate v1 (2026-07-11, see human-gate-design.md). When 1, this
     -- card can only be unblocked with a one-time token pushed to the
@@ -2485,6 +2512,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+
+    # Legacy block rows have no auditable typed cause. Keep these NULL rather
+    # than guessing from event prose, so their old counter cannot trip a new
+    # cause's loop threshold after upgrade.
+    for name, definition in (
+        ("block_cause_fingerprint", "block_cause_fingerprint TEXT"),
+        ("block_reason_code", "block_reason_code TEXT"),
+        ("block_cause_version", "block_cause_version INTEGER"),
+    ):
+        if name not in cols:
+            _add_column_if_missing(conn, "tasks", name, definition)
 
     if "completion_contract" not in cols:
         _add_column_if_missing(
@@ -7846,7 +7884,9 @@ def get_current_attention(conn: sqlite3.Connection, task_id: str, *, now: Option
     row = conn.execute(
         "SELECT a.*, x.id AS attention_id, x.type, x.created_at AS attention_created_at "
         "FROM task_attentions x JOIN task_pending_actions a ON a.id=x.action_id "
-        "WHERE x.task_id=? AND a.state IN ('pending','approved') AND a.expires_at>? ORDER BY x.id DESC LIMIT 1",
+        "JOIN tasks t ON t.id=x.task_id "
+        "WHERE x.task_id=? AND t.status NOT IN ('done','archived') "
+        "AND a.state IN ('pending','approved') AND a.expires_at>? ORDER BY x.id DESC LIMIT 1",
         (task_id, now),
     ).fetchone()
     if row is None:
@@ -7855,6 +7895,79 @@ def get_current_attention(conn: sqlite3.Connection, task_id: str, *, now: Option
                      summary=row["summary"],
                      created_at=int(row["attention_created_at"]), state=row["state"], version=int(row["version"]),
                      expires_at=int(row["expires_at"]), requires_human_action=True, approvable=row["state"] == "pending")
+
+
+def finalize_goal_block_or_reuse_current_attention(
+    conn: sqlite3.Connection, task_id: str, *, reason: str,
+) -> bool:
+    """Atomically choose exact-action precedence or the typed goal fallback.
+
+    The choice and fallback transition share one IMMEDIATE transaction: a
+    concurrent action request cannot appear in the gap between a read and a
+    generic block.  Hooks deliberately run only after commit.
+    """
+    now = int(time.time())
+    hook: Optional[tuple[Optional[Task], Optional[int]]] = None
+    with write_txn(conn):
+        task = conn.execute("SELECT status, current_run_id, block_recurrences, block_cause_fingerprint FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task is None or task["status"] in ("done", "archived"):
+            return False
+        action = conn.execute(
+            "SELECT a.*, x.id AS attention_id FROM task_pending_actions a "
+            "JOIN task_attentions x ON x.action_id=a.id AND x.type='exact_action' "
+            "WHERE a.task_id=? AND a.state IN ('pending','approved') AND a.expires_at>? "
+            "ORDER BY a.id DESC LIMIT 1", (task_id, now),
+        ).fetchone()
+        if action is not None:
+            if task["status"] == "blocked" and task["current_run_id"] is None:
+                return True
+            if task["status"] != "running" or task["current_run_id"] != action["run_id"]:
+                return False
+            run = conn.execute("SELECT status, ended_at FROM task_runs WHERE id=? AND task_id=?", (action["run_id"], task_id)).fetchone()
+            if run is None or run["status"] != "running" or run["ended_at"] is not None:
+                return False
+            conn.execute("UPDATE tasks SET status='blocked', current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, block_kind='needs_input' WHERE id=? AND status='running' AND current_run_id=?", (task_id, action["run_id"]))
+            conn.execute("UPDATE task_runs SET status='blocked', outcome='blocked', ended_at=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=? AND task_id=? AND status='running' AND ended_at IS NULL", (now, action["run_id"], task_id))
+            hook = (get_task(conn, task_id), int(action["run_id"]))
+        else:
+            # Typed protocol fallback, fully in this transaction.  Free worker
+            # prose never becomes a task_runs summary (which is public via
+            # latest_run/latest_summary); only this enumerable code persists.
+            fingerprint = _block_cause_fingerprint(conn, task_id=task_id,
+                attention_type="protocol", reason_code="goal_closeout_missing",
+                scope={"protocol": "goal_closeout"})
+            assert fingerprint is not None
+            recurrences = int(task["block_recurrences"] or 0) + 1 if task["block_cause_fingerprint"] == fingerprint else 1
+            routed_to = "triage" if recurrences >= BLOCK_RECURRENCE_LIMIT else "blocked"
+            cur = conn.execute(
+                "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                "block_kind='needs_input', block_recurrences=?, block_cause_fingerprint=?, "
+                "block_reason_code=?, block_cause_version=? WHERE id=? AND status IN ('running','ready')",
+                (routed_to, recurrences, fingerprint, "goal_closeout_missing", BLOCK_CAUSE_VERSION, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            _goal_finalizer_after_task_update_hook()
+            run_id = _end_run(conn, task_id, outcome="blocked", status="blocked", summary="goal_closeout_missing")
+            if run_id is None:
+                run_id = _synthesize_ended_run(conn, task_id, outcome="blocked", summary="goal_closeout_missing")
+            _append_event(conn, task_id, "block_loop_detected" if routed_to == "triage" else "blocked", {
+                "kind": "needs_input", "attention_type": "protocol",
+                "reason_code": "goal_closeout_missing", "recurrences": recurrences,
+                **({"limit": BLOCK_RECURRENCE_LIMIT} if routed_to == "triage" else {}),
+            }, run_id=run_id)
+            hook = (get_task(conn, task_id), run_id)
+    if hook is not None:
+        blocked_task, run_id = hook
+        _fire_kanban_lifecycle_hook("kanban_task_blocked", task_id,
+            board=get_current_board(), assignee=blocked_task.assignee if blocked_task else None,
+            run_id=run_id,
+            reason=("terminal_approval_required" if action is not None else "goal_closeout_missing"))
+    return True
+
+
+def _goal_finalizer_after_task_update_hook() -> None:
+    """Private in-transaction fault seam for finalizer rollback tests."""
 
 
 def resolve_pending_action(conn: sqlite3.Connection, task_id: str, action_id: int, *, now: Optional[int] = None) -> bool:
@@ -7897,6 +8010,47 @@ def _cancel_approved_pending_action(
             )
 
 
+def _block_cause_fingerprint(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    attention_type: Optional[str],
+    reason_code: Optional[str],
+    scope: Optional[dict[str, str]] = None,
+) -> Optional[str]:
+    """Return a safe typed cause identity, or None for legacy callers.
+
+    Compatibility is intentionally fail-closed: omitted typed inputs do not
+    hash free-form reason text and therefore never continue an old chain.
+    """
+    if attention_type is None and reason_code is None:
+        return None
+    if attention_type not in VALID_BLOCK_ATTENTION_TYPES:
+        raise ValueError("unsupported block attention type")
+    if reason_code not in VALID_BLOCK_REASON_CODES:
+        raise ValueError("unsupported block reason code")
+    allowed_scope = BLOCK_CAUSE_SCOPE_ENUMS.get((attention_type, reason_code))
+    if allowed_scope is None:
+        raise ValueError("unsupported block attention type/reason code pair")
+    clean_scope: dict[str, str] = {}
+    for key, value in (scope or {}).items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("block cause scope must use string enums")
+        permitted = allowed_scope.get(key)
+        if permitted is None or value not in permitted:
+            raise ValueError("unsupported block cause scope")
+        clean_scope[key] = value
+    manifest = {"v": BLOCK_CAUSE_VERSION, "board": _pending_action_board_identity(conn),
+                "task_id": task_id, "attention_type": attention_type,
+                "reason_code": reason_code, "scope": clean_scope}
+    payload = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _block_cause_after_task_update_hook() -> None:
+    """Private fault-injection seam; runs inside the block transaction."""
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7909,6 +8063,9 @@ def block_task(
     human_gate: Optional[bool] = None,
     human_summary: Optional[str] = None,
     human_action: Optional[str] = None,
+    attention_type: Optional[str] = None,
+    reason_code: Optional[str] = None,
+    cause_scope: Optional[dict[str, str]] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -7986,9 +8143,32 @@ def block_task(
             payload["human_action"] = str(human_action).strip()
         return payload
 
+    def _typed_event_payload(*, recurrences: int, loop: bool = False) -> dict[str, object]:
+        """Only enumerable typed cause data may enter durable operator surfaces."""
+        payload: dict[str, object] = {
+            "kind": kind, "attention_type": attention_type,
+            "reason_code": reason_code, "recurrences": recurrences,
+        }
+        if loop:
+            payload["limit"] = BLOCK_RECURRENCE_LIMIT
+        return payload
+
+    typed_cause = attention_type is not None or reason_code is not None
+    # Run summaries are public through latest_run/latest_summary.  Typed causes
+    # are protocol data, so retain only their allowlisted reason code there.
+    persisted_summary = reason_code if typed_cause else reason
+
     # Dependency waits are a complete transition of their own. Keep the hook
     # outside ``write_txn`` so subscribers can only observe committed state.
     if kind == "dependency":
+        # Dependencies deliberately have no attention projection or recurrence
+        # fingerprint, but callers may still supply a typed cause for audit
+        # classification. Validate it before treating its code as safe output.
+        if typed_cause:
+            _block_cause_fingerprint(
+                conn, task_id=task_id, attention_type=attention_type,
+                reason_code=reason_code, scope=cause_scope,
+            )
         with write_txn(conn):
             if expected_run_id is None:
                 params = (kind, task_id)
@@ -8012,7 +8192,7 @@ def block_task(
                 task_id,
                 outcome="blocked",
                 status="blocked",
-                summary=reason,
+                summary=persisted_summary,
             )
             _cancel_approved_pending_action(
                 conn,
@@ -8023,13 +8203,13 @@ def block_task(
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+                    conn, task_id, outcome="blocked", summary=persisted_summary,
                 )
             _append_event(
                 conn,
                 task_id,
                 "dependency_wait",
-                _with_human_fields({"reason": reason, "kind": kind}),
+                _typed_event_payload(recurrences=0) if typed_cause else _with_human_fields({"reason": reason, "kind": kind}),
                 run_id=run_id,
             )
             blocked_task = get_task(conn, task_id)
@@ -8039,7 +8219,7 @@ def block_task(
             board=get_current_board(),
             assignee=blocked_task.assignee if blocked_task else None,
             run_id=run_id,
-            reason=reason,
+            reason=reason_code if typed_cause else reason,
         )
         return True
 
@@ -8048,7 +8228,7 @@ def block_task(
     now = int(time.time())
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, block_cause_fingerprint FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -8061,13 +8241,14 @@ def block_task(
             else 0
         )
 
-        # Truly-blocked kinds. Increment the unblock-loop counter when this is a
-        # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
-        # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
+        # Only an exact persisted typed fingerprint can continue a chain.
+        # Legacy callers intentionally receive a fresh recurrence every time.
+        cause_fingerprint = _block_cause_fingerprint(
+            conn, task_id=task_id, attention_type=attention_type,
+            reason_code=reason_code, scope=cause_scope,
+        )
+        same_cause = (cause_fingerprint is not None
+                      and str(cur_row["block_cause_fingerprint"] or "") == cause_fingerprint)
         recurrences = prev_recurrences + 1 if same_cause else 1
 
         pending_terminal_action = (
@@ -8095,10 +8276,15 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            conn.execute(
+                "UPDATE tasks SET block_cause_fingerprint=?, block_reason_code=?, block_cause_version=? WHERE id=?",
+                (cause_fingerprint, reason_code, BLOCK_CAUSE_VERSION if cause_fingerprint else None, task_id),
+            )
+            _block_cause_after_task_update_hook()
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=persisted_summary,
             )
             _cancel_approved_pending_action(
                 conn, task_id, now=now,
@@ -8106,11 +8292,11 @@ def block_task(
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+                    conn, task_id, outcome="blocked", summary=persisted_summary,
                 )
             _append_event(
                 conn, task_id, "block_loop_detected",
-                _with_human_fields({
+                _typed_event_payload(recurrences=recurrences, loop=True) if typed_cause else _with_human_fields({
                     "reason": reason,
                     "kind": kind,
                     "recurrences": recurrences,
@@ -8159,10 +8345,15 @@ def block_task(
                 )
             if cur.rowcount != 1:
                 return False
+            conn.execute(
+                "UPDATE tasks SET block_cause_fingerprint=?, block_reason_code=?, block_cause_version=? WHERE id=?",
+                (cause_fingerprint, reason_code, BLOCK_CAUSE_VERSION if cause_fingerprint else None, task_id),
+            )
+            _block_cause_after_task_update_hook()
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=persisted_summary,
             )
             _cancel_approved_pending_action(
                 conn, task_id, now=now,
@@ -8174,11 +8365,11 @@ def block_task(
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
-                    summary=reason,
+                    summary=persisted_summary,
                 )
             _append_event(
                 conn, task_id, "blocked",
-                _with_human_fields(
+                _typed_event_payload(recurrences=recurrences) if typed_cause else _with_human_fields(
                     {"reason": reason, "kind": kind, "recurrences": recurrences}
                 ),
                 run_id=run_id,
@@ -8190,7 +8381,7 @@ def block_task(
         board=get_current_board(),
         assignee=_blocked_task.assignee if _blocked_task else None,
         run_id=run_id,
-        reason=reason,
+        reason=reason_code if typed_cause else reason,
     )
     return True
 

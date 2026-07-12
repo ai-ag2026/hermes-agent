@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -1141,10 +1142,12 @@ def test_same_persistent_cause_fingerprint_increments_recurrence_chain(
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert kb.block_task(conn, task_id, kind="needs_input", reason="need credential choice",
+                             attention_type="decision", reason_code="credential_choice",
                              expected_run_id=task.current_run_id)
         assert kb.unblock_task(conn, task_id, reason="credential choice supplied")
         assert kb.claim_task(conn, task_id, claimer="second-worker") is not None
-        assert kb.block_task(conn, task_id, kind="needs_input", reason="need credential choice")
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="need credential choice",
+                             attention_type="decision", reason_code="credential_choice")
         current = kb.get_task(conn, task_id)
         assert current is not None and current.block_recurrences == 2
 
@@ -1157,10 +1160,12 @@ def test_different_persistent_cause_fingerprint_starts_new_recurrence_chain(
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert kb.block_task(conn, task_id, kind="needs_input", reason="need credential choice",
+                             attention_type="decision", reason_code="credential_choice",
                              expected_run_id=task.current_run_id)
         assert kb.unblock_task(conn, task_id, reason="credential choice supplied")
         assert kb.claim_task(conn, task_id, claimer="second-worker") is not None
-        assert kb.block_task(conn, task_id, kind="needs_input", reason="need publication approval")
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="need publication approval",
+                             attention_type="decision", reason_code="publication_approval")
         current = kb.get_task(conn, task_id)
         # This is deliberately exact persistent-cause identity, not NLP similarity.
         assert current is not None and current.block_recurrences == 1
@@ -1208,10 +1213,382 @@ def test_pending_action_goal_finalizer_keeps_single_current_operator_attention(
         ]) == 1
 
 
+
+def test_legacy_null_cause_fingerprint_never_continues_recurrence(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        conn.execute("UPDATE tasks SET block_recurrences=99, block_cause_fingerprint=NULL WHERE id=?", (task_id,))
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="credential",
+                             attention_type="decision", reason_code="credential_choice",
+                             expected_run_id=task.current_run_id)
+        row = conn.execute("SELECT block_recurrences, block_cause_fingerprint, block_reason_code FROM tasks WHERE id=?", (task_id,)).fetchone()
+        assert row["block_recurrences"] == 1 and row["block_cause_fingerprint"] and row["block_reason_code"] == "credential_choice"
+
+
+def test_cause_transition_fault_rolls_back_counter_and_fingerprint(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        before = dict(conn.execute("SELECT status, block_recurrences, block_cause_fingerprint FROM tasks WHERE id=?", (task_id,)).fetchone())
+        events_before = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,)).fetchone()[0]
+        monkeypatch.setattr(kb, "_block_cause_after_task_update_hook", lambda: (_ for _ in ()).throw(RuntimeError("fault")))
+        with pytest.raises(RuntimeError, match="fault"):
+            kb.block_task(conn, task_id, kind="needs_input", reason="credential",
+                          attention_type="decision", reason_code="credential_choice",
+                          expected_run_id=task.current_run_id)
+        assert dict(conn.execute("SELECT status, block_recurrences, block_cause_fingerprint FROM tasks WHERE id=?", (task_id,)).fetchone()) == before
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,)).fetchone()[0] == events_before
+
+
+def test_real_legacy_tasks_schema_migrates_cause_columns_idempotently(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A representative old blocked row upgrades through the public initializer."""
+    db_path = Path(os.environ["HERMES_KANBAN_DB"])
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy blocked", assignee="backend-eng")
+        conn.execute("UPDATE tasks SET status='blocked', block_kind='needs_input', block_recurrences=41 WHERE id=?", (task_id,))
+        conn.execute("ALTER TABLE tasks RENAME TO tasks_modern")
+        legacy_schema = kb.SCHEMA_SQL[kb.SCHEMA_SQL.index("CREATE TABLE IF NOT EXISTS tasks"):kb.SCHEMA_SQL.index("CREATE TABLE IF NOT EXISTS task_links")]
+        legacy_schema = legacy_schema.replace("    block_cause_fingerprint TEXT,\n    block_reason_code     TEXT,\n    block_cause_version   INTEGER,\n", "")
+        conn.executescript(legacy_schema)
+        modern_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks_modern)")}
+        legacy_cols = [row["name"] for row in conn.execute("PRAGMA table_info(tasks)")]
+        fields = ", ".join(col for col in legacy_cols if col in modern_cols)
+        conn.execute(f"INSERT INTO tasks ({fields}) SELECT {fields} FROM tasks_modern")
+        conn.execute("DROP TABLE tasks_modern")
+        assert {"block_cause_fingerprint", "block_reason_code", "block_cause_version"}.isdisjoint({row["name"] for row in conn.execute("PRAGMA table_info(tasks)")})
+    kb.init_db(db_path)
+    with kb.connect() as conn:
+        first = tuple(conn.execute("SELECT status, block_recurrences, block_cause_fingerprint, block_reason_code, block_cause_version FROM tasks WHERE id=?", (task_id,)).fetchone())
+        assert first == ("blocked", 41, None, None, None)
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    kb.init_db(db_path)
+    with kb.connect() as conn:
+        assert tuple(conn.execute("SELECT status, block_recurrences, block_cause_fingerprint, block_reason_code, block_cause_version FROM tasks WHERE id=?", (task_id,)).fetchone()) == first
+        assert kb.unblock_task(conn, task_id)
+        claimed = kb.claim_task(conn, task_id, claimer="migrated-worker")
+        assert claimed is not None
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="migration secret must not persist",
+                             attention_type="decision", reason_code="credential_choice",
+                             cause_scope={"required_decision": "credential"}, expected_run_id=claimed.current_run_id)
+        migrated = kb.get_task(conn, task_id)
+        cause = conn.execute("SELECT block_cause_fingerprint, block_reason_code FROM tasks WHERE id=?", (task_id,)).fetchone()
+        assert migrated is not None and migrated.status == "blocked" and migrated.block_recurrences == 1
+        assert cause["block_cause_fingerprint"] and cause["block_reason_code"] == "credential_choice"
+
+
+def test_parallel_same_typed_cause_has_one_transition_and_one_event(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        run_id = kb.get_task(conn, task_id).current_run_id
+    barrier = threading.Barrier(2)
+    results: list[bool] = []
+    errors: list[Exception] = []
+
+    def blocker() -> None:
+        try:
+            with kb.connect() as other:
+                barrier.wait(timeout=5)
+                results.append(kb.block_task(other, task_id, kind="needs_input", reason="SECRET_NEVER_PUBLIC", attention_type="decision", reason_code="credential_choice", cause_scope={"required_decision": "credential"}, expected_run_id=run_id))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=blocker) for _ in range(2)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join(timeout=10)
+    assert not errors and all(not thread.is_alive() for thread in threads)
+    assert sorted(results) == [False, True]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.block_recurrences == 1
+        assert [event.kind for event in kb.list_events(conn, task_id=task_id) if event.kind == "blocked"] == ["blocked"]
+
+
+def test_finalizer_write_lock_blocks_concurrent_action_until_fallback_commits(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two connections prove the fallback read/transition has no action-creation gap."""
+    task_id = _create_running_task(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    original_append = kb._append_event
+
+    def pause_after_fallback(conn, event_task_id, kind, payload, **kwargs):
+        result = original_append(conn, event_task_id, kind, payload, **kwargs)
+        if event_task_id == task_id and kind == "blocked":
+            entered.set()
+            assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(kb, "_append_event", pause_after_fallback)
+    finalizer: list[bool] = []
+    contender: list[object] = []
+
+    def closeout() -> None:
+        with kb.connect() as conn:
+            finalizer.append(kb.finalize_goal_block_or_reuse_current_attention(conn, task_id, reason="SECRET_NEVER_PUBLIC"))
+
+    attempt, finished = threading.Event(), threading.Event()
+
+    def create_action() -> None:
+        assert entered.wait(5)
+        try:
+            with kb.connect() as conn:
+                task = kb.get_task(conn, task_id)
+                attempt.set()  # immediately before the competing write call
+                contender.append(kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command="git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic", summary="x", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000))
+        except Exception as exc:
+            contender.append(exc)
+        finally:
+            finished.set()
+
+    first, second = threading.Thread(target=closeout), threading.Thread(target=create_action)
+    first.start(); assert entered.wait(5); second.start(); assert attempt.wait(5)
+    # The contender has reached its write attempt but cannot complete while the
+    # finalizer owns BEGIN IMMEDIATE; this is an interleave proof, not a sleep.
+    assert not finished.wait(0.2) and contender == []
+    release.set()
+    first.join(10); second.join(10)
+    assert finalizer == [True] and not first.is_alive() and not second.is_alive()
+    assert finished.is_set() and len(contender) == 1
+    assert isinstance(contender[0], Exception)
+    with kb.connect() as conn:
+        assert kb.get_pending_action(conn, task_id) is None
+        assert [event.kind for event in kb.list_events(conn, task_id=task_id) if event.kind in {"blocked", "terminal_approval_pending"}] == ["blocked"]
+
+
+def test_goal_finalizer_exact_action_precedence_retry_is_event_silent(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    observed: list[dict[str, object]] = []
+
+    def hook(event: str, hooked_task_id: str, **fields: object) -> None:
+        # Fresh connection proves callbacks run only after the commit.
+        run_id = fields["run_id"]
+        assert isinstance(run_id, int)
+        with kb.connect() as fresh:
+            task = kb.get_task(fresh, hooked_task_id)
+            run = kb.get_run(fresh, run_id)
+            attention = kb.get_current_attention(fresh, hooked_task_id)
+            action = kb.get_pending_action(fresh, hooked_task_id)
+        assert task is not None and task.status == "blocked" and task.current_run_id is None
+        assert run is not None and run.status == run.outcome == "blocked" and run.ended_at is not None
+        assert action is not None and attention is not None and attention.action_id == action.id
+        observed.append({"event": event, "task_id": hooked_task_id, **fields})
+
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", hook)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        origin_run_id = task.current_run_id
+        action = kb.record_pending_action(conn, task_id=task_id, run_id=origin_run_id, command="git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic", summary="x", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        assert kb.finalize_goal_block_or_reuse_current_attention(conn, task_id, reason="SECRET_NEVER_PUBLIC")
+        attention_id = kb.get_current_attention(conn, task_id).id
+        before = _atomic_snapshot(conn, task_id, origin_run_id)
+        assert kb.finalize_goal_block_or_reuse_current_attention(conn, task_id, reason="SECRET_NEVER_PUBLIC")
+        assert _atomic_snapshot(conn, task_id, origin_run_id) == before
+        attention = kb.get_current_attention(conn, task_id)
+        assert attention.action_id == action.id and attention.id == attention_id
+    assert observed == [{"event": "kanban_task_blocked", "task_id": task_id,
+                         "board": kb.get_current_board(), "assignee": "backend-eng",
+                         "run_id": origin_run_id,
+                         "reason": "terminal_approval_required"}]
+
+
+def test_typed_cause_redacts_reason_from_event_hook_and_public_projection(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    markers = ("CAUSE_SECRET_MARKER", "PROFILE_MARKER", "WORKSPACE_MARKER")
+    raw_reason = " ".join(markers)
+    captured: list[dict[str, object]] = []
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", lambda _event, _task, **fields: captured.append(fields))
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert kb.block_task(conn, task_id, kind="needs_input", reason=raw_reason,
+            attention_type="decision", reason_code="credential_choice",
+            cause_scope={"required_decision": "credential"}, expected_run_id=task.current_run_id)
+        latest = kb.latest_run(conn, task_id)
+        raw_runs = conn.execute("SELECT summary, error, metadata FROM task_runs WHERE task_id=?", (task_id,)).fetchall()
+        public = (
+            repr(kb.get_task(conn, task_id)) + repr(kb.get_current_attention(conn, task_id))
+            + repr(kb.list_events(conn, task_id=task_id)) + repr(captured)
+            + repr(latest) + repr(kb.latest_summary(conn, task_id)) + repr([tuple(row) for row in raw_runs])
+        )
+        event = next(e for e in kb.list_events(conn, task_id=task_id) if e.kind == "blocked")
+        assert latest is not None and latest.summary == "credential_choice"
+        assert kb.latest_summary(conn, task_id) == "credential_choice"
+        assert len(raw_runs) == 1 and raw_runs[0]["summary"] == "credential_choice"
+        assert set(event.payload or {}) == {"kind", "attention_type", "reason_code", "recurrences"}
+    assert all(marker not in public for marker in markers)
+    assert captured == [{"board": kb.get_current_board(), "assignee": "backend-eng", "run_id": task.current_run_id, "reason": "credential_choice"}]
+
+
+def test_typed_dependency_cause_redacts_reason_from_event_hook_and_public_projection(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    markers = ("DEPENDENCY_SECRET_MARKER", "DEPENDENCY_PROFILE_MARKER", "DEPENDENCY_WORKSPACE_MARKER")
+    raw_reason = " ".join(markers)
+    captured: list[dict[str, object]] = []
+
+    def hook(_event: str, _task_id: str, **fields: object) -> None:
+        # A new connection observes committed task/run/event state, not caller state.
+        with kb.connect() as fresh:
+            task = kb.get_task(fresh, task_id)
+            run = kb.latest_run(fresh, task_id)
+            attention = kb.get_current_attention(fresh, task_id)
+            events = kb.list_events(fresh, task_id=task_id)
+            rows = fresh.execute("SELECT summary, error, metadata FROM task_runs WHERE task_id=?", (task_id,)).fetchall()
+        captured.append({**fields, "task": task, "run": run, "attention": attention,
+                         "events": events, "rows": [tuple(row) for row in rows]})
+
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", hook)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        origin_run_id = task.current_run_id
+        assert kb.block_task(conn, task_id, kind="dependency", reason=raw_reason,
+                             attention_type="decision", reason_code="credential_choice",
+                             cause_scope={"required_decision": "credential"},
+                             expected_run_id=origin_run_id)
+        latest = kb.latest_run(conn, task_id)
+        event = next(e for e in kb.list_events(conn, task_id=task_id) if e.kind == "dependency_wait")
+        public = repr(kb.get_task(conn, task_id)) + repr(latest) + repr(kb.latest_summary(conn, task_id)) + repr(kb.get_current_attention(conn, task_id)) + repr(kb.list_events(conn, task_id=task_id)) + repr(captured)
+        assert latest is not None and latest.summary == "credential_choice"
+        assert kb.latest_summary(conn, task_id) == "credential_choice"
+        assert kb.get_current_attention(conn, task_id) is None
+        assert event.payload == {"kind": "dependency", "attention_type": "decision",
+                                 "reason_code": "credential_choice", "recurrences": 0}
+    assert all(marker not in public for marker in markers)
+    assert len(captured) == 1
+    assert captured[0]["reason"] == "credential_choice"
+
+
+def test_typed_cause_scope_rejects_unknown_values_and_different_threshold_starts_one(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        with pytest.raises(ValueError, match="scope"):
+            kb.block_task(conn, task_id, kind="needs_input", reason="safe", attention_type="decision",
+                reason_code="credential_choice", cause_scope={"required_decision": "PROFILE_MARKER"})
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="safe", attention_type="decision",
+            reason_code="credential_choice", cause_scope={"required_decision": "credential"}, expected_run_id=task.current_run_id)
+        conn.execute("UPDATE tasks SET block_recurrences=? WHERE id=?", (kb.BLOCK_RECURRENCE_LIMIT - 1, task_id))
+        assert kb.unblock_task(conn, task_id)
+        assert kb.claim_task(conn, task_id, claimer="again") is not None
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="safe", attention_type="decision",
+            reason_code="publication_approval", cause_scope={"required_decision": "publication"})
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.status == "blocked" and current.block_recurrences == 1
+
+
+def test_goal_finalizer_stale_origin_is_event_silent_and_exact_retry_is_silent(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    hooks: list[object] = []
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", lambda *_args, **_kwargs: hooks.append(True))
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        action = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id,
+            command="git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic", summary="x",
+            profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        # Binding no longer matches current run: finalizer must not fallback.
+        other = conn.execute("INSERT INTO task_runs (task_id,status,started_at,profile) VALUES (?, 'running', 1, 'backend-eng')", (task_id,)).lastrowid
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (other, task_id))
+        before = _atomic_snapshot(conn, task_id, other)
+        assert not kb.finalize_goal_block_or_reuse_current_attention(conn, task_id, reason="CAUSE_SECRET_MARKER")
+        assert _atomic_snapshot(conn, task_id, other) == before
+        assert kb.get_current_attention(conn, task_id) is not None
+        assert action.id
+    assert hooks == []
+
+
+def test_goal_finalizer_fallback_closes_origin_run_redacts_and_hooks_after_commit(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    marker = "FINALIZER_SECRET_PROFILE_WORKSPACE"
+    observed: list[tuple[object, object, object]] = []
+
+    def hook(_event, hooked_task_id, **fields):
+        # A fresh connection is the committed-state contract, not a view of the
+        # finalizer's still-open transaction.
+        with kb.connect() as fresh:
+            task = kb.get_task(fresh, hooked_task_id)
+            run = kb.get_run(fresh, fields["run_id"])
+            observed.append((task.status if task else None, run.outcome if run else None, kb.latest_summary(fresh, hooked_task_id)))
+
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", hook)
+    with kb.connect() as conn:
+        origin = kb.get_task(conn, task_id).current_run_id
+        assert origin is not None
+        assert kb.finalize_goal_block_or_reuse_current_attention(conn, task_id, reason=marker)
+        task = kb.get_task(conn, task_id)
+        runs = conn.execute("SELECT id, status, outcome, summary, ended_at FROM task_runs WHERE task_id=?", (task_id,)).fetchall()
+        public = repr(task) + repr(kb.latest_run(conn, task_id)) + repr(kb.latest_summary(conn, task_id)) + repr(kb.list_events(conn, task_id=task_id))
+        assert task is not None and task.current_run_id is None and task.status == "blocked"
+        assert len(runs) == 1 and runs[0]["id"] == origin and runs[0]["ended_at"] is not None
+        assert runs[0]["status"] == runs[0]["outcome"] == "blocked" and runs[0]["summary"] == "goal_closeout_missing"
+        assert marker not in public
+    assert observed == [("blocked", "blocked", "goal_closeout_missing")]
+
+
+def test_goal_finalizer_fault_rolls_back_everything_and_is_hook_silent(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    hooks: list[object] = []
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", lambda *_args, **_kwargs: hooks.append(True))
+    with kb.connect() as conn:
+        origin = kb.get_task(conn, task_id).current_run_id
+        assert origin is not None
+        before = _atomic_snapshot(conn, task_id, origin)
+        monkeypatch.setattr(kb, "_goal_finalizer_after_task_update_hook", lambda: (_ for _ in ()).throw(RuntimeError("finalizer fault")))
+        with pytest.raises(RuntimeError, match="finalizer fault"):
+            kb.finalize_goal_block_or_reuse_current_attention(conn, task_id, reason="never durable")
+        assert _atomic_snapshot(conn, task_id, origin) == before
+    assert hooks == []
+
+
+def test_current_attention_excludes_done_archived_and_expired_tasks(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        action = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id,
+            command="git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic", summary="x",
+            profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        assert kb.get_current_attention(conn, task_id)
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+        assert kb.get_current_attention(conn, task_id) is None
+        conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (task_id,))
+        assert kb.get_current_attention(conn, task_id) is None
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task_id,))
+        conn.execute("UPDATE task_pending_actions SET expires_at=1 WHERE id=?", (action.id,))
+        assert kb.get_current_attention(conn, task_id, now=2) is None
+
 def test_execute_code_and_terminal_pending_paths_create_same_durable_approval_contract(
     isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import json
 
     from tools import approval, code_execution_tool, terminal_tool
 
