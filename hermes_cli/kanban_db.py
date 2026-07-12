@@ -93,7 +93,7 @@ import urllib.request
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Literal, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1283,6 +1283,35 @@ class ResolvePendingActionResult:
 
     def __bool__(self) -> bool:
         return self.status == "resolved"
+
+
+@dataclass(frozen=True)
+class ApprovePendingActionResult:
+    """Committed, redacted result of versioned exact-action approval."""
+
+    status: Literal["approved", "not_found", "conflict", "gone"]
+    task_id: str
+    action_id: Optional[int] = None
+    attention_id: Optional[int] = None
+    attention_version: Optional[int] = None
+    task_status: Optional[Literal["ready", "todo"]] = None
+
+    def __bool__(self) -> bool:
+        return self.status == "approved"
+
+
+@dataclass(frozen=True)
+class AttentionStatusTransitionResult:
+    """Committed, redacted result of an attention-aware status transition."""
+
+    status: Literal["transitioned", "not_found", "conflict", "gone"]
+    task_id: str
+    task_status: Optional[Literal["ready", "todo", "triage"]] = None
+    attention_id: Optional[int] = None
+    attention_version: Optional[int] = None
+
+    def __bool__(self) -> bool:
+        return self.status == "transitioned"
 
 
 @dataclass
@@ -4136,6 +4165,7 @@ def recompute_ready(
             cur_status = row["status"]
             if cur_status == "blocked" and (
                 row["human_gate"] or _has_sticky_block(conn, task_id)
+                or conn.execute("SELECT 1 FROM task_attentions WHERE task_id=? LIMIT 1", (task_id,)).fetchone() is not None
             ):
                 # Worker / operator asked for human review, OR the card is
                 # hard-gated — do not silently auto-recover.
@@ -7917,56 +7947,88 @@ def approve_pending_action(
         return True
 
 
+def approve_pending_action_and_unblock_versioned(
+    conn: sqlite3.Connection, task_id: str, action_id: int, *,
+    expected_version: int, actor: str = "operator", now: Optional[int] = None,
+) -> ApprovePendingActionResult:
+    """CAS-approve one exact action and unblock its card in one transaction.
+
+    ``expected_version`` is mandatory at this public seam.  The matching
+    exact-action projection is part of the same compare-and-set, preventing a
+    stale dashboard card from authorizing a replacement action.
+    """
+    now = int(time.time()) if now is None else int(now)
+    hook: Optional[tuple[Optional[Task], Optional[int]]] = None
+    with write_txn(conn):
+        _materialize_expired_actions(conn, now)
+        task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task is None:
+            return ApprovePendingActionResult("not_found", task_id)
+        action = conn.execute(
+            "SELECT * FROM task_pending_actions WHERE id=? AND task_id=?",
+            (int(action_id), task_id),
+        ).fetchone()
+        if action is None:
+            return ApprovePendingActionResult("not_found", task_id)
+        attention = conn.execute(
+            "SELECT id, type FROM task_attentions WHERE task_id=? AND action_id=? "
+            "ORDER BY id DESC LIMIT 1", (task_id, int(action_id)),
+        ).fetchone()
+        if action["state"] != "pending" or int(action["expires_at"]) <= now:
+            return ApprovePendingActionResult("gone", task_id, int(action_id))
+        if attention is None:
+            return ApprovePendingActionResult("gone", task_id, int(action_id))
+        if (attention["type"] != "exact_action" or int(action["version"]) != int(expected_version)
+                or task["status"] not in ("blocked", "triage", "todo", "ready")
+                or not _pending_action_fingerprint_valid(conn, action)):
+            return ApprovePendingActionResult("conflict", task_id, int(action_id), int(attention["id"]))
+        origin = conn.execute(
+            "SELECT outcome FROM task_runs WHERE id=? AND task_id=?", (action["run_id"], task_id),
+        ).fetchone()
+        if origin is None or origin["outcome"] != "blocked":
+            return ApprovePendingActionResult("conflict", task_id, int(action_id), int(attention["id"]))
+        undone = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+            "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1", (task_id,),
+        ).fetchone()
+        target: Literal["ready", "todo"] = "todo" if undone else "ready"
+        cur = conn.execute(
+            "UPDATE task_pending_actions SET approved_at=?, state='approved', updated_at=?, version=version+1 "
+            "WHERE id=? AND task_id=? AND version=? AND state='pending' AND expires_at>?",
+            (now, now, int(action_id), task_id, int(expected_version), now),
+        )
+        if cur.rowcount != 1:
+            return ApprovePendingActionResult("conflict", task_id, int(action_id), int(attention["id"]))
+        if conn.execute(
+            "UPDATE tasks SET status=?, current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "consecutive_failures=0, last_failure_error=NULL WHERE id=? AND status IN ('blocked','triage','todo','ready')",
+            (target, task_id),
+        ).rowcount != 1:
+            raise RuntimeError("approval task CAS failed")
+        _append_event(conn, task_id, "terminal_approval_granted", {"action_id": int(action_id), "actor": str(actor)[:120]})
+        _append_event(conn, task_id, "unblocked", {"status": target, "terminal_action_id": int(action_id), "actor": str(actor)[:120]})
+        hook = (get_task(conn, task_id), action["run_id"])
+        result = ApprovePendingActionResult("approved", task_id, int(action_id), int(attention["id"]), int(expected_version) + 1, target)
+    if hook is not None:
+        approved_task, run_id = hook
+        _fire_kanban_lifecycle_hook("kanban_task_unblocked", task_id, board=get_current_board(),
+            assignee=approved_task.assignee if approved_task else None, run_id=run_id,
+            reason="terminal_approval_granted")
+    return result
+
+
 def approve_pending_action_and_unblock(
     conn: sqlite3.Connection, task_id: str, action_id: int,
     *, now: Optional[int] = None, actor: str = "operator",
 ) -> bool:
-    """Atomically grant one exact action and return its blocked card to work."""
+    """Legacy bool wrapper over the versioned approval seam."""
     now = int(time.time()) if now is None else int(now)
-    with write_txn(conn):
-        _materialize_expired_actions(conn, now)
-        task = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if task is None or task["status"] not in ("blocked", "triage", "todo", "ready"):
-            return False
-        action = conn.execute(
-            "SELECT a.* FROM task_pending_actions a "
-            "JOIN task_runs r ON r.id = a.run_id AND r.task_id = a.task_id "
-            "WHERE a.id = ? AND a.task_id = ? AND a.state='pending' AND a.expires_at > ? "
-            "AND r.outcome = 'blocked'",
-            (int(action_id), task_id, now),
-        ).fetchone()
-        if action is None or not _pending_action_fingerprint_valid(conn, action):
-            return False
-        undone_parent = conn.execute(
-            "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        new_status = "todo" if undone_parent else "ready"
-        cur = conn.execute(
-            "UPDATE task_pending_actions SET approved_at=?, state='approved', updated_at=?, version=version+1 "
-            "WHERE id=? AND fingerprint=? AND version=? AND state='pending' AND expires_at > ?",
-            (now, now, int(action_id), action["fingerprint"], action["version"], now),
-        )
-        if cur.rowcount != 1:
-            return False
-        conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL WHERE id = ?",
-            (new_status, task_id),
-        )
-        _append_event(
-            conn, task_id, "terminal_approval_granted",
-            {"action_id": int(action_id), "actor": actor},
-        )
-        _append_event(
-            conn, task_id, "unblocked",
-            {"status": new_status, "terminal_action_id": int(action_id),
-             "actor": actor},
-        )
-        return True
+    row = conn.execute("SELECT version FROM task_pending_actions WHERE id=? AND task_id=?", (int(action_id), task_id)).fetchone()
+    if row is None:
+        return False
+    return bool(approve_pending_action_and_unblock_versioned(
+        conn, task_id, int(action_id), expected_version=int(row["version"]), actor=actor, now=now,
+    ))
 
 
 def consume_approved_action(
@@ -8784,6 +8846,10 @@ def promote_task(
     ).fetchone()
     if pending_action is not None:
         return False, "exact terminal action approval is still pending"
+    if cur_status == "blocked" and conn.execute(
+        "SELECT 1 FROM task_attentions WHERE task_id=? LIMIT 1", (task_id,)
+    ).fetchone() is not None:
+        return False, "current attention requires its typed lifecycle operation"
 
     if not force:
         parents = conn.execute(
@@ -8825,6 +8891,91 @@ def promote_task(
         )
 
     return True, None
+
+
+def transition_task_status_with_attention(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    status: Literal["ready", "todo", "triage"],
+    actor: str = "webui",
+    expected_attention_id: Optional[int] = None,
+    expected_attention_version: Optional[int] = None,
+    token: Optional[str] = None,
+    now: Optional[int] = None,
+) -> AttentionStatusTransitionResult:
+    """Only safe public exit from ``blocked`` for attention-aware callers.
+
+    A live projection is intentionally sticky: exact pending must be approved,
+    approved grants await a worker, and typed human/technical projections need
+    their own resolver.  Consequently this generic transition only permits the
+    no-current-attention state and cannot consume an action lifecycle.
+    """
+    if status not in {"ready", "todo", "triage"}:
+        raise ValueError("status must be ready, todo, or triage")
+    now = int(time.time()) if now is None else int(now)
+    hook: Optional[tuple[Optional[Task], Optional[int], str]] = None
+    with write_txn(conn):
+        _materialize_expired_actions(conn, now)
+        task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task is None:
+            return AttentionStatusTransitionResult("not_found", task_id)
+        if task["status"] != "blocked":
+            return AttentionStatusTransitionResult("conflict", task_id)
+        projection = conn.execute(
+            "SELECT x.id, x.action_id, x.type, a.state, a.version, a.expires_at "
+            "FROM task_attentions x LEFT JOIN task_pending_actions a ON a.id=x.action_id "
+            "WHERE x.task_id=? ORDER BY x.id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        if projection is not None:
+            # A stale exact projection is no longer a valid authorization
+            # object; report 410 rather than allowing it to become a bypass.
+            if (projection["action_id"] is not None and
+                    (projection["state"] not in ("pending", "approved")
+                     or projection["expires_at"] is None or int(projection["expires_at"]) <= now)):
+                return AttentionStatusTransitionResult("gone", task_id, attention_id=int(projection["id"]))
+            return AttentionStatusTransitionResult(
+                "conflict", task_id, attention_id=int(projection["id"]),
+                attention_version=(int(projection["version"]) if projection["version"] is not None else None),
+            )
+        if expected_attention_id is not None or expected_attention_version is not None:
+            return AttentionStatusTransitionResult("conflict", task_id)
+        target: Literal["ready", "todo", "triage"] = status
+        if target == "ready":
+            undone = conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+                "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1", (task_id,),
+            ).fetchone()
+            if undone:
+                target = "todo"
+        try:
+            _assert_human_gate_open(conn, task_id, token=token, action="change_status")
+        except GateTokenError:
+            return AttentionStatusTransitionResult("conflict", task_id)
+        run_id = task["current_run_id"]
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET status='reclaimed', outcome='reclaimed', ended_at=?, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=? AND task_id=? AND ended_at IS NULL",
+                (now, int(run_id), task_id),
+            )
+        if conn.execute(
+            "UPDATE tasks SET status=?, current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "consecutive_failures=0, last_failure_error=NULL WHERE id=? AND status='blocked'",
+            (target, task_id),
+        ).rowcount != 1:
+            return AttentionStatusTransitionResult("conflict", task_id)
+        _append_event(conn, task_id, "unblocked" if target in ("ready", "todo") else "status", {
+            "status": target, "actor": str(actor)[:120],
+        })
+        transitioned = get_task(conn, task_id)
+        hook = (transitioned, run_id, "unblock" if target in ("ready", "todo") else "status_change")
+        result = AttentionStatusTransitionResult("transitioned", task_id, target)
+    if hook is not None:
+        transitioned, run_id, reason = hook
+        _fire_kanban_lifecycle_hook("kanban_task_unblocked", task_id, board=get_current_board(),
+            assignee=transitioned.assignee if transitioned else None, run_id=run_id, reason=reason)
+    return result
 
 
 def unblock_task(

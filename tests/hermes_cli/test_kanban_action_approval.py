@@ -2372,3 +2372,49 @@ def test_parallel_versioned_resolves_have_exactly_one_winner(
         current = kb.get_pending_action_by_id(conn, task_id, action.id)
         assert current is not None and (current.state, current.version) == ("resolved", action.version + 1)
         assert kb.get_current_attention(conn, task_id, now=1) is None
+
+
+
+def test_versioned_approval_is_cas_and_keeps_waiting_projection(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        action = kb.record_pending_action(
+            conn, task_id=task_id, run_id=task.current_run_id, command="git push origin HEAD",
+            summary="push", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000,
+        )
+        assert kb.block_task(conn, task_id, kind="needs_input", expected_run_id=task.current_run_id)
+        attention = kb.get_current_attention(conn, task_id, now=1_900_000_000)
+        assert attention is not None
+        result = kb.approve_pending_action_and_unblock_versioned(
+            conn, task_id, action.id, expected_version=attention.version, now=1_900_000_000,
+        )
+        assert result.status == "approved"
+        assert result.attention_id == attention.id and result.attention_version == attention.version + 1
+        waiting = kb.get_current_attention(conn, task_id, now=1_900_000_000)
+        assert waiting is not None and waiting.id == attention.id and waiting.state == "approved"
+        assert not waiting.approvable and not waiting.requires_human_action
+        assert kb.approve_pending_action_and_unblock_versioned(
+            conn, task_id, action.id, expected_version=attention.version, now=1_900_000_000,
+        ).status == "gone"
+
+
+def test_attention_transition_refuses_live_projection(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.record_pending_action(
+            conn, task_id=task_id, run_id=task.current_run_id, command="git push origin HEAD",
+            summary="push", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000,
+        )
+        assert kb.block_task(conn, task_id, kind="needs_input", expected_run_id=task.current_run_id)
+        result = kb.transition_task_status_with_attention(
+            conn=conn, task_id=task_id, status="ready", now=1_900_000_000,
+        )
+        assert result.status == "conflict" and result.attention_id is not None
