@@ -1320,7 +1320,6 @@ class ResumeApprovedActionRetryResult:
 
     status: Literal["resumed", "not_found", "conflict", "gone"]
     task_id: str
-    action_id: Optional[int] = None
     attention_id: Optional[int] = None
     attention_version: Optional[int] = None
     task_status: Optional[Literal["ready", "todo"]] = None
@@ -8368,7 +8367,9 @@ def get_current_attentions(
                 id=int(row["attention_id"]), task_id=task_id, action_id=action_id,
                 type=row["type"], summary=row["summary"], created_at=int(row["attention_created_at"]),
                 state=row["action_state"] if exact else "pending",
-                version=int(row["action_version"] if action_id is not None else row["projection_version"]),
+                # Exact-action approval is versioned on the durable action;
+                # technical retries are versioned on their replacement projection.
+                version=int(row["action_version"] if exact else row["projection_version"]),
                 expires_at=(int(row["expires_at"]) if row["expires_at"] is not None else None),
                 requires_human_action=(row["action_state"] == "pending") if exact else row["type"] in {"decision", "protocol", "review", "capability"},
                 approvable=exact and row["action_state"] == "pending",
@@ -8471,6 +8472,10 @@ def _goal_finalizer_after_task_update_hook() -> None:
 
 def _technical_attention_after_replace_hook() -> None:
     """Private in-transaction fault seam for technical replacement rollback tests."""
+
+
+def _approved_action_retry_after_projection_restore_hook() -> None:
+    """Private in-transaction fault seam for opaque retry rollback tests."""
 
 
 def block_approved_action_for_technical_failure(
@@ -8641,16 +8646,19 @@ def resume_approved_action_retry(
             return ResumeApprovedActionRetryResult("not_found", task_id)
         if action["state"] != "approved" or int(action["expires_at"]) <= now:
             return ResumeApprovedActionRetryResult("gone", task_id)
-        # The current restored projection must be exactly the historical opaque
-        # id, and the technical provenance must be the requested resumed run.
+        # The current technical projection is the sole public retry authority.
+        # Resolve its private action binding only inside this transaction.
         attention = conn.execute(
-            "SELECT x.id, a.version FROM task_attentions x JOIN task_pending_actions a ON a.id=x.action_id "
-            "WHERE x.task_id=? AND x.id=? AND x.action_id=? AND x.type='exact_action'",
+            "SELECT x.id, x.version, x.origin_run_id FROM task_attentions x "
+            "WHERE x.task_id=? AND x.id=? AND x.action_id=? "
+            "AND x.type IN ('capability','transient')",
             (task_id, int(expected_attention_id), int(action["id"])),
         ).fetchone()
         if attention is None:
             return ResumeApprovedActionRetryResult("gone", task_id)
         if int(attention["version"]) != int(expected_attention_version):
+            return ResumeApprovedActionRetryResult("conflict", task_id, attention_id=int(attention["id"]), attention_version=int(attention["version"]))
+        if attention["origin_run_id"] != int(expected_origin_run_id):
             return ResumeApprovedActionRetryResult("conflict", task_id, attention_id=int(attention["id"]), attention_version=int(attention["version"]))
         origin = conn.execute(
             "SELECT status, outcome, ended_at FROM task_runs WHERE id=? AND task_id=?",
@@ -8674,13 +8682,25 @@ def resume_approved_action_retry(
         target: Literal["ready", "todo"] = "todo" if conn.execute(
             "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1", (task_id,)
         ).fetchone() else "ready"
+        # Rebind the stable opaque projection in-place before releasing the
+        # task.  The worker will see the same public ID as an approved exact
+        # action until it consumes the one-time grant.
+        if conn.execute(
+            "UPDATE task_attentions SET type='exact_action', origin_run_id=NULL, summary=? "
+            "WHERE id=? AND task_id=? AND action_id=? AND type IN ('capability','transient') "
+            "AND version=? AND origin_run_id=?",
+            (PENDING_ACTION_OPERATOR_SUMMARY, int(attention["id"]), task_id, int(action["id"]),
+             int(expected_attention_version), int(expected_origin_run_id)),
+        ).rowcount != 1:
+            return ResumeApprovedActionRetryResult("conflict", task_id, attention_id=int(attention["id"]), attention_version=int(attention["version"]))
+        _approved_action_retry_after_projection_restore_hook()
         if conn.execute(
             "UPDATE tasks SET status=?, current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
             "WHERE id=? AND status='blocked' AND current_run_id IS NULL AND claim_lock IS NULL "
             "AND claim_expires IS NULL AND worker_pid IS NULL",
             (target, task_id),
         ).rowcount != 1:
-            return ResumeApprovedActionRetryResult("conflict", task_id, attention_id=int(attention["id"]), attention_version=int(attention["version"]))
+            raise RuntimeError("approved action retry task CAS lost")
         _append_event(conn, task_id, "unblocked", {"status": target, "actor": str(actor)[:120]})
         _append_event(conn, task_id, "approved_action_retry_resumed", {"actor": str(actor)[:120]}, run_id=int(expected_origin_run_id))
         return ResumeApprovedActionRetryResult("resumed", task_id, attention_id=int(attention["id"]), attention_version=int(attention["version"]), task_status=target)

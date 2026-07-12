@@ -2321,6 +2321,74 @@ def test_technical_projection_is_deleted_on_expiry_resolve_and_cleanup_rollback(
         assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 0
 
 
+def test_opaque_technical_retry_rejects_stale_origin_and_replay_without_drift(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        action, origin_run_id = _park_and_approve(conn, task_id, "opaque-retry-cas-marker", isolated_board)
+        assert origin_run_id is not None
+        assert kb.block_approved_action_for_technical_failure(
+            conn, task_id=task_id, action_id=action.id, expected_run_id=origin_run_id,
+            attention_type="capability", reason_code="missing_capability", now=1_900_000_001,
+        )
+        technical = kb.get_current_attention(conn, task_id, now=1_900_000_001)
+        assert technical is not None
+        before = _atomic_snapshot(conn, task_id, origin_run_id)
+        stale = kb.resume_approved_action_retry(
+            conn, task_id=task_id, expected_attention_id=technical.id,
+            expected_attention_version=technical.version + 1,
+            expected_origin_run_id=origin_run_id, now=1_900_000_002,
+        )
+        wrong_origin = kb.resume_approved_action_retry(
+            conn, task_id=task_id, expected_attention_id=technical.id,
+            expected_attention_version=technical.version,
+            expected_origin_run_id=origin_run_id + 1, now=1_900_000_002,
+        )
+        assert (stale.status, wrong_origin.status) == ("conflict", "conflict")
+        assert _atomic_snapshot(conn, task_id, origin_run_id) == before
+        assert kb.resume_approved_action_retry(
+            conn, task_id=task_id, expected_attention_id=technical.id,
+            expected_attention_version=technical.version,
+            expected_origin_run_id=origin_run_id, now=1_900_000_002,
+        ).status == "resumed"
+        after_resume = _atomic_snapshot(conn, task_id, origin_run_id)
+        replay = kb.resume_approved_action_retry(
+            conn, task_id=task_id, expected_attention_id=technical.id,
+            expected_attention_version=technical.version,
+            expected_origin_run_id=origin_run_id, now=1_900_000_002,
+        )
+        assert replay.status == "gone"
+        assert _atomic_snapshot(conn, task_id, origin_run_id) == after_resume
+
+
+def test_opaque_technical_retry_restore_fault_rolls_back_snapshot(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        action, origin_run_id = _park_and_approve(conn, task_id, "opaque-retry-rollback-marker", isolated_board)
+        assert origin_run_id is not None
+        assert kb.block_approved_action_for_technical_failure(
+            conn, task_id=task_id, action_id=action.id, expected_run_id=origin_run_id,
+            attention_type="transient", reason_code="external_transient", now=1_900_000_001,
+        )
+        technical = kb.get_current_attention(conn, task_id, now=1_900_000_001)
+        assert technical is not None
+        before = _atomic_snapshot(conn, task_id, origin_run_id)
+        monkeypatch.setattr(
+            kb, "_approved_action_retry_after_projection_restore_hook",
+            lambda: (_ for _ in ()).throw(RuntimeError("retry restore fault")),
+        )
+        with pytest.raises(RuntimeError, match="retry restore fault"):
+            kb.resume_approved_action_retry(
+                conn, task_id=task_id, expected_attention_id=technical.id,
+                expected_attention_version=technical.version,
+                expected_origin_run_id=origin_run_id, now=1_900_000_002,
+            )
+        assert _atomic_snapshot(conn, task_id, origin_run_id) == before
+
+
 def test_technical_projection_is_deleted_on_consume_done_and_archive(
     isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2356,27 +2424,25 @@ def test_technical_projection_is_deleted_on_consume_done_and_archive(
             action.id, "transient", "pending",
         )
 
-        assert kb.restore_approved_action_attention(conn, task_id, action.id, now=1_900_000_002)
+        resumed = kb.resume_approved_action_retry(
+            conn, task_id=task_id, expected_attention_id=technical.id,
+            expected_attention_version=technical.version,
+            expected_origin_run_id=first_resumed_run, now=1_900_000_002,
+        )
+        assert resumed.status == "resumed"
         restored = kb.get_current_attention(conn, task_id, now=1_900_000_002)
         restored_rows = conn.execute(
             "SELECT action_id, type FROM task_attentions WHERE task_id=?", (task_id,)
         ).fetchall()
         restored_action = kb.get_pending_action_by_id(conn, task_id, action.id)
-        assert restored is not None and (restored.action_id, restored.type, restored.state) == (
-            action.id, "exact_action", "approved",
+        assert restored is not None and (restored.id, restored.action_id, restored.type, restored.state) == (
+            technical.id, action.id, "exact_action", "approved",
         )
         assert [tuple(row) for row in restored_rows] == [(action.id, "exact_action")]
         assert restored_action is not None and (
             restored_action.state, restored_action.version, restored_action.consumed_at,
         ) == ("approved", approved_version, None)
 
-        retry_attention = kb.get_current_attention(conn, task_id)
-        assert retry_attention is not None
-        assert kb.resume_approved_action_retry(
-            conn, task_id=task_id, expected_attention_id=retry_attention.id,
-            expected_attention_version=retry_attention.version,
-            expected_origin_run_id=first_resumed_run,
-        )
         ready = kb.get_task(conn, task_id)
         assert ready is not None and (
             ready.status, ready.current_run_id, ready.claim_lock, ready.claim_expires,
@@ -2409,6 +2475,9 @@ def test_technical_projection_is_deleted_on_consume_done_and_archive(
         assert sum(event.kind == "unblocked" for event in events) == 2
         assert sum(event.kind == "claimed" for event in events) == 3
         assert sum(event.kind == "blocked" for event in events) == 2
+        retry_events = [event for event in events if event.kind == "approved_action_retry_resumed"]
+        assert len(retry_events) == 1 and retry_events[0].payload is not None
+        assert "action_id" not in retry_events[0].payload
         consume_events = [event for event in events if event.kind == "terminal_approval_consumed"]
         assert len(consume_events) == 1
         consume_event = consume_events[0]
