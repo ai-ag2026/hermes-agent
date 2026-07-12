@@ -178,21 +178,21 @@ def _task_dict(
     return d
 
 
-def _attention_dict(conn: sqlite3.Connection, task: kanban_db.Task) -> Optional[dict[str, Any]]:
-    """Return the canonical safe current-attention projection, never history."""
-    if task.status in {"done", "archived"}:
-        return None
-    attention = kanban_db.get_current_attention(conn, task.id)
+def _attention_dict(attention: Optional[kanban_db.Attention]) -> Optional[dict[str, Any]]:
+    """Serialize one Core-provided projection through a closed public schema.
+
+    Callers must obtain the mapping with ``get_current_attentions``.  In
+    particular, this function deliberately performs no action/history lookup:
+    doing so would turn a board render into an N+1 query and leak lifecycle
+    authority back into the dashboard adapter.
+    """
     if attention is None:
         return None
-    action = kanban_db.get_pending_action_by_id(conn, task.id, attention.action_id)
     if attention.type == "exact_action":
-        if action is None or action.state not in {"pending", "approved"} or any((
-            action.resolved_at is not None, action.consumed_at is not None, action.cancelled_at is not None,
-        )):
-            return None
-        approved = action.state == "approved"
-        mutation_kind = action.mutation_kind
+        # Core only returns live exact projections.  Do not resolve action_id
+        # here: it is private authority, not a public-dashboard field.
+        approved = attention.state == "approved"
+        mutation_kind = None
         state = "approved-awaiting-worker" if approved else "pending"
         requires_human_action = False if approved else attention.requires_human_action
         approvable = False if approved else attention.approvable
@@ -219,31 +219,17 @@ def _attention_dict(conn: sqlite3.Connection, task: kanban_db.Task) -> Optional[
 
 
 def _attention_action(conn: sqlite3.Connection, task_id: str, attention_id: int) -> Optional[kanban_db.PendingAction]:
-    """Resolve an opaque public attention id to its private exact-action binding."""
-    row = conn.execute(
-        "SELECT action_id, type FROM task_attentions WHERE id=? AND task_id=?",
-        (int(attention_id), task_id),
-    ).fetchone()
-    if row is None or row["type"] != "exact_action" or row["action_id"] is None:
-        return None
-    return kanban_db.get_pending_action_by_id(conn, task_id, int(row["action_id"]))
+    """Resolve only task-bound opaque history; never reconstruct from events."""
+    return kanban_db.get_action_by_attention_id(conn, task_id, attention_id)
 
 
 def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
-    """History cannot become an approval side channel."""
-    payload = event.payload
-    if event.kind.startswith("terminal_approval"):
-        payload = None
-    elif isinstance(payload, dict):
-        payload = {key: value for key, value in payload.items() if key not in {
-            "action_id", "terminal_action_id", "reason", "summary", "fingerprint",
-            "command_hash", "profile", "workspace", "token", "credential",
-        }}
+    """Return an envelope only: event payload is untrusted worker prose."""
     return {
         "id": event.id,
         "task_id": event.task_id,
         "kind": event.kind,
-        "payload": payload,
+        "payload": None,
         "created_at": event.created_at,
         "run_id": event.run_id,
     }
@@ -275,24 +261,17 @@ def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
 
 
 def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
-    """Serialise a Run for the drawer's Run history section."""
+    """Strict operational whitelist; never expose worker identity or prose."""
     return {
         "id": r.id,
         "task_id": r.task_id,
-        "profile": r.profile,
         "step_key": r.step_key,
         "status": r.status,
-        "claim_lock": r.claim_lock,
-        "claim_expires": r.claim_expires,
-        "worker_pid": r.worker_pid,
         "max_runtime_seconds": r.max_runtime_seconds,
         "last_heartbeat_at": r.last_heartbeat_at,
         "started_at": r.started_at,
         "ended_at": r.ended_at,
         "outcome": r.outcome,
-        "summary": None if r.outcome == "blocked" else r.summary,
-        "metadata": r.metadata,
-        "error": r.error,
     }
 
 
@@ -519,7 +498,9 @@ def get_board(
         # window-function query (avoids N+1 ``latest_summary`` calls
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        task_ids = [t.id for t in tasks]
+        summary_map = kanban_db.latest_summaries(conn, task_ids)
+        attentions = kanban_db.get_current_attentions(conn, task_ids)
 
         for t in tasks:
             full = summary_map.get(t.id)
@@ -527,7 +508,7 @@ def get_board(
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
             d = _task_dict(t, latest_summary=preview)
-            attention = _attention_dict(conn, t)
+            attention = _attention_dict(attentions.get(t.id))
             if attention is not None:
                 d["attention"] = attention
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
@@ -611,7 +592,7 @@ def get_task(
         # a second round-trip. Cards on /board carry a 200-char preview.
         full_summary = kanban_db.latest_summary(conn, task_id)
         task_d = _task_dict(task, latest_summary=full_summary)
-        attention = _attention_dict(conn, task)
+        attention = _attention_dict(kanban_db.get_current_attentions(conn, [task_id]).get(task_id))
         if attention is not None:
             task_d["attention"] = attention
         # Attach diagnostics so the drawer's Diagnostics section can
@@ -881,21 +862,29 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
-    # Structured handoff fields — forwarded to complete_task when status
-    # transitions to 'done'. Dashboard parity with ``hermes kanban
-    # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    attention_id: Optional[StrictInt] = Field(default=None, gt=0)
+    attention_version: Optional[StrictInt] = Field(default=None, ge=0)
+
+    class Config:
+        extra = "forbid"
 
 
 class ApproveTerminalActionBody(BaseModel):
-    action_id: StrictInt = Field(gt=0, description="Opaque current attention id")
-    version: StrictInt = Field(ge=0)
+    attention_id: StrictInt = Field(gt=0, description="Opaque current attention id")
+    attention_version: StrictInt = Field(ge=0)
+
+    class Config:
+        extra = "forbid"
 
 
 class ResolveTerminalActionBody(BaseModel):
-    action_id: StrictInt = Field(gt=0, description="Opaque current attention id")
-    version: StrictInt = Field(ge=0)
+    attention_id: StrictInt = Field(gt=0, description="Opaque current attention id")
+    attention_version: StrictInt = Field(ge=0)
+
+    class Config:
+        extra = "forbid"
 
 
 def _attention_result_error(result: Any) -> HTTPException:
@@ -919,11 +908,11 @@ def approve_terminal_action(
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail="task not found")
-        action = _attention_action(conn, task_id, payload.action_id)
+        action = _attention_action(conn, task_id, payload.attention_id)
         if action is None:
             raise HTTPException(status_code=404, detail="terminal action not found")
         result = kanban_db.approve_pending_action_and_unblock_versioned(
-            conn, task_id, action.id, expected_version=payload.version, actor="dashboard",
+            conn, task_id, action.id, expected_version=payload.attention_version, actor="dashboard",
         )
         if not result:
             raise _attention_result_error(result)
@@ -944,19 +933,19 @@ def resolve_terminal_action(
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail="task not found")
-        action = _attention_action(conn, task_id, payload.action_id)
+        action = _attention_action(conn, task_id, payload.attention_id)
         if action is None:
             raise HTTPException(status_code=404, detail="terminal action not found")
         if action.state not in {"pending", "approved"}:
             raise HTTPException(status_code=410, detail="terminal action is no longer available")
         result = kanban_db.resolve_pending_action(
-            conn, task_id, action.id, expected_version=payload.version,
+            conn, task_id, action.id, expected_version=payload.attention_version,
         )
         if not result:
             # Core returns conflict for a concurrent/just-settled CAS. Read
             # terminal state only to classify the safe HTTP outcome; it never
             # authorizes a mutation outside the Core transaction.
-            if getattr(result, "status", None) == "conflict" and action.version == payload.version:
+            if getattr(result, "status", None) == "conflict" and action.version == payload.attention_version:
                 settled = kanban_db.get_pending_action_by_id(conn, task_id, action.id)
                 if settled is not None and settled.state not in {"pending", "approved"}:
                     raise HTTPException(status_code=410, detail="terminal action is no longer available")
@@ -989,18 +978,23 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
-            pending_action = kanban_db.get_pending_action(conn, task_id)
-            current_attention = _attention_dict(conn, task)
-            if task.status == "blocked" and s in {"ready", "todo", "triage"} and current_attention is not None:
-                # Never provide a generic blocked escape around a current typed
-                # attention. The Core seam owns the atomic projection check.
+            if (payload.attention_id is None) != (payload.attention_version is None):
+                raise HTTPException(status_code=422, detail="attention_id and attention_version must be passed together")
+            if task.status == "blocked" and s in {"ready", "todo", "triage"}:
+                # Core owns every blocked exit.  A live projection cannot be
+                # escaped through dashboard SQL or legacy unblock helpers.
+                if task.human_gate:
+                    raise HTTPException(status_code=409, detail="human-gated task cannot change status without approval")
                 transitioned = kanban_db.transition_task_status_with_attention(
-                    conn, task_id=task_id, status=s, actor="dashboard",  # type: ignore[arg-type]
+                    conn, task_id=task_id, status=s, actor="dashboard",
+                    expected_attention_id=payload.attention_id,
+                    expected_attention_version=payload.attention_version,
                 )
                 if not transitioned:
                     raise _attention_result_error(transitioned)
                 updated = kanban_db.get_task(conn, task_id)
                 return {"task": _task_dict(updated) if updated else None}
+            pending_action = kanban_db.get_pending_action(conn, task_id)
             if pending_action is not None and s not in ("blocked", "archived"):
                 raise HTTPException(
                     status_code=409,

@@ -97,7 +97,7 @@ def test_exact_terminal_action_requires_combined_approval_and_resume(client, tmp
 
     approved = client.post(
         f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action",
-        json={"action_id": attention["id"], "version": attention["version"]},
+        json={"attention_id": attention["id"], "attention_version": attention["version"]},
     )
     assert approved.status_code == 200, approved.text
     with kb.connect() as conn:
@@ -107,7 +107,7 @@ def test_exact_terminal_action_requires_combined_approval_and_resume(client, tmp
 
     replay = client.post(
         f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action",
-        json={"action_id": attention["id"], "version": attention["version"]},
+        json={"attention_id": attention["id"], "attention_version": attention["version"]},
     )
     assert replay.status_code == 410
 
@@ -156,27 +156,27 @@ def test_versioned_attention_routes_and_named_board_isolation(client, tmp_path):
     task, _ = _pending_exact_action(client, tmp_path)
     other, _ = _pending_exact_action(client, tmp_path, board="other")
     attention = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]["attention"]
-    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action?board=other", json={"action_id": attention["id"], "version": attention["version"]}).status_code == 404
-    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action", json={"action_id": attention["id"], "version": attention["version"] + 1}).status_code == 409
-    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action", json={"action_id": attention["id"], "version": attention["version"]}).status_code == 200
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action?board=other", json={"attention_id": attention["id"], "attention_version": attention["version"]}).status_code == 404
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action", json={"attention_id": attention["id"], "attention_version": attention["version"] + 1}).status_code == 409
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action", json={"attention_id": attention["id"], "attention_version": attention["version"]}).status_code == 200
     assert "attention" not in client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
-    # The resolved projection is no longer current; its opaque id is therefore
-    # a stale snapshot conflict rather than an authorization handle.
-    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action", json={"action_id": attention["id"], "version": attention["version"]}).status_code == 409
+    # Terminal/replay identity is task-bound opaque history and therefore
+    # gone (not a new authorization conflict or an event reconstruction).
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action", json={"attention_id": attention["id"], "attention_version": attention["version"]}).status_code == 410
     assert client.get(f"/api/plugins/kanban/tasks/{other['id']}?board=other").json()["task"]["attention"]["id"]
-    assert client.post(f"/api/plugins/kanban/tasks/{other['id']}/resolve-terminal-action?board=other", json={"action_id": True, "version": 1}).status_code == 422
-    assert client.post(f"/api/plugins/kanban/tasks/{other['id']}/resolve-terminal-action?board=other", json={"action_id": 1, "version": True}).status_code == 422
+    assert client.post(f"/api/plugins/kanban/tasks/{other['id']}/resolve-terminal-action?board=other", json={"attention_id": True, "attention_version": 1}).status_code == 422
+    assert client.post(f"/api/plugins/kanban/tasks/{other['id']}/resolve-terminal-action?board=other", json={"attention_id": 1, "attention_version": True}).status_code == 422
 
 
 def test_approved_current_attention_is_non_actionable_and_terminal_absent(client, tmp_path):
     task, _ = _pending_exact_action(client, tmp_path)
     pending = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]["attention"]
-    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action", json={"action_id": pending["id"], "version": pending["version"]}).status_code == 200
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action", json={"attention_id": pending["id"], "attention_version": pending["version"]}).status_code == 200
     approved = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]["attention"]
     assert approved["id"] == pending["id"] and approved["version"] == pending["version"] + 1
     assert approved["state"] == "approved-awaiting-worker"
     assert approved["requires_human_action"] is False and approved["approvable"] is False
-    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action", json={"action_id": approved["id"], "version": approved["version"]}).status_code == 200
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/resolve-terminal-action", json={"attention_id": approved["id"], "attention_version": approved["version"]}).status_code == 200
     assert "attention" not in client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
 
 
@@ -1531,9 +1531,13 @@ def test_task_detail_includes_runs(client):
     assert len(d["runs"]) == 1
     run = d["runs"][0]
     assert run["outcome"] == "completed"
-    assert run["profile"] == "worker"
-    assert run["summary"] == "tested on rate limiter"
-    assert run["metadata"] == {"changed_files": ["limiter.py"]}
+    assert set(run) == {
+        "id", "task_id", "step_key", "status", "max_runtime_seconds",
+        "last_heartbeat_at", "started_at", "ended_at", "outcome",
+    }
+    assert "worker" not in repr(run)
+    assert "tested on rate limiter" not in repr(run)
+    assert "limiter.py" not in repr(run)
     assert run["ended_at"] is not None
 
 

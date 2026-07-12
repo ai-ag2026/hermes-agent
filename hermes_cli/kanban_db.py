@@ -7795,7 +7795,14 @@ def _migrate_pending_action_lifecycle(conn: sqlite3.Connection) -> None:
         for row in rows:
             valid = _pending_action_fingerprint_valid(conn, row)
             state = row["state"] or "pending"
-            if row["consumed_at"] is not None:
+            # Once a v2 lifecycle reached a terminal state, re-initialization
+            # must never infer a new pending grant from its old timestamps.
+            # This is essential because dashboard connections initialize on
+            # every request; resurrecting a resolved row would recreate a
+            # supposedly terminal opaque attention identity.
+            if state in {"consumed", "cancelled", "expired", "resolved"}:
+                pass
+            elif row["consumed_at"] is not None:
                 state = "consumed"
             elif row["cancelled_at"] is not None:
                 state = "cancelled"
