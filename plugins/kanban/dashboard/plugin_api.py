@@ -116,6 +116,11 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
     return normed
 
 
+def _response_board(board: Optional[str]) -> str:
+    """Return the concrete board selected by a normalised request value."""
+    return board if board is not None else kanban_db.get_current_board()
+
+
 def _conn(board: Optional[str] = None):
     """Open a kanban_db connection, creating the schema on first use.
 
@@ -160,20 +165,38 @@ def _task_dict(
     *,
     latest_summary: Optional[str] = None,
 ) -> dict[str, Any]:
-    d = asdict(task)
-    # Blocker prose is history/internal context, never dashboard payload.
-    d["block_reason"] = None
+    # Deliberately a public whitelist, not a dataclass dump with fields removed.
+    # Task also carries worker, workspace, failure, run, session, gate, and
+    # metadata internals that must never reach the browser.
+    d = {
+        "id": task.id,
+        "title": task.title,
+        "body": task.body,
+        "assignee": task.assignee,
+        "status": task.status,
+        "priority": task.priority,
+        "tenant": task.tenant,
+        "created_at": task.created_at,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
+        "max_runtime_seconds": task.max_runtime_seconds,
+        "workflow_template_id": task.workflow_template_id,
+        "current_step_key": task.current_step_key,
+        "goal_mode": task.goal_mode,
+        "goal_max_turns": task.goal_max_turns,
+        "skills": task.skills,
+        # Blocker prose is history/internal context, never dashboard payload.
+        "block_reason": None,
+    }
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
         d["age"] = kanban_db.task_age(task)
     except Exception:
         d["age"] = {"created_age_seconds": None, "started_age_seconds": None, "time_to_complete_seconds": None}
-    # Surface the latest non-null run summary so dashboards don't show
-    # blank cards/drawers for tasks where the worker handed off via
-    # ``task_runs.summary`` (the kanban-worker pattern) instead of
-    # ``tasks.result``. ``None`` when no run has produced a summary yet.
-    d["latest_summary"] = None if task.status == "blocked" else latest_summary
+    # Run summaries are worker prose. Keep the stable product field but never
+    # serialize its raw content through board/detail responses.
+    d["latest_summary"] = None
     # Keep body short on list endpoints; full body comes from /tasks/:id.
     return d
 
@@ -544,6 +567,7 @@ def get_board(
         ]
 
         return {
+            "board": _response_board(board),
             "columns": [
                 {"name": name, "tasks": columns[name]} for name in columns.keys()
             ],
@@ -603,6 +627,7 @@ def get_task(
             task_d["diagnostics"] = diag_list
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
         return {
+            "board": _response_board(board),
             "task": task_d,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
             "events": [_event_dict(e) for e in kanban_db.list_events(conn, task_id)],
@@ -887,6 +912,15 @@ class ResolveTerminalActionBody(BaseModel):
         extra = "forbid"
 
 
+class ResumeApprovedActionRetryBody(BaseModel):
+    attention_id: StrictInt = Field(gt=0, description="Opaque current technical attention id")
+    attention_version: StrictInt = Field(ge=0)
+    origin_run_id: StrictInt = Field(gt=0)
+
+    class Config:
+        extra = "forbid"
+
+
 def _attention_result_error(result: Any) -> HTTPException:
     outcome = getattr(result, "status", "conflict")
     if outcome == "not_found":
@@ -916,7 +950,14 @@ def approve_terminal_action(
         )
         if not result:
             raise _attention_result_error(result)
-        return {"ok": True, "task_id": task_id}
+        return {
+            "ok": True,
+            "board": _response_board(board),
+            "task_id": result.task_id,
+            "attention_id": result.attention_id,
+            "attention_version": result.attention_version,
+            "task_status": result.task_status,
+        }
     finally:
         conn.close()
 
@@ -950,7 +991,45 @@ def resolve_terminal_action(
                 if settled is not None and settled.state not in {"pending", "approved"}:
                     raise HTTPException(status_code=410, detail="terminal action is no longer available")
             raise _attention_result_error(result)
-        return {"ok": True, "task_id": task_id}
+        return {
+            "ok": True,
+            "board": _response_board(board),
+            "task_id": task_id,
+            "attention_id": payload.attention_id,
+            "attention_version": payload.attention_version,
+        }
+    finally:
+        conn.close()
+
+
+@router.post("/tasks/{task_id}/resume-approved-action-retry")
+def resume_approved_action_retry(
+    task_id: str,
+    payload: ResumeApprovedActionRetryBody,
+    board: Optional[str] = Query(None),
+):
+    """Resume an approved grant directly from its opaque technical attention."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        result = kanban_db.resume_approved_action_retry(
+            conn,
+            task_id=task_id,
+            expected_attention_id=payload.attention_id,
+            expected_attention_version=payload.attention_version,
+            expected_origin_run_id=payload.origin_run_id,
+            actor="dashboard",
+        )
+        if not result:
+            raise _attention_result_error(result)
+        return {
+            "ok": True,
+            "board": _response_board(board),
+            "task_id": result.task_id,
+            "attention_id": result.attention_id,
+            "attention_version": result.attention_version,
+            "task_status": result.task_status,
+        }
     finally:
         conn.close()
 
@@ -993,7 +1072,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 if not transitioned:
                     raise _attention_result_error(transitioned)
                 updated = kanban_db.get_task(conn, task_id)
-                return {"task": _task_dict(updated) if updated else None}
+                return {"board": _response_board(board), "task": _task_dict(updated) if updated else None}
             pending_action = kanban_db.get_pending_action(conn, task_id)
             if pending_action is not None and s not in ("blocked", "archived"):
                 raise HTTPException(
@@ -1117,7 +1196,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 )
 
         updated = kanban_db.get_task(conn, task_id)
-        return {"task": _task_dict(updated) if updated else None}
+        return {"board": _response_board(board), "task": _task_dict(updated) if updated else None}
     finally:
         conn.close()
 

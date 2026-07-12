@@ -151,6 +151,91 @@ def test_current_attention_contract_and_redaction(client, tmp_path):
     assert "pending_terminal_action" not in public
 
 
+def test_task_payload_is_a_recursive_public_whitelist(client, tmp_path):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "safe", "body": "public body", "assignee": "worker"}).json()["task"]
+    markers = {
+        "workspace_path": "P5_WORKSPACE_MARKER", "claim_lock": "P5_CLAIM_MARKER",
+        "last_failure_error": "P5_FAILURE_MARKER", "result": "P5_RESULT_MARKER",
+        "session_id": "P5_SESSION_MARKER", "run_summary": "P5_RUN_MARKER",
+        "run_error": "P5_RUN_ERROR_MARKER", "run_metadata": "P5_RUN_METADATA_MARKER",
+        "event_metadata": "P5_EVENT_METADATA_MARKER",
+    }
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task["id"], claimer="redaction-worker")
+        assert claimed is not None and claimed.current_run_id is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_path=?, claim_lock=?, last_failure_error=?, result=?, session_id=? WHERE id=?",
+                (markers["workspace_path"], markers["claim_lock"], markers["last_failure_error"], markers["result"], markers["session_id"], task["id"]),
+            )
+            conn.execute(
+                "UPDATE task_runs SET summary=?, metadata=?, error=? WHERE id=?",
+                (markers["run_summary"], markers["run_metadata"], markers["run_error"], claimed.current_run_id),
+            )
+            conn.execute("UPDATE task_events SET payload=? WHERE task_id=?", (markers["event_metadata"], task["id"]))
+    board = client.get("/api/plugins/kanban/board").json()
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    expected = {
+        "id", "title", "body", "assignee", "status", "priority", "tenant", "created_at", "started_at", "completed_at",
+        "max_runtime_seconds", "workflow_template_id", "current_step_key", "goal_mode", "goal_max_turns", "skills", "block_reason", "age", "latest_summary",
+    }
+    board_task = _board_task(board, task["id"])
+    assert expected <= set(board_task)
+    assert set(board_task) == expected | {"link_counts", "comment_count", "progress"}
+    assert set(detail["task"]) == expected
+    assert board_task["block_reason"] is None and detail["task"]["block_reason"] is None
+    public = repr({"board": board, "detail": detail}) + repr({"board": board, "detail": detail})
+    for marker in markers.values():
+        assert marker not in public
+
+
+def test_named_board_identity_is_returned_by_board_detail_update_and_approve(client, tmp_path):
+    board = "p5-named"
+    kb.create_board(board)
+    task, _ = _pending_exact_action(client, tmp_path, board=board)
+    board_payload = client.get(f"/api/plugins/kanban/board?board={board}").json()
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}?board={board}").json()
+    updated = client.patch(f"/api/plugins/kanban/tasks/{task['id']}?board={board}", json={"title": "renamed"}).json()
+    attention = detail["task"]["attention"]
+    approved = client.post(
+        f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action?board={board}",
+        json={"attention_id": attention["id"], "attention_version": attention["version"]},
+    )
+    assert approved.status_code == 200, approved.text
+    assert {board_payload["board"], detail["board"], updated["board"], approved.json()["board"]} == {board}
+    assert client.get("/api/plugins/kanban/board").json()["board"] == "default"
+
+
+def test_resume_approved_action_retry_is_opaque_and_versioned(client, tmp_path):
+    task, action = _pending_exact_action(client, tmp_path)
+    pending = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]["attention"]
+    assert client.post(f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action", json={"attention_id": pending["id"], "attention_version": pending["version"]}).status_code == 200
+    with kb.connect() as conn:
+        resumed = kb.claim_task(conn, task["id"], claimer="retry-worker")
+        assert resumed is not None and resumed.current_run_id is not None
+        assert kb.block_approved_action_for_technical_failure(
+            conn, task_id=task["id"], action_id=action.id, expected_run_id=resumed.current_run_id,
+            attention_type="capability", reason_code="missing_capability", now=int(time.time()),
+        )
+        origin_run_id = resumed.current_run_id
+    technical = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]["attention"]
+    assert technical["type"] == "capability"
+    route = f"/api/plugins/kanban/tasks/{task['id']}/resume-approved-action-retry"
+    base = {"attention_id": technical["id"], "attention_version": technical["version"], "origin_run_id": origin_run_id}
+    assert client.post(route, json={**base, "origin_run_id": origin_run_id + 1}).status_code == 409
+    assert client.post(route, json={**base, "attention_version": technical["version"] + 1}).status_code == 409
+    for hostile in ({**base, "attention_id": True}, {**base, "action_id": action.id}, {**base, "origin_run_id": True}):
+        assert client.post(route, json=hostile).status_code == 422
+    response = client.post(route, json=base)
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "ok": True, "board": "default", "task_id": task["id"], "attention_id": technical["id"],
+        "attention_version": technical["version"], "task_status": "ready",
+    }
+    assert "action_id" not in repr(response.json())
+    assert client.post(route, json=base).status_code == 410
+
+
 def test_versioned_attention_routes_and_named_board_isolation(client, tmp_path):
     kb.create_board("other")
     task, _ = _pending_exact_action(client, tmp_path)
