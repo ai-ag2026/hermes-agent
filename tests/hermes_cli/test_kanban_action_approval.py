@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import threading
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -528,3 +530,261 @@ def test_pending_action_block_preserves_latest_human_guidance(
         ][-1]
         assert blocked.payload["human_summary"] == "Exact publication approval is pending."
         assert blocked.payload["human_action"] == "Approve the displayed action, then resume."
+
+
+# Package 0A — desired core contracts for the approval/attention repair.
+# These are deliberately red against ddacab180: they describe the atomic
+# operator-attention lifecycle that the repair package must introduce.
+# Package-2 test gap: this baseline has no existing combined core transition
+# with a fault-injection seam, so rollback atomicity cannot be asserted without
+# inventing a production API. Cover it when Package 2 exposes that transition.
+
+
+def test_duplicate_exact_action_after_one_second_keeps_same_approval_id(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    now = {"value": 1_900_000_000}
+    monkeypatch.setattr(kb.time, "time", lambda: now["value"])
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        first = kb.record_pending_action(
+            conn, task_id=task_id, run_id=task.current_run_id, command=command,
+            summary="publish", profile="backend-eng", workspace=str(isolated_board),
+            expires_at=now["value"] + 86400,
+        )
+        now["value"] += 2
+        second = kb.record_pending_action(
+            conn, task_id=task_id, run_id=task.current_run_id, command=command,
+            summary="publish", profile="backend-eng", workspace=str(isolated_board),
+            expires_at=now["value"] + 86400,
+        )
+    # An approval identity is the exact action, not its refreshed deadline.
+    # Repair may retain or extend expires_at, but must not rotate ID/fingerprint.
+    assert second.id == first.id
+    assert second.fingerprint == first.fingerprint
+    assert second.expires_at >= first.expires_at
+
+
+def _configure_terminal_pending_guard(monkeypatch: pytest.MonkeyPatch, command: str) -> None:
+    from tools import approval
+
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(
+        approval, "detect_dangerous_command",
+        lambda value: (True, "git_force_push", "force push")
+        if value == command else (False, None, None),
+    )
+
+
+def test_terminal_pending_action_atomically_ends_run_blocks_and_surfaces_one_attention(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import approval
+
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    smart_llm = Mock()
+    monkeypatch.setattr(approval, "_smart_approve", smart_llm)
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["status"] == "pending_approval"
+    smart_llm.assert_not_called()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "blocked"
+        assert task.current_run_id is None
+        run = kb.latest_run(conn, task_id)
+        assert run is not None and run.outcome == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_pending_actions WHERE task_id=? "
+            "AND consumed_at IS NULL AND cancelled_at IS NULL", (task_id,),
+        ).fetchone()[0] == 1
+        assert len([
+            event for event in kb.list_events(conn, task_id=task_id)
+            if event.kind == "terminal_approval_pending"
+        ]) == 1
+
+
+def test_guard_response_crash_boundary_leaves_actionable_blocked_operator_entity(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returning pending_approval is the simulated crash boundary: no caller cleanup."""
+    from tools import approval
+
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    assert approval.check_all_command_guards(command, "local")["status"] == "pending_approval"
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "blocked"
+        assert kb.get_pending_action(conn, task_id) is not None
+        assert any(
+            event.kind == "blocked" and (event.payload or {})["kind"] == "needs_input"
+            for event in kb.list_events(conn, task_id=task_id)
+        )
+
+
+def test_human_gate_token_survives_other_unblock_precondition_failure(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.record_pending_action(
+            conn, task_id=task_id, run_id=task.current_run_id, command=command,
+            summary="publish", profile="backend-eng", workspace=str(isolated_board),
+            expires_at=2_000_000_000,
+        )
+        assert kb.block_task(
+            conn, task_id, kind="needs_input", reason="approval required",
+            expected_run_id=task.current_run_id, human_gate=True,
+        )
+        token = kb.issue_gate_token(conn, task_id, action="unblock")
+        assert token
+        assert kb.unblock_task(conn, task_id, token=token) is False
+        row = conn.execute(
+            "SELECT gate_token_hash FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        assert row["gate_token_hash"] == kb.hash_gate_token(token)
+
+
+def test_same_persistent_cause_fingerprint_increments_recurrence_chain(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="need credential choice",
+                             expected_run_id=task.current_run_id)
+        assert kb.unblock_task(conn, task_id, reason="credential choice supplied")
+        assert kb.claim_task(conn, task_id, claimer="second-worker") is not None
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="need credential choice")
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.block_recurrences == 2
+
+
+def test_different_persistent_cause_fingerprint_starts_new_recurrence_chain(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="need credential choice",
+                             expected_run_id=task.current_run_id)
+        assert kb.unblock_task(conn, task_id, reason="credential choice supplied")
+        assert kb.claim_task(conn, task_id, claimer="second-worker") is not None
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="need publication approval")
+        current = kb.get_task(conn, task_id)
+        # This is deliberately exact persistent-cause identity, not NLP similarity.
+        assert current is not None and current.block_recurrences == 1
+
+
+def test_pending_action_goal_finalizer_keeps_single_current_operator_attention(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real CLI goal-finalizer must not add generic attention to approval."""
+    import cli as cli_mod
+    from hermes_cli import goals
+
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.record_pending_action(
+            conn, task_id=task_id, run_id=task.current_run_id,
+            command="git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic",
+            summary="publish", profile="backend-eng", workspace=str(isolated_board),
+            expires_at=2_000_000_000,
+        )
+
+    # Drive cli.py's actual run_kanban_goal_loop closeout route: a first DONE
+    # verdict produces the finalizer prompt; the second detects no lifecycle
+    # call and invokes the real _block closure.
+    monkeypatch.setattr(
+        goals, "judge_goal", lambda *_args, **_kwargs: ("done", "ready to finalize", False, None),
+    )
+    fake_cli = SimpleNamespace(
+        agent=SimpleNamespace(
+            session_id="goal-finalizer-test",
+            run_conversation=lambda **_kwargs: {"final_response": "still open"},
+        ),
+        conversation_history=[],
+        session_id="goal-finalizer-test",
+    )
+    cli_mod._run_kanban_goal_loop_q(fake_cli, "work is complete")  # type: ignore[arg-type]
+
+    with kb.connect() as conn:
+        attention_kinds = {"terminal_approval_pending", "blocked", "block_loop_detected"}
+        assert len([
+            event for event in kb.list_events(conn, task_id=task_id)
+            if event.kind in attention_kinds
+        ]) == 1
+
+
+def test_execute_code_and_terminal_pending_paths_create_same_durable_approval_contract(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+
+    from tools import approval, code_execution_tool, terminal_tool
+
+    terminal_task = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    assert approval.check_all_command_guards(command, "local")["status"] == "pending_approval"
+
+    with kb.connect() as conn:
+        code_task = kb.create_task(conn, title="execute code", assignee="backend-eng")
+        claimed = kb.claim_task(conn, code_task, claimer="code-worker")
+        assert claimed is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", code_task)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+
+    # Call the real public wrapper. Its real guard returns pending approval, so
+    # no script is executed; mocked dispatch makes accidental execution loud.
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "local"})
+    monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda _cfg: False)
+    monkeypatch.setattr(code_execution_tool, "_execute_remote", Mock(side_effect=AssertionError("must not execute")))
+    result = json.loads(code_execution_tool.execute_code("import os; os.unlink('x')"))
+    assert result["status"] == "error"
+
+    with kb.connect() as conn:
+        terminal_action = kb.get_pending_action(conn, terminal_task)
+        code_action = kb.get_pending_action(conn, code_task)
+        terminal_state = kb.get_task(conn, terminal_task)
+        code_state = kb.get_task(conn, code_task)
+        terminal_run = kb.latest_run(conn, terminal_task)
+        code_run = kb.latest_run(conn, code_task)
+        assert terminal_action is not None
+        assert code_action is not None
+        # Mutation kinds can differ, but lifecycle/approval invariants cannot.
+        for action, state, run in (
+            (terminal_action, terminal_state, terminal_run),
+            (code_action, code_state, code_run),
+        ):
+            assert state is not None and state.status == "blocked"
+            assert state.current_run_id is None
+            assert run is not None and run.outcome == "blocked"
+            assert action.fingerprint
+            assert action.approved_at is None and action.consumed_at is None
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_pending_actions WHERE task_id=? "
+                "AND consumed_at IS NULL AND cancelled_at IS NULL", (action.task_id,),
+            ).fetchone()[0] == 1
+            assert len([
+                event for event in kb.list_events(conn, task_id=action.task_id)
+                if event.kind == "terminal_approval_pending"
+            ]) == 1
