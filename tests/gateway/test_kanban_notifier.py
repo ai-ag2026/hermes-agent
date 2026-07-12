@@ -88,6 +88,18 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     assert tid in adapter.sent[0]["text"]
 
 
+def test_notifier_resets_shadow_duplicate_outcomes_on_next_empty_tick(tmp_path, monkeypatch):
+    """Notifier outcomes are per-tick process state, never stale counters."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "empty-tick.db"))
+    kb.init_db()
+    runner = _make_runner(RecordingAdapter())
+    runner._kanban_shadow_duplicate_suppressed_last_tick = {"hot-board": 9}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert runner._kanban_shadow_duplicate_suppressed_last_tick == {"default": 0}
+
+
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
     db_path = tmp_path / "single-owner.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -305,5 +317,132 @@ def _unseen_terminal_events_for(tid, chat_id):
             kinds=["completed", "blocked", "gave_up", "crashed", "timed_out"],
         )
         return events
+    finally:
+        conn.close()
+
+
+def _create_attention_subscription(*, channels=1):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="Public attention title", assignee="worker")
+        for number in range(channels):
+            kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id=f"attention-{number}")
+        attention = kb.upsert_current_typed_attention(
+            conn, task_id=tid, attention_type="decision",
+            reason_code="credential_choice", summary="Choose a credential",
+        )
+        return tid, attention
+    finally:
+        conn.close()
+
+
+def test_notifier_delivers_current_attention_once_per_channel_with_identity_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "attention-once.db"))
+    kb.init_db()
+    tid, attention = _create_attention_subscription(channels=2)
+    adapter = RecordingAdapter()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert {item["chat_id"] for item in adapter.sent} == {"attention-0", "attention-1"}
+    for item in adapter.sent:
+        assert item["metadata"]["kanban_attention_identity"] == {
+            "board": "default", "attention_id": attention.id, "attention_version": attention.version,
+        }
+
+    restarted = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(restarted)))
+    assert restarted.sent == []
+    conn = kb.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM kanban_attention_deliveries WHERE task_id=? AND state='delivered'", (tid,)).fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_notifier_attention_failure_retries_same_identity_with_safe_error_and_logs(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "attention-retry.db"))
+    kb.init_db()
+    tid, attention = _create_attention_subscription()
+    marker = "CHAT PROFILE TITLE REASON EXCEPTION EVENT RUN COMMAND WORKSPACE TOKEN"
+
+    class MarkerFailingAdapter:
+        async def send(self, chat_id, text, metadata=None):
+            raise RuntimeError(marker)
+
+    caplog.set_level("WARNING", logger="gateway.run")
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(MarkerFailingAdapter())))
+    conn = kb.connect()
+    try:
+        failed = conn.execute("SELECT attempts, last_error FROM kanban_attention_deliveries WHERE task_id=?", (tid,)).fetchone()
+        assert tuple(failed) == (1, "send_failed")
+    finally:
+        conn.close()
+    assert marker not in caplog.text
+
+    delivered = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(delivered)))
+    assert len(delivered.sent) == 1
+    assert delivered.sent[0]["metadata"]["kanban_attention_identity"]["attention_id"] == attention.id
+    conn = kb.connect()
+    try:
+        row = conn.execute("SELECT attempts, state, last_error FROM kanban_attention_deliveries WHERE task_id=?", (tid,)).fetchone()
+        assert tuple(row) == (2, "delivered", None)
+    finally:
+        conn.close()
+
+
+def test_notifier_attention_revalidates_before_send_and_cancelled_rows_never_replay(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "attention-cancel.db"))
+    kb.init_db()
+    tid, attention = _create_attention_subscription()
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    original_revalidate = runner._kanban_attention_is_current
+
+    def resolve_before_send(delivery, board):
+        conn = kb.connect(board=board)
+        try:
+            kb.complete_task(conn, tid, summary="resolved before send")
+        finally:
+            conn.close()
+        return original_revalidate(delivery, board)
+
+    monkeypatch.setattr(runner, "_kanban_attention_is_current", resolve_before_send)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.sent == []
+
+    conn = kb.connect()
+    try:
+        assert conn.execute("SELECT state FROM kanban_attention_deliveries WHERE task_id=?", (tid,)).fetchone()[0] == "cancelled"
+        kb.complete_task(conn, tid, summary="resolved")
+    finally:
+        conn.close()
+    restarted = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(restarted)))
+    assert all("kanban_attention_identity" not in item["metadata"] for item in restarted.sent)
+    assert attention.id > 0
+
+
+def test_notifier_suppresses_only_historical_blocked_ping_and_advances_cursor(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "attention-blocked-suppression.db"))
+    kb.init_db()
+    tid, _ = _create_attention_subscription()
+    conn = kb.connect()
+    try:
+        kb._append_event(conn, tid, "blocked", {"reason": "historical"})
+        kb._append_event(conn, tid, "crashed")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    # One attention prompt plus the unrelated crash; no duplicate blocked ping.
+    assert len(adapter.sent) == 2
+    assert all("blocked" not in item["text"].lower() for item in adapter.sent)
+    assert any("crashed" in item["text"].lower() for item in adapter.sent)
+    conn = kb.connect()
+    try:
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["last_event_id"] >= 2
     finally:
         conn.close()

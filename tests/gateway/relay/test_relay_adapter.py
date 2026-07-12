@@ -302,3 +302,13 @@ async def test_no_revocation_no_fatal():
     except asyncio.CancelledError:
         pass
     assert a.has_fatal_error is False
+
+
+@pytest.mark.asyncio
+async def test_send_preserves_attention_identity_metadata_through_relay_stub():
+    """Relay forwarding must preserve opaque attention routing metadata exactly."""
+    transport = _CaptureTransport()
+    adapter = RelayAdapter(PlatformConfig(), make_desc(platform="discord"), transport=transport)
+    identity = {"board": "default", "attention_id": 17, "attention_version": 3}
+    await adapter.send("attention-chat", "attention", metadata={"kanban_attention_identity": identity})
+    assert transport.sent["metadata"]["kanban_attention_identity"] == identity

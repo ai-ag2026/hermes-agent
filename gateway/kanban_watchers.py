@@ -12,17 +12,171 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Mapping, Optional
 
 from agent.i18n import t
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+@dataclass(frozen=True)
+class AttentionStormMetrics:
+    active_human_required: int = 0
+    new_attention_5m: int = 0
+    new_attention_15m: int = 0
+    blocked_run_ratio_15m: float | None = None
+    recurrent_blocks: int = 0
+    current_delivery_identities_materialized: int = 0
+    duplicate_suppressed_last_tick: int = 0
+
+
+@dataclass(frozen=True)
+class BackpressureShadowConfig:
+    shadow_enabled: bool = False
+    active_human_required_threshold: int = 20
+    new_attention_5m_threshold: int = 8
+    new_attention_15m_threshold: int = 20
+    blocked_run_ratio_15m_threshold: float = 0.60
+    recurrent_blocks_threshold: int = 5
+    duplicate_suppressed_threshold: int = 50
+    warning_cooldown_seconds: int = 300
+
+
+@dataclass(frozen=True)
+class BackpressureShadowDecision:
+    action: Literal["none", "pause_new_fanout"]
+    reasons: tuple[str, ...]
+    metrics: AttentionStormMetrics
+
+    @property
+    def fingerprint(self) -> str:
+        return f"{self.action}:{','.join(self.reasons)}"
+
+
+def _normalize_backpressure_shadow_config(raw: Mapping[str, Any] | None) -> BackpressureShadowConfig:
+    """Strict, fail-safe normalization for the report-only shadow namespace."""
+    raw = raw if isinstance(raw, Mapping) else {}
+    def integer(name: str, default: int, maximum: int = 100000) -> int:
+        value = raw.get(name, default)
+        if isinstance(value, bool):
+            return default
+        try:
+            value = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return min(max(value, 1), maximum)
+    ratio = raw.get("blocked_run_ratio_15m_threshold", 0.60)
+    if isinstance(ratio, bool):
+        ratio = 0.60
+    try:
+        ratio = float(ratio)
+    except (TypeError, ValueError, OverflowError):
+        ratio = 0.60
+    if not math.isfinite(ratio):
+        ratio = 0.60
+    five = integer("new_attention_5m_threshold", 8)
+    return BackpressureShadowConfig(
+        shadow_enabled=bool(raw.get("shadow_enabled")) if isinstance(raw.get("shadow_enabled"), bool) else False,
+        active_human_required_threshold=integer("active_human_required_threshold", 20),
+        new_attention_5m_threshold=five,
+        new_attention_15m_threshold=max(integer("new_attention_15m_threshold", 20), five),
+        blocked_run_ratio_15m_threshold=min(max(ratio, 0.0), 1.0),
+        recurrent_blocks_threshold=integer("recurrent_blocks_threshold", 5),
+        duplicate_suppressed_threshold=integer("duplicate_suppressed_threshold", 50),
+        warning_cooldown_seconds=integer("warning_cooldown_seconds", 300, 86400),
+    )
+
+
+def _resolve_backpressure_shadow_config(load_config: Callable[[], Any]) -> BackpressureShadowConfig:
+    try:
+        cfg = load_config()
+        kanban = cfg.get("kanban", {}) if isinstance(cfg, Mapping) else {}
+        shadow = kanban.get("backpressure_shadow", {}) if isinstance(kanban, Mapping) else {}
+    except Exception:
+        shadow = {}
+    return _normalize_backpressure_shadow_config(shadow)
+
+
+def evaluate_backpressure_shadow(metrics: AttentionStormMetrics, config: Mapping[str, Any] | None = None) -> BackpressureShadowDecision:
+    """Return report-only advice; callers must not use it to control dispatch."""
+    cfg = _normalize_backpressure_shadow_config(config)
+    if not cfg.shadow_enabled:
+        return BackpressureShadowDecision("none", (), metrics)
+    reasons: list[str] = []
+    if metrics.active_human_required >= cfg.active_human_required_threshold:
+        reasons.append("active_human_required")
+    if metrics.new_attention_5m >= cfg.new_attention_5m_threshold:
+        reasons.append("new_attention_5m")
+    if metrics.new_attention_15m >= cfg.new_attention_15m_threshold:
+        reasons.append("new_attention_15m")
+    if metrics.blocked_run_ratio_15m is not None and metrics.blocked_run_ratio_15m >= cfg.blocked_run_ratio_15m_threshold:
+        reasons.append("blocked_run_ratio_15m")
+    if metrics.recurrent_blocks >= cfg.recurrent_blocks_threshold:
+        reasons.append("recurrent_blocks")
+    if metrics.duplicate_suppressed_last_tick >= cfg.duplicate_suppressed_threshold:
+        reasons.append("duplicate_suppressed_last_tick")
+    return BackpressureShadowDecision("pause_new_fanout" if reasons else "none", tuple(reasons), metrics)
+
+
+def _collect_attention_storm_metrics_readonly(db_path: str | Path, now: int) -> AttentionStormMetrics | None:
+    """Collect authoritative aggregates via a read-only SQLite connection only."""
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{Path(db_path).expanduser()}?mode=ro", uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=1000")
+        row = conn.execute("""
+            WITH candidates AS (
+              SELECT x.id,x.task_id,x.type,x.created_at,x.version,t.block_recurrences,t.block_cause_fingerprint,
+                     a.state action_state,a.expires_at,a.version action_version
+              FROM task_attentions x JOIN tasks t ON t.id=x.task_id LEFT JOIN task_pending_actions a ON a.id=x.action_id
+              WHERE t.status NOT IN ('done','archived') AND ((x.type='exact_action' AND a.state IN ('pending','approved') AND a.expires_at>?) OR (x.type IN ('capability','transient') AND x.action_id IS NOT NULL AND a.state='approved' AND a.expires_at>?) OR (x.type IN ('decision','protocol','review','loop_triage','capability','transient') AND x.action_id IS NULL))
+            ), current AS (
+              SELECT * FROM (SELECT candidates.*,ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY id DESC) rn FROM candidates) WHERE rn=1
+            ), human AS (
+              SELECT *,CASE WHEN type='exact_action' THEN action_version ELSE version END delivery_version FROM current WHERE (type='exact_action' AND action_state='pending') OR type IN ('decision','protocol','review','capability')
+            )
+            SELECT COUNT(*) active,COALESCE(SUM(created_at>=?-300),0) new5,COALESCE(SUM(created_at>=?-900),0) new15,COALESCE(SUM(block_recurrences>=2 AND block_cause_fingerprint IS NOT NULL),0) recurrent,(SELECT COUNT(*) FROM human h JOIN kanban_attention_deliveries d ON d.task_id=h.task_id AND d.attention_id=h.id AND d.attention_version=h.delivery_version WHERE d.state IN ('pending','sending','delivered')) materialized FROM human
+        """, (now, now, now, now)).fetchone()
+        runs = conn.execute("SELECT COUNT(*) ended,COALESCE(SUM(outcome='blocked'),0) blocked FROM task_runs WHERE ended_at IS NOT NULL AND ended_at>=?", (now - 900,)).fetchone()
+        ended = int(runs["ended"])
+        return AttentionStormMetrics(int(row["active"]), int(row["new5"]), int(row["new15"]), int(runs["blocked"]) / ended if ended else None, int(row["recurrent"]), int(row["materialized"]))
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _should_emit_shadow_warning(last_warning: dict[str, int], decision: BackpressureShadowDecision, now: int, cooldown: int) -> bool:
+    if decision.action != "pause_new_fanout":
+        return False
+    previous = last_warning.get(decision.fingerprint)
+    if previous is not None and now - previous < cooldown:
+        return False
+    last_warning[decision.fingerprint] = now
+    return True
+
+
+def _log_shadow_warning(decision: BackpressureShadowDecision) -> None:
+    """A deliberately aggregate-only warning boundary for shadow diagnostics."""
+    m = decision.metrics
+    logger.warning(
+        "kanban backpressure shadow action=%s reasons=%s active=%d new5=%d new15=%d ratio=%s recurrent=%d materialized=%d duplicate_suppressed_last_tick=%d",
+        decision.action, ",".join(decision.reasons), m.active_human_required,
+        m.new_attention_5m, m.new_attention_15m, m.blocked_run_ratio_15m,
+        m.recurrent_blocks, m.current_delivery_identities_materialized,
+        m.duplicate_suppressed_last_tick,
+    )
 
 
 def _resolve_auto_decompose_settings(
@@ -281,16 +435,25 @@ class GatewayKanbanWatchersMixin:
         await asyncio.sleep(5)
 
         while self._running:
+            # The dispatcher reads these per-board values only as current-tick,
+            # process-local Delivery outcomes; they are never reconstructed from rows.
+            self._kanban_shadow_duplicate_suppressed_last_tick = {}
             try:
                 def _collect():
+                    duplicate_suppressed_by_board: dict[str, int] = {}
                     deliveries: list[dict] = []
+                    attention_deliveries: list[dict] = []
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
                     }
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
-                        return deliveries
+                        return {
+                            "events": deliveries,
+                            "attentions": attention_deliveries,
+                            "duplicate_suppressed_by_board": duplicate_suppressed_by_board,
+                        }
 
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
@@ -304,6 +467,11 @@ class GatewayKanbanWatchersMixin:
                     seen_db_paths: set[str] = set()
                     for board_meta in boards:
                         slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                        try:
+                            board_slug = _kb._normalize_board_slug(slug) or _kb.DEFAULT_BOARD
+                        except (TypeError, ValueError):
+                            continue
+                        duplicate_suppressed_by_board[board_slug] = 0
                         db_path = board_meta.get("db_path")
                         try:
                             resolved_db_path = str(Path(db_path).expanduser().resolve()) if db_path else str(_kb.kanban_db_path(slug).resolve())
@@ -357,6 +525,17 @@ class GatewayKanbanWatchersMixin:
                                 )
 
                             subs = _kb.list_notify_subs(conn)
+                            # Current attention is Core-owned state, never inferred
+                            # from event history. Synchronize all subscribed tasks once
+                            # per board/tick, then lease per channel below.
+                            if subs:
+                                sync_outcome = _kb.sync_attention_deliveries(
+                                    conn,
+                                    task_ids=[sub["task_id"] for sub in subs],
+                                )
+                                duplicate_suppressed_by_board[board_slug] += int(
+                                    sync_outcome.get("suppressed_duplicate", 0) or 0
+                                )
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
@@ -376,6 +555,32 @@ class GatewayKanbanWatchersMixin:
                                         sub.get("task_id"), platform or "<missing>",
                                     )
                                     continue
+                                current_attention = _kb.get_current_attention(conn, sub["task_id"])
+                                if current_attention is not None and current_attention.requires_human_action:
+                                    attention_claim = _kb.claim_attention_delivery(
+                                        conn,
+                                        task_id=sub["task_id"],
+                                        attention_id=current_attention.id,
+                                        attention_version=current_attention.version,
+                                        platform=sub["platform"],
+                                        chat_id=sub["chat_id"],
+                                        thread_id=sub.get("thread_id") or "",
+                                    )
+                                    if attention_claim is not None:
+                                        attention_deliveries.append({
+                                            "sub": sub,
+                                            "delivery": attention_claim,
+                                            "attention": current_attention,
+                                            "task": _kb.get_task(conn, sub["task_id"]),
+                                            "board": slug,
+                                        })
+                                suppress_blocked = _kb.has_current_attention_delivery(
+                                    conn,
+                                    task_id=sub["task_id"],
+                                    platform=sub["platform"],
+                                    chat_id=sub["chat_id"],
+                                    thread_id=sub.get("thread_id") or "",
+                                )
                                 old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                     conn,
                                     task_id=sub["task_id"],
@@ -398,12 +603,69 @@ class GatewayKanbanWatchersMixin:
                                     "events": events,
                                     "task": task,
                                     "board": slug,
+                                    "suppress_blocked": suppress_blocked,
                                 })
                         finally:
                             conn.close()
-                    return deliveries
+                    return {
+                        "events": deliveries,
+                        "attentions": attention_deliveries,
+                        "duplicate_suppressed_by_board": duplicate_suppressed_by_board,
+                    }
 
-                deliveries = await asyncio.to_thread(_collect)
+                collected = await asyncio.to_thread(_collect)
+                outcomes = collected.get("duplicate_suppressed_by_board", {})
+                self._kanban_shadow_duplicate_suppressed_last_tick = (
+                    dict(outcomes) if isinstance(outcomes, Mapping) else {}
+                )
+                deliveries = collected["events"]
+                attention_deliveries = collected["attentions"]
+                for attention_item in attention_deliveries:
+                    sub = attention_item["sub"]
+                    delivery = attention_item["delivery"]
+                    attention = attention_item["attention"]
+                    board_slug = attention_item["board"]
+                    platform_str = (sub["platform"] or "").lower()
+                    try:
+                        plat = _Platform(platform_str)
+                    except ValueError:
+                        await asyncio.to_thread(self._kanban_finish_attention_delivery, delivery, False, board_slug)
+                        continue
+                    adapter = self._authorization_adapter(plat, sub.get("notifier_profile") or None)
+                    if adapter is None:
+                        await asyncio.to_thread(self._kanban_finish_attention_delivery, delivery, False, board_slug)
+                        continue
+                    # Revalidate immediately before the external side effect. A
+                    # resolved/replaced projection is cancelled, never sent.
+                    if not await asyncio.to_thread(self._kanban_attention_is_current, delivery, board_slug):
+                        continue
+                    task = attention_item["task"]
+                    title = (task.title if task else sub["task_id"])[:120]
+                    text = (
+                        f"Attention for Kanban {sub['task_id']}: {title}\n"
+                        f"{attention.type} ({attention.state}) — {attention.summary}"
+                    )
+                    metadata: dict[str, Any] = {
+                        "kanban_attention_identity": {
+                            "board": str(board_slug).strip().lower(),
+                            "attention_id": int(attention.id),
+                            "attention_version": int(attention.version),
+                        },
+                    }
+                    if sub.get("thread_id"):
+                        metadata["thread_id"] = sub["thread_id"]
+                    try:
+                        await adapter.send(sub["chat_id"], text, metadata=metadata)
+                    except Exception:
+                        # Exception prose can contain platform/user secrets. Keep
+                        # durable state and logs to the closed safe code only.
+                        await asyncio.to_thread(self._kanban_finish_attention_delivery, delivery, False, board_slug)
+                        logger.warning(
+                            "kanban attention delivery retry identity=%s/%s/%s",
+                            board_slug, attention.id, attention.version,
+                        )
+                    else:
+                        await asyncio.to_thread(self._kanban_finish_attention_delivery, delivery, True, board_slug)
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
@@ -446,6 +708,11 @@ class GatewayKanbanWatchersMixin:
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        # The durable live attention is the human request. A
+                        # historical blocked event still advances the cursor but
+                        # must not create a second prompt or wake.
+                        if kind == "blocked" and d.get("suppress_blocked"):
+                            continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -598,7 +865,11 @@ class GatewayKanbanWatchersMixin:
                         # above for the failure mode this prevents.
                         task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                        _wake_kinds = {
+                            ev.kind for ev in d["events"]
+                            if ev.kind in _WAKE_KINDS
+                            and not (ev.kind == "blocked" and d.get("suppress_blocked"))
+                        }
                         if _wake_kinds:
                             try:
                                 _session_key = getattr(task, "session_id", None) or ""
@@ -680,6 +951,33 @@ class GatewayKanbanWatchersMixin:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    def _kanban_attention_is_current(self, delivery: Mapping[str, Any], board: Optional[str]) -> bool:
+        """Fail closed before an external attention send; no event history."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.sync_attention_deliveries(conn, task_ids=[str(delivery["task_id"])])
+            current = _kb.get_current_attention(conn, str(delivery["task_id"]))
+            return bool(
+                current is not None
+                and current.id == int(delivery["attention_id"])
+                and current.version == int(delivery["attention_version"])
+                and current.requires_human_action
+            )
+        finally:
+            conn.close()
+
+    def _kanban_finish_attention_delivery(
+        self, delivery: Mapping[str, Any], success: bool, board: Optional[str],
+    ) -> bool:
+        """Persist the outcome using the exact opaque lease generation."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.finish_attention_delivery(conn, delivery, success=success)
+        finally:
+            conn.close()
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
@@ -1078,6 +1376,7 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        shadow_last_warning: dict[str, int] = {}
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1371,6 +1670,45 @@ class GatewayKanbanWatchersMixin:
                     )
             except Exception:
                 logger.exception("kanban dispatcher: zombie reaper failed")
+
+            # Shadow is report-only: per-board read-only diagnostics run before
+            # the existing Reap → Auto-Decompose → Dispatch execution block.
+            # Its decision is intentionally not consulted below.
+            try:
+                shadow_cfg = _resolve_backpressure_shadow_config(_load_config)
+                if shadow_cfg.shadow_enabled:
+                    boards = _kb.list_boards(include_archived=False)
+                    duplicate_outcomes = getattr(
+                        self, "_kanban_shadow_duplicate_suppressed_last_tick", {}
+                    )
+                    if not isinstance(duplicate_outcomes, Mapping):
+                        duplicate_outcomes = {}
+                    now = int(time.time())
+                    for board_meta in boards:
+                        slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                        try:
+                            board_slug = _kb._normalize_board_slug(slug) or _kb.DEFAULT_BOARD
+                        except (TypeError, ValueError):
+                            continue
+                        path = board_meta.get("db_path") or _kb.kanban_db_path(slug)
+                        metrics = await asyncio.to_thread(_collect_attention_storm_metrics_readonly, path, now)
+                        if metrics is None:
+                            continue
+                        metrics = AttentionStormMetrics(
+                            metrics.active_human_required, metrics.new_attention_5m,
+                            metrics.new_attention_15m, metrics.blocked_run_ratio_15m,
+                            metrics.recurrent_blocks, metrics.current_delivery_identities_materialized,
+                            int(duplicate_outcomes.get(board_slug, 0) or 0),
+                        )
+                        decision = evaluate_backpressure_shadow(metrics, shadow_cfg.__dict__)
+                        if _should_emit_shadow_warning(
+                            shadow_last_warning, decision, now, shadow_cfg.warning_cooldown_seconds,
+                        ):
+                            _log_shadow_warning(decision)
+            except Exception:
+                # Shadow diagnostics never impact the execution loop and never
+                # surface board/path/error text through the safe warning channel.
+                pass
 
             try:
                 # Re-read the auto-decompose toggle live each tick so a user

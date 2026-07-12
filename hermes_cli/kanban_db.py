@@ -93,7 +93,7 @@ import urllib.request
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Literal, Optional
+from typing import Any, Iterable, Literal, Mapping, Optional, Sequence
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -1276,6 +1276,16 @@ class Attention:
 
 
 @dataclass(frozen=True)
+class AttentionDeliveryFinishResult:
+    """Safe delivery outcome; contains no task, channel, or exception prose."""
+
+    status: Literal["delivered", "retry", "suppressed_duplicate"]
+
+    def __bool__(self) -> bool:
+        return self.status != "suppressed_duplicate"
+
+
+@dataclass(frozen=True)
 class ResolvePendingActionResult:
     """Safe resolve outcome for HTTP 404/409/410 mapping without raw bindings."""
 
@@ -1628,6 +1638,32 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Durable, per-channel delivery projection for the *current* attention.
+-- It deliberately does not use task_events: those are history, while an
+-- attention can be resolved or superseded before a notifier gets a turn.
+CREATE TABLE IF NOT EXISTS kanban_attention_deliveries (
+    task_id           TEXT NOT NULL,
+    attention_id      INTEGER NOT NULL,
+    attention_version INTEGER NOT NULL,
+    platform          TEXT NOT NULL,
+    chat_id           TEXT NOT NULL,
+    thread_id         TEXT NOT NULL DEFAULT '',
+    notifier_profile  TEXT,
+    state             TEXT NOT NULL DEFAULT 'pending'
+                      CHECK(state IN ('pending','sending','delivered','cancelled')),
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    -- Incremented on every claim. Finish operations must present this exact
+    -- opaque generation so an expired claimant cannot finish a reclaimed lease.
+    lease_version     INTEGER NOT NULL DEFAULT 0,
+    lease_until       INTEGER,
+    delivered_at      INTEGER,
+    last_error        TEXT,
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY(task_id, attention_id, attention_version, platform, chat_id, thread_id)
+);
+CREATE INDEX IF NOT EXISTS idx_attention_deliveries_claim
+    ON kanban_attention_deliveries(state, lease_until);
 """
 
 
@@ -2441,6 +2477,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
+    delivery_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(kanban_attention_deliveries)")
+    }
+    if delivery_cols and "lease_version" not in delivery_cols:
+        _add_column_if_missing(
+            conn,
+            "kanban_attention_deliveries",
+            "lease_version",
+            "lease_version INTEGER NOT NULL DEFAULT 0",
+        )
+
     action_cols = {
         row["name"] for row in conn.execute("PRAGMA table_info(task_pending_actions)")
     }
@@ -8380,6 +8427,125 @@ def get_current_attentions(
 def get_current_attention(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None) -> Optional[Attention]:
     """Return the one live operator projection, never reconstructed from events."""
     return get_current_attentions(conn, [task_id], now=now).get(task_id)
+
+
+def sync_attention_deliveries(
+    conn: sqlite3.Connection, *, task_ids: Sequence[str], now: Optional[int] = None,
+) -> dict[str, int]:
+    """Project current attention x notify subscription into durable deliveries.
+
+    Rows which no longer match the current projection are terminally cancelled.
+    This is intentionally idempotent and is safe to call from every watcher tick.
+    """
+    now = int(time.time()) if now is None else int(now)
+    ids = list(dict.fromkeys(str(x) for x in task_ids))
+    current = get_current_attentions(conn, ids, now=now)
+    created = cancelled = suppressed = 0
+    with write_txn(conn):
+        for task_id in ids:
+            attention = current.get(task_id)
+            if attention is None:
+                cur = conn.execute(
+                    "UPDATE kanban_attention_deliveries SET state='cancelled', lease_until=NULL, updated_at=? "
+                    "WHERE task_id=? AND state IN ('pending','sending')", (now, task_id),
+                )
+                cancelled += cur.rowcount
+                continue
+            cur = conn.execute(
+                "UPDATE kanban_attention_deliveries SET state='cancelled', lease_until=NULL, updated_at=? "
+                "WHERE task_id=? AND state IN ('pending','sending') AND "
+                "(attention_id<>? OR attention_version<>?)",
+                (now, task_id, attention.id, attention.version),
+            )
+            cancelled += cur.rowcount
+            subs = conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id=?", (task_id,)).fetchall()
+            for sub in subs:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO kanban_attention_deliveries "
+                    "(task_id,attention_id,attention_version,platform,chat_id,thread_id,notifier_profile,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (task_id, attention.id, attention.version, sub['platform'], sub['chat_id'],
+                     sub['thread_id'] or '', sub['notifier_profile'], now),
+                )
+                if cur.rowcount:
+                    created += 1
+                else:
+                    suppressed += 1
+    return {'created': created, 'cancelled_resolved': cancelled, 'suppressed_duplicate': suppressed}
+
+
+def has_current_attention_delivery(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str, thread_id: str = '',
+    now: Optional[int] = None,
+) -> bool:
+    """Whether this channel has a durable row for exactly the live human attention."""
+    current = get_current_attention(conn, task_id, now=now)
+    if current is None or not current.requires_human_action:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM kanban_attention_deliveries WHERE task_id=? AND attention_id=? "
+        "AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? "
+        "AND state IN ('pending','sending','delivered')",
+        (task_id, current.id, current.version, platform, chat_id, thread_id or ''),
+    ).fetchone()
+    return row is not None
+
+
+def claim_attention_delivery(
+    conn: sqlite3.Connection, *, task_id: str, attention_id: int, attention_version: int,
+    platform: str, chat_id: str, thread_id: str = '', now: Optional[int] = None,
+    lease_seconds: int = 60,
+) -> Optional[dict[str, Any]]:
+    """Atomically lease one current attention/channel delivery, or return None."""
+    now = int(time.time()) if now is None else int(now)
+    key = (task_id, int(attention_id), int(attention_version), platform, chat_id, thread_id or '')
+    with write_txn(conn):
+        live = get_current_attention(conn, task_id, now=now)
+        if live is None or live.id != int(attention_id) or live.version != int(attention_version):
+            conn.execute("UPDATE kanban_attention_deliveries SET state='cancelled', lease_until=NULL, updated_at=? "
+                         "WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? "
+                         "AND state IN ('pending','sending')", (now, *key))
+            return None
+        row = conn.execute(
+            "SELECT * FROM kanban_attention_deliveries WHERE task_id=? AND attention_id=? AND attention_version=? "
+            "AND platform=? AND chat_id=? AND thread_id=?", key,
+        ).fetchone()
+        if row is None or row['state'] in ('delivered', 'cancelled'):
+            return None
+        if row['state'] == 'sending' and (row['lease_until'] or 0) > now:
+            return None
+        cur = conn.execute(
+            "UPDATE kanban_attention_deliveries SET state='sending', attempts=attempts+1, lease_version=lease_version+1, lease_until=?, updated_at=? "
+            "WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? "
+            "AND (state='pending' OR (state='sending' AND COALESCE(lease_until,0)<=?))",
+            (now + int(lease_seconds), now, *key, now),
+        )
+        if cur.rowcount != 1:
+            return None
+        claimed = conn.execute("SELECT * FROM kanban_attention_deliveries WHERE task_id=? AND attention_id=? "
+                               "AND attention_version=? AND platform=? AND chat_id=? AND thread_id=?", key).fetchone()
+        return dict(claimed) if claimed else None
+
+
+def finish_attention_delivery(conn: sqlite3.Connection, delivery: Mapping[str, Any], *, success: bool,
+                              now: Optional[int] = None) -> bool:
+    """CAS a lease to delivered or retry-pending; never persist exception prose."""
+    now = int(time.time()) if now is None else int(now)
+    key = tuple(delivery[x] for x in ('task_id','attention_id','attention_version','platform','chat_id','thread_id'))
+    try:
+        lease_version = int(delivery['lease_version'])
+    except (KeyError, TypeError, ValueError):
+        return False
+    with write_txn(conn):
+        if success:
+            cur = conn.execute("UPDATE kanban_attention_deliveries SET state='delivered', delivered_at=?, lease_until=NULL, last_error=NULL, updated_at=? "
+                               "WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? AND state='sending' AND lease_version=?",
+                               (now, now, *key, lease_version))
+        else:
+            cur = conn.execute("UPDATE kanban_attention_deliveries SET state='pending', lease_until=NULL, last_error='send_failed', updated_at=? "
+                               "WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? AND state='sending' AND lease_version=?",
+                               (now, *key, lease_version))
+        return cur.rowcount == 1
 
 
 def get_action_by_attention_id(
