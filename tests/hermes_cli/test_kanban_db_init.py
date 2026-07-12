@@ -4,6 +4,8 @@ import sqlite3
 import threading
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 
 
@@ -175,3 +177,88 @@ def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
         )
         assert isinstance(cursor, int)
         assert isinstance(events, list)
+
+
+def _make_pre_typed_attention_db(path: Path, *, duplicate_projection: bool = False, unbound_action: bool = False) -> None:
+    """Create the immediately preceding attention schema via sqlite DDL."""
+    conn = sqlite3.connect(path)
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.executescript("""
+        DROP TABLE task_attentions;
+        DROP TABLE task_pending_actions;
+        CREATE TABLE task_pending_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, run_id INTEGER,
+            command_hash TEXT NOT NULL, fingerprint TEXT NOT NULL, mutation_kind TEXT NOT NULL,
+            profile TEXT NOT NULL, workspace TEXT NOT NULL, summary TEXT NOT NULL,
+            state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL, approved_at INTEGER, approved_by TEXT,
+            consumed_at INTEGER, version INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE task_attentions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+            action_id INTEGER NOT NULL UNIQUE, type TEXT NOT NULL,
+            cause_fingerprint TEXT NOT NULL, summary TEXT NOT NULL, created_at INTEGER NOT NULL,
+            UNIQUE(task_id, cause_fingerprint)
+        );
+    """)
+    conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('legacy-attention', 'legacy', 'blocked', 1)")
+    conn.execute("""INSERT INTO task_pending_actions
+        (id, task_id, command_hash, fingerprint, mutation_kind, profile, workspace, summary, state, created_at, updated_at, expires_at)
+        VALUES (41, 'legacy-attention', 'h', 'f', 'test', 'default', '/tmp', 'operator', 'pending', 1, 1, 2000000000)""")
+    if not unbound_action:
+        conn.execute("INSERT INTO task_attentions VALUES (777, 'legacy-attention', 41, 'exact_action', 'legacy-exact', 'operator', 1)")
+    if duplicate_projection:
+        conn.executescript("DROP TABLE task_attentions; CREATE TABLE task_attentions (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, action_id INTEGER NOT NULL, type TEXT NOT NULL, cause_fingerprint TEXT NOT NULL, summary TEXT NOT NULL, created_at INTEGER NOT NULL);")
+        conn.executemany("INSERT INTO task_attentions VALUES (?, 'legacy-attention', 41, 'exact_action', ?, 'operator', 1)", [(777, 'legacy-exact'), (778, 'legacy-duplicate')])
+    conn.commit()
+    conn.close()
+
+
+def _attention_snapshot(path: Path) -> tuple[list[tuple], list[tuple], list[tuple]]:
+    conn = sqlite3.connect(path)
+    try:
+        return (
+            conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='task_attentions'").fetchall(),
+            conn.execute("SELECT * FROM task_attentions ORDER BY id").fetchall(),
+            conn.execute("SELECT name FROM sqlite_master WHERE name='task_attentions_rebuild'").fetchall(),
+        )
+    finally:
+        conn.close()
+
+
+def test_pre_typed_attention_migration_preserves_ids_backfills_and_reinits(tmp_path, monkeypatch):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_pre_typed_attention_db(db_path)
+    with kb.connect(db_path) as conn:
+        projection = conn.execute("SELECT id, action_id, version, origin_run_id FROM task_attentions").fetchone()
+        action = conn.execute("SELECT attention_id FROM task_pending_actions WHERE id=41").fetchone()
+        columns = {row["name"]: row for row in conn.execute("PRAGMA table_info(task_attentions)")}
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(task_attentions)")}
+        assert tuple(projection) == (777, 41, 1, None)
+        assert action["attention_id"] == 777
+        assert columns["action_id"]["notnull"] == 0
+        assert {"uq_task_attentions_action_live", "uq_task_attentions_task_cause", "idx_task_attentions_task_created"} <= indexes
+        assert "uq_pending_actions_attention_id" in {row["name"] for row in conn.execute("PRAGMA index_list(task_pending_actions)")}
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    kb.init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT id FROM task_attentions").fetchone()[0] == 777
+        assert conn.execute("SELECT attention_id FROM task_pending_actions WHERE id=41").fetchone()[0] == 777
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+
+
+def test_pre_typed_attention_migration_rejects_ambiguous_drift_without_partial_rebuild(tmp_path, monkeypatch):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_pre_typed_attention_db(db_path, duplicate_projection=True)
+    before = _attention_snapshot(db_path)
+    with pytest.raises(RuntimeError, match="duplicate non-null action_id|ambiguous exact attention"):
+        kb.connect(db_path)
+    assert _attention_snapshot(db_path) == before
+
+
+def test_pre_typed_attention_legacy_action_without_unique_projection_stays_unbound(tmp_path, monkeypatch):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_pre_typed_attention_db(db_path, unbound_action=True)
+    with kb.connect(db_path) as conn:
+        assert conn.execute("SELECT attention_id FROM task_pending_actions WHERE id=41").fetchone()[0] is None
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions").fetchone()[0] == 0

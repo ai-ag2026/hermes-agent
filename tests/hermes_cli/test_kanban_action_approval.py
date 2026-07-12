@@ -428,7 +428,7 @@ def test_approved_retry_is_stable_and_does_not_emit_second_pending_event(
         assert sum(e.kind == "terminal_approval_pending" for e in kb.list_events(conn, task_id=task_id)) == 1
 
 
-def test_terminal_same_identity_rebinds_stable_attention(
+def test_terminal_same_identity_creates_fresh_attention_after_projection_cleanup(
     isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     task_id = _create_running_task(monkeypatch)
@@ -441,13 +441,14 @@ def test_terminal_same_identity_rebinds_stable_attention(
         old_attention = kb.get_current_attention(conn, task_id)
         assert old_attention is not None
         assert kb.resolve_pending_action(conn, task_id, first.id, expected_version=first.version, now=1_900_000_000)
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 0
         second = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id, command=command,
                                           summary="publish", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_100)
         current = kb.get_current_attention(conn, task_id)
         historic = kb.get_pending_action_by_id(conn, task_id, first.id)
         assert current is not None and historic is not None
         assert historic.state == "resolved"
-        assert (current.id, current.action_id) == (old_attention.id, second.id)
+        assert (current.id != old_attention.id, current.action_id) == (True, second.id)
 
 
 def test_parallel_consumers_only_one_wins(
@@ -480,7 +481,7 @@ def test_parallel_consumers_only_one_wins(
         assert sum(e.kind == "terminal_approval_consumed" for e in kb.list_events(conn, task_id=task_id)) == 1
 
 
-def test_expired_pending_rerequest_rebinds_stable_attention(
+def test_expired_pending_rerequest_creates_fresh_attention_after_projection_cleanup(
     isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = {"value": 50}
@@ -499,7 +500,7 @@ def test_expired_pending_rerequest_rebinds_stable_attention(
         old = kb.get_pending_action_by_id(conn, task_id, first.id)
         current = kb.get_current_attention(conn, task_id, now=101)
         assert old is not None and current is not None
-        assert (old.state, second.id != first.id, current.id, current.action_id) == ("expired", True, attention.id, second.id)
+        assert (old.state, second.id != first.id, current.id != attention.id, current.action_id) == ("expired", True, True, second.id)
 
 
 def test_supersession_only_cancels_current_origin_action(
@@ -1147,7 +1148,12 @@ def test_same_persistent_cause_fingerprint_increments_recurrence_chain(
         assert kb.block_task(conn, task_id, kind="needs_input", reason="need credential choice",
                              attention_type="decision", reason_code="credential_choice",
                              expected_run_id=task.current_run_id)
-        assert kb.unblock_task(conn, task_id, reason="credential choice supplied")
+        attention = kb.get_current_attention(conn, task_id)
+        assert attention is not None
+        assert kb.transition_task_status_with_attention(
+            conn, task_id=task_id, status="ready", expected_attention_id=attention.id,
+            expected_attention_version=attention.version,
+        ).status == "transitioned"
         assert kb.claim_task(conn, task_id, claimer="second-worker") is not None
         assert kb.block_task(conn, task_id, kind="needs_input", reason="need credential choice",
                              attention_type="decision", reason_code="credential_choice")
@@ -1165,7 +1171,12 @@ def test_different_persistent_cause_fingerprint_starts_new_recurrence_chain(
         assert kb.block_task(conn, task_id, kind="needs_input", reason="need credential choice",
                              attention_type="decision", reason_code="credential_choice",
                              expected_run_id=task.current_run_id)
-        assert kb.unblock_task(conn, task_id, reason="credential choice supplied")
+        attention = kb.get_current_attention(conn, task_id)
+        assert attention is not None
+        assert kb.transition_task_status_with_attention(
+            conn, task_id=task_id, status="ready", expected_attention_id=attention.id,
+            expected_attention_version=attention.version,
+        ).status == "transitioned"
         assert kb.claim_task(conn, task_id, claimer="second-worker") is not None
         assert kb.block_task(conn, task_id, kind="needs_input", reason="need publication approval",
                              attention_type="decision", reason_code="publication_approval")
@@ -1492,7 +1503,12 @@ def test_typed_cause_scope_rejects_unknown_values_and_different_threshold_starts
         assert kb.block_task(conn, task_id, kind="needs_input", reason="safe", attention_type="decision",
             reason_code="credential_choice", cause_scope={"required_decision": "credential"}, expected_run_id=task.current_run_id)
         conn.execute("UPDATE tasks SET block_recurrences=? WHERE id=?", (kb.BLOCK_RECURRENCE_LIMIT - 1, task_id))
-        assert kb.unblock_task(conn, task_id)
+        attention = kb.get_current_attention(conn, task_id)
+        assert attention is not None
+        assert kb.transition_task_status_with_attention(
+            conn, task_id=task_id, status="ready", expected_attention_id=attention.id,
+            expected_attention_version=attention.version,
+        ).status == "transitioned"
         assert kb.claim_task(conn, task_id, claimer="again") is not None
         assert kb.block_task(conn, task_id, kind="needs_input", reason="safe", attention_type="decision",
             reason_code="publication_approval", cause_scope={"required_decision": "publication"})
@@ -2184,26 +2200,12 @@ def test_public_execute_code_variants_never_reuse_approved_exact_grant_and_later
             action_a_before_resolution.state, action_a_before_resolution.consumed_at, action_a_before_resolution.version,
         )
         assert action_b_after_resolution.state == "resolved" and action_b_after_resolution.consumed_at is None
-        assert kb.unblock_task(conn, task_id)
-        resumed_after_variant = kb.claim_task(conn, task_id, claimer="resumed-a-after-variant")
-        assert resumed_after_variant is not None and resumed_after_variant.current_run_id is not None
-        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resumed_after_variant.current_run_id))
-    with pytest.raises(AssertionError, match="local spawn"):
-        code_execution_tool.execute_code(code_a)
-    with kb.connect() as conn:
-        consumed = kb.get_pending_action_by_id(conn, task_id, action_a_id)
-        action_b_final = kb.get_pending_action_by_id(conn, task_id, action_b_id)
-        assert consumed is not None and action_b_final is not None
-        assert consumed.state == "consumed" and consumed.consumed_at is not None
-        assert consumed.version == action_a_before_resolution.version + 1
-        assert (action_b_final.state, action_b_final.consumed_at, action_b_final.version) == (
-            "resolved", None, action_b_after_resolution.version,
-        )
-        consume_events = [e for e in kb.list_events(conn, task_id=task_id) if e.kind == "terminal_approval_consumed"]
-        assert len(consume_events) == 1
-        assert (consume_events[0].payload["action_id"], consume_events[0].run_id) == (
-            action_a_id, resumed_after_variant.current_run_id,
-        )
+        attention_a = kb.get_current_attention(conn, task_id)
+        assert attention_a is not None and (attention_a.action_id, attention_a.state) == (action_a_id, "approved")
+        # A second, byte-different request is not a technical failure of A.
+        # It must not manufacture retry authority for A; only the dedicated
+        # technical lifecycle may resume an approved exact action.
+        assert conn.execute("SELECT retry_origin_run_id FROM task_pending_actions WHERE id=?", (action_a_id,)).fetchone()[0] is None
 
 
 def test_resolve_pending_action_reports_not_found_conflict_and_gone(
@@ -2325,12 +2327,97 @@ def test_technical_projection_is_deleted_on_consume_done_and_archive(
     command = "terminal-cleanup-marker"
     task_id = _create_running_task(monkeypatch)
     with kb.connect() as conn:
-        action, resumed_run = _park_and_approve(conn, task_id, command, isolated_board)
-        conn.execute("DELETE FROM task_attentions WHERE task_id=?", (task_id,))
-        conn.execute("INSERT INTO task_attentions (task_id, action_id, type, cause_fingerprint, summary, created_at) VALUES (?, ?, 'transient', 'consume-cleanup', 'technical', 1)", (task_id, action.id))
-        assert kb.consume_approved_action(conn, task_id=task_id, run_id=resumed_run, command=command,
-            profile="backend-eng", workspace=str(isolated_board), now=1_900_000_001)
-        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 0
+        action, first_resumed_run = _park_and_approve(conn, task_id, command, isolated_board)
+        assert first_resumed_run is not None
+        approved = kb.get_pending_action_by_id(conn, task_id, action.id)
+        assert approved is not None and approved.state == "approved"
+        approved_version = approved.version
+        assert kb.block_approved_action_for_technical_failure(
+            conn, task_id=task_id, action_id=action.id, expected_run_id=first_resumed_run,
+            attention_type="transient", reason_code="external_transient", now=1_900_000_001,
+        )
+        blocked_task = kb.get_task(conn, task_id)
+        blocked_run = conn.execute(
+            "SELECT status, outcome, ended_at, claim_lock FROM task_runs WHERE id=?",
+            (first_resumed_run,),
+        ).fetchone()
+        technical_rows = conn.execute(
+            "SELECT action_id, type FROM task_attentions WHERE task_id=?", (task_id,)
+        ).fetchall()
+        assert blocked_task is not None and (
+            blocked_task.status, blocked_task.current_run_id, blocked_task.claim_lock,
+        ) == ("blocked", None, None)
+        assert blocked_run is not None and (
+            blocked_run["status"], blocked_run["outcome"], blocked_run["ended_at"], blocked_run["claim_lock"],
+        ) == ("blocked", "blocked", 1_900_000_001, None)
+        assert [tuple(row) for row in technical_rows] == [(action.id, "transient")]
+        technical = kb.get_current_attention(conn, task_id, now=1_900_000_001)
+        assert technical is not None and (technical.action_id, technical.type, technical.state) == (
+            action.id, "transient", "pending",
+        )
+
+        assert kb.restore_approved_action_attention(conn, task_id, action.id, now=1_900_000_002)
+        restored = kb.get_current_attention(conn, task_id, now=1_900_000_002)
+        restored_rows = conn.execute(
+            "SELECT action_id, type FROM task_attentions WHERE task_id=?", (task_id,)
+        ).fetchall()
+        restored_action = kb.get_pending_action_by_id(conn, task_id, action.id)
+        assert restored is not None and (restored.action_id, restored.type, restored.state) == (
+            action.id, "exact_action", "approved",
+        )
+        assert [tuple(row) for row in restored_rows] == [(action.id, "exact_action")]
+        assert restored_action is not None and (
+            restored_action.state, restored_action.version, restored_action.consumed_at,
+        ) == ("approved", approved_version, None)
+
+        retry_attention = kb.get_current_attention(conn, task_id)
+        assert retry_attention is not None
+        assert kb.resume_approved_action_retry(
+            conn, task_id=task_id, expected_attention_id=retry_attention.id,
+            expected_attention_version=retry_attention.version,
+            expected_origin_run_id=first_resumed_run,
+        )
+        ready = kb.get_task(conn, task_id)
+        assert ready is not None and (
+            ready.status, ready.current_run_id, ready.claim_lock, ready.claim_expires,
+        ) == ("ready", None, None, None)
+        second_resumed = kb.claim_task(conn, task_id, claimer="technical-retry")
+        assert second_resumed is not None and second_resumed.current_run_id is not None
+        second_resumed_run = second_resumed.current_run_id
+        running_row = conn.execute(
+            "SELECT status, outcome, ended_at, claim_lock FROM task_runs WHERE id=?",
+            (second_resumed_run,),
+        ).fetchone()
+        assert running_row is not None and (
+            running_row["status"], running_row["outcome"], running_row["ended_at"], running_row["claim_lock"],
+        ) == ("running", None, None, "technical-retry")
+
+        assert kb.consume_approved_action(
+            conn, task_id=task_id, run_id=second_resumed_run, command=command,
+            profile="backend-eng", workspace=str(isolated_board), now=1_900_000_003,
+        )
+        consumed = kb.get_pending_action_by_id(conn, task_id, action.id)
+        assert consumed is not None and (
+            consumed.state, consumed.consumed_at, consumed.version,
+        ) == ("consumed", 1_900_000_003, approved_version + 1)
+        assert kb.get_current_attention(conn, task_id, now=1_900_000_003) is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,),
+        ).fetchone()[0] == 0
+        events = kb.list_events(conn, task_id=task_id)
+        assert sum(event.kind == "terminal_approval_granted" for event in events) == 1
+        assert sum(event.kind == "unblocked" for event in events) == 2
+        assert sum(event.kind == "claimed" for event in events) == 3
+        assert sum(event.kind == "blocked" for event in events) == 2
+        consume_events = [event for event in events if event.kind == "terminal_approval_consumed"]
+        assert len(consume_events) == 1
+        consume_event = consume_events[0]
+        assert consume_event.payload is not None
+        assert (consume_event.run_id, consume_event.payload["action_id"]) == (
+            second_resumed_run, action.id,
+        )
+        assert command not in repr(events)
+        assert action.fingerprint not in repr(events)
 
     for terminal in ("done", "archived"):
         task_id = _create_running_task(monkeypatch)
@@ -2418,3 +2505,165 @@ def test_attention_transition_refuses_live_projection(
             conn=conn, task_id=task_id, status="ready", now=1_900_000_000,
         )
         assert result.status == "conflict" and result.attention_id is not None
+
+
+def test_versioned_approval_human_gate_requires_token_and_consumes_only_on_success(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        origin_run_id = task.current_run_id
+        action = kb.record_pending_action(conn, task_id=task_id, run_id=origin_run_id,
+            command="git push origin gated", summary="push", profile="backend-eng",
+            workspace=str(isolated_board), expires_at=2_000_000_000)
+        assert kb.block_task(conn, task_id, kind="needs_input", expected_run_id=task.current_run_id, human_gate=True)
+        token = kb.issue_gate_token(conn, task_id, action="unblock")
+        attention = kb.get_current_attention(conn, task_id, now=1_900_000_000)
+        assert token and attention
+        before = _atomic_snapshot(conn, task_id, origin_run_id)
+        denied = kb.approve_pending_action_and_unblock_versioned(
+            conn, task_id, action.id, expected_version=attention.version, now=1_900_000_000)
+        assert denied.status == "conflict"
+        # Rejected gate attempts are auditable, but do not consume the token or
+        # mutate the action/task lifecycle.
+        after_denied = _atomic_snapshot(conn, task_id, origin_run_id)
+        assert after_denied["task"] == before["task"]
+        assert after_denied["actions"] == before["actions"]
+        assert conn.execute("SELECT gate_token_hash FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == kb.hash_gate_token(token)
+        approved = kb.approve_pending_action_and_unblock_versioned(
+            conn, task_id, action.id, expected_version=attention.version, token=token, now=1_900_000_000)
+        assert approved.status == "approved"
+        assert conn.execute("SELECT gate_token_hash FROM tasks WHERE id=?", (task_id,)).fetchone()[0] is None
+
+
+def test_versioned_approval_foreign_request_does_not_materialize_unrelated_expiry(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    monkeypatch.setattr(kb.time, "time", lambda: 100)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        action = kb.record_pending_action(
+            conn, task_id=task_id, run_id=task.current_run_id,
+            command="git push origin expired", summary="push", profile="backend-eng",
+            workspace=str(isolated_board), expires_at=101,
+        )
+        before = tuple(conn.execute("SELECT state, version FROM task_pending_actions WHERE id=?", (action.id,)).fetchone())
+        result = kb.approve_pending_action_and_unblock_versioned(conn, "foreign-task", action.id, expected_version=action.version, now=102)
+        assert result.status == "not_found"
+        assert tuple(conn.execute("SELECT state, version FROM task_pending_actions WHERE id=?", (action.id,)).fetchone()) == before
+
+
+@pytest.mark.parametrize(("attention_type", "reason_code", "scope", "requires_human_action"), [
+    ("decision", "credential_choice", {"required_decision": "credential"}, True),
+    ("protocol", "goal_closeout_missing", {"protocol": "goal_closeout"}, True),
+    ("review", "review_required", {"subject": "review"}, True),
+    ("loop_triage", "review_required", {"subject": "loop"}, False),
+    ("capability", "missing_capability", {"capability": "tool"}, True),
+    ("transient", "external_transient", {"subject": "external_service"}, False),
+])
+def test_block_task_all_actionless_typed_attentions_transition_by_id_and_version(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch, attention_type: str,
+    reason_code: str, scope: dict[str, str], requires_human_action: bool,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="untrusted prose",
+                             attention_type=attention_type, reason_code=reason_code,
+                             cause_scope=scope, expected_run_id=task.current_run_id)
+        attention = kb.get_current_attention(conn, task_id)
+        assert attention is not None
+        assert (attention.type, attention.version, attention.requires_human_action,
+                attention.approvable, attention.action_id) == (
+                    attention_type, 1, requires_human_action, False, None)
+        assert not kb.unblock_task(conn, task_id)
+        result = kb.transition_task_status_with_attention(
+            conn, task_id=task_id, status="ready", expected_attention_id=attention.id,
+            expected_attention_version=attention.version,
+        )
+        assert result.status == "transitioned"
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE id=?", (attention.id,)).fetchone()[0] == 0
+
+
+def test_exact_approved_awaiting_worker_remains_visible_not_approvable(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        action = kb.record_pending_action(conn, task_id=task_id, run_id=task.current_run_id,
+            command="approved-awaiting-worker", summary="ignored", profile="backend-eng",
+            workspace=str(isolated_board), expires_at=2_000_000_000)
+        assert kb.block_task(conn, task_id, kind="needs_input", expected_run_id=task.current_run_id)
+        before = kb.get_current_attention(conn, task_id, now=1_900_000_000)
+        assert before is not None
+        assert kb.approve_pending_action_and_unblock_versioned(
+            conn, task_id, action.id, expected_version=before.version, now=1_900_000_000,
+        ).status == "approved"
+        waiting = kb.get_current_attention(conn, task_id, now=1_900_000_000)
+        assert waiting is not None and waiting.id == before.id
+        assert (waiting.type, waiting.state, waiting.approvable, waiting.requires_human_action) == (
+            "exact_action", "approved", False, False)
+
+
+def test_current_attentions_batch_is_read_only_deduped_and_bounded(isolated_board: Path) -> None:
+    with kb.connect() as conn:
+        ids = [f"batch-{n}" for n in range(901)]
+        conn.executemany("INSERT INTO tasks (id, title, status, created_at) VALUES (?, ?, 'blocked', 1)",
+                         [(task_id, task_id) for task_id in ids])
+        conn.executemany("""INSERT INTO task_attentions
+            (task_id, action_id, type, cause_fingerprint, summary, created_at, version, origin_run_id)
+            VALUES (?, NULL, 'transient', ?, 'external_transient', 1, 1, NULL)""",
+                         [(task_id, f"batch-{n}-cause") for n, task_id in enumerate(ids)])
+        before = conn.total_changes
+        selects: list[str] = []
+        conn.set_trace_callback(lambda sql: selects.append(sql) if "FROM task_attentions x" in sql else None)
+        assert kb.get_current_attentions(conn, []) == {}
+        got = kb.get_current_attentions(conn, ids + ids[:40])
+        conn.set_trace_callback(None)
+        assert set(got) == set(ids)
+        assert all(attention.action_id is None and attention.type == "transient" for attention in got.values())
+        assert len(selects) == 2
+        assert conn.total_changes == before
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (ids[0],))
+        conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (ids[1],))
+        visible = kb.get_current_attentions(conn, ids[:2])
+        assert visible == {}
+
+
+def test_typed_attention_transition_stale_version_and_two_connections_have_one_winner(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        assert kb.block_task(conn, task_id, kind="needs_input", attention_type="decision",
+                             reason_code="credential_choice", cause_scope={"required_decision": "credential"},
+                             expected_run_id=task.current_run_id)
+        attention = kb.get_current_attention(conn, task_id)
+        assert attention is not None
+        stale = kb.transition_task_status_with_attention(conn, task_id=task_id, status="ready",
+            expected_attention_id=attention.id, expected_attention_version=attention.version + 1)
+        assert stale.status == "conflict"
+    barrier, results = threading.Barrier(2), []
+    def transition() -> None:
+        with kb.connect() as other:
+            barrier.wait(timeout=5)
+            results.append(kb.transition_task_status_with_attention(
+                other, task_id=task_id, status="ready", expected_attention_id=attention.id,
+                expected_attention_version=attention.version,
+            ).status)
+    workers = [threading.Thread(target=transition) for _ in range(2)]
+    [worker.start() for worker in workers]
+    [worker.join(timeout=5) for worker in workers]
+    assert not any(worker.is_alive() for worker in workers)
+    assert sorted(results) == ["conflict", "transitioned"]
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE id=?", (attention.id,)).fetchone()[0] == 0
