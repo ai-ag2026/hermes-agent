@@ -2369,4 +2369,4 @@ class TestApprovalPromptRedaction:
         assert result.get("status") == "pending_approval"
         # The script's credential must not appear in the user-facing message.
         assert "sk-proj-abc123xyz4567890abcdef" not in result["message"]
-        assert "sk-proj-abc123xyz4567890abcdef" not in result["command"]
+        assert "command" not in result  # P3 public result never exposes source.

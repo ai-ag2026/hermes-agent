@@ -4214,7 +4214,7 @@ def claim_task(
         # unresolved exact-action gate. Only the combined approve+unblock path
         # can leave an approved grant on a ready task.
         unresolved_action = conn.execute(
-            "SELECT id FROM task_pending_actions WHERE task_id = ? "
+            "SELECT id FROM task_pending_actions WHERE task_id = ? AND state = 'pending' "
             "AND approved_at IS NULL AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ? "
             "ORDER BY id DESC LIMIT 1",
             (task_id, now),
@@ -7281,7 +7281,18 @@ def _pending_action_hash(command: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _pending_action_mutation_kind(command: str) -> str:
+def _pending_action_mutation_kind(command: str, explicit_kind: Optional[str] = None) -> str:
+    """Classify terminal payloads, or accept the one internal code payload kind.
+
+    ``execute-code-arbitrary`` is intentionally not inferred from source: it is
+    a private, whole-payload, one-shot approval boundary supplied by the code
+    guard. Keeping that explicit prevents Python source from being treated as a
+    shell command or as a bounded mutation.
+    """
+    if explicit_kind is not None:
+        if explicit_kind != "execute-code-arbitrary":
+            raise ValueError("unsupported explicit pending-action mutation kind")
+        return explicit_kind
     canonical = _normalise_pending_action_command(command)
     lower = canonical.lower()
     if re.search(r"\bgit\s+push\b", lower):
@@ -7475,6 +7486,7 @@ def record_pending_action_and_block(
     profile: str,
     workspace: str,
     expires_at: int,
+    mutation_kind: Optional[str] = None,
 ) -> dict[str, Any]:
     """Atomically persist one exact action and park its running origin."""
     now = int(time.time())
@@ -7485,7 +7497,7 @@ def record_pending_action_and_block(
     if int(expires_at) <= now:
         raise ValueError("pending action expiry must be in the future")
     command_hash = _pending_action_hash(command)
-    mutation_kind = _pending_action_mutation_kind(command)
+    mutation_kind = _pending_action_mutation_kind(command, mutation_kind)
     fingerprint = _pending_action_fingerprint(
         board_identity=_pending_action_board_identity(conn), task_id=task_id, run_id=run_id,
         command_hash=command_hash, mutation_kind=mutation_kind, profile=profile, workspace=workspace,
@@ -7551,10 +7563,10 @@ def record_pending_action_and_block(
                 _append_event(conn, task_id, "blocked", {"kind": "needs_input", "reason": "terminal_approval_required", "action_id": action.id}, run_id=int(run_id))
             attention = conn.execute("SELECT id FROM task_attentions WHERE task_id=? AND action_id=? AND type='exact_action' ORDER BY id DESC LIMIT 1", (task_id, action.id)).fetchone()
             result = {"action_id": action.id, "attention_id": int(attention["id"]), "attention_status": action.state, "reused": reused}
-            hook_assignee = str(task["assignee"])
+            hook_assignee = ""
     if hook_assignee is not None:
         _fire_kanban_lifecycle_hook(
-            "kanban_task_blocked", task_id, board=get_current_board(), assignee=hook_assignee,
+            "kanban_task_blocked", task_id, board=get_current_board(),
             run_id=int(run_id), reason="terminal_approval_required",
         )
     return result
@@ -7774,11 +7786,12 @@ def consume_approved_action(
     profile: str,
     workspace: str,
     now: Optional[int] = None,
+    mutation_kind: Optional[str] = None,
 ) -> bool:
     """Atomically consume a grant from the currently running resumed attempt."""
     now = int(time.time()) if now is None else int(now)
     command_hash = _pending_action_hash(command)
-    mutation_kind = _pending_action_mutation_kind(command)
+    mutation_kind = _pending_action_mutation_kind(command, mutation_kind)
     workspace = str(Path(workspace).resolve())
     with write_txn(conn):
         _materialize_expired_actions(conn, now)
@@ -8318,11 +8331,15 @@ def unblock_task(
     """
     now = int(time.time())
     with write_txn(conn):
-        gated = _assert_human_gate_open(conn, task_id, token=token, action="unblock")
+        # Read all independent business preconditions before consuming a
+        # single-use human-gate token.  A refused unblock must be retryable by
+        # the same authorized operator.
         pending_action = conn.execute(
             "SELECT 1 FROM task_pending_actions WHERE task_id = ? "
+            "AND run_id = (SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1) "
+            "AND state IN ('pending', 'approved') "
             "AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at >= ? LIMIT 1",
-            (task_id, now),
+            (task_id, task_id, now),
         ).fetchone()
         if pending_action is not None:
             return False
@@ -8355,6 +8372,9 @@ def unblock_task(
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
+        # Token validation/consumption is the final authorization operation in
+        # this transaction, immediately before the status CAS below.
+        gated = _assert_human_gate_open(conn, task_id, token=token, action="unblock")
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run

@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest.mock
@@ -5962,6 +5963,38 @@ def test_human_gate_token_roundtrip(kanban_home):
         events = kb.list_events(conn, tid)
         unblocked = [e for e in events if e.kind == "unblocked"][-1]
         assert unblocked.payload["human_gate"] is True
+
+
+def test_human_gate_token_race_has_one_winner(kanban_home):
+    """Two real connections redeeming one token produce one transition."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="needs approval", kind="needs_input", human_gate=True)
+        token = kb.issue_gate_token(conn, tid)
+    barrier = threading.Barrier(2)
+    outcomes: list[bool] = []
+    failures: list[BaseException] = []
+
+    def redeem() -> None:
+        try:
+            with kb.connect() as other:
+                barrier.wait(timeout=5)
+                outcomes.append(kb.unblock_task(other, tid, token=token))
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=redeem) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    assert not failures
+    assert outcomes.count(True) == 1 and outcomes.count(False) == 1
+    with kb.connect() as conn:
+        row = conn.execute("SELECT status, gate_token_hash FROM tasks WHERE id=?", (tid,)).fetchone()
+        assert row["status"] in ("ready", "todo") and row["gate_token_hash"] is None
+        assert sum(event.kind == "unblocked" for event in kb.list_events(conn, tid)) == 1
 
 
 def test_human_gate_grant_binds_board_task_and_action(kanban_home):

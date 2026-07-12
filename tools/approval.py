@@ -21,13 +21,63 @@ import sys
 import threading
 import time
 import unicodedata
-from typing import Optional
+from typing import Literal, Optional, TypedDict
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
 from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+# Internal, dict-compatible policy protocol. Existing consumers retain their
+# legacy fields while enforcement surfaces switch on this closed semantic set.
+GUARD_ALLOW: Literal["allow"] = "allow"
+GUARD_DENY_HARD: Literal["deny_hard"] = "deny_hard"
+GUARD_RETRY_SAFE: Literal["retry_with_safe_alternative"] = "retry_with_safe_alternative"
+GUARD_APPROVAL_REQUIRED: Literal["approval_required"] = "approval_required"
+GuardOutcomeKind = Literal["allow", "deny_hard", "retry_with_safe_alternative", "approval_required"]
+
+
+class GuardOutcome(TypedDict, total=False):
+    outcome: GuardOutcomeKind
+    approved: bool
+    status: str
+    message: str | None
+    reason_code: str
+    mutation_kind: str
+    kanban_approval: dict
+
+
+def _guard_outcome(result: dict, outcome: GuardOutcomeKind, **fields: object) -> GuardOutcome:
+    """Add the P3 semantic decision without breaking legacy dict call sites."""
+    result = dict(result)
+    # ``outcome`` historically carried gateway values such as timeout/denied.
+    # Preserve them for old callers; wrappers use ``guard_outcome`` exclusively.
+    if result.get("outcome") not in {"timeout", "denied", "blocked", "notify_failed"}:
+        result["outcome"] = outcome
+    result["guard_outcome"] = outcome
+    result.update(fields)
+    return result  # type: ignore[return-value]
+
+
+def _semantic_outcome(result: dict) -> GuardOutcomeKind:
+    return result.get("guard_outcome") or result.get("outcome") or GUARD_DENY_HARD
+
+
+_SAFE_READONLY_HEREDOC_RE = re.compile(
+    r"sh <<'SAFE_READ'\ncat -- '(/[A-Za-z0-9._/@:+,-]+)'\nSAFE_READ\n?"
+)
+
+
+def _match_safe_readonly_heredoc(command: str) -> dict | None:
+    """Recognize the one non-executing literal-file audit template, byte-exactly."""
+    if _SAFE_READONLY_HEREDOC_RE.fullmatch(command) is None:
+        return None
+    return {
+        "tool": "read_file",
+        "kind": "literal-file-inspection",
+        "execution": "not_run",
+    }
 
 # Freeze YOLO mode at module import time. Reading os.environ on every call
 # would allow any skill running inside the process to set this variable and
@@ -2535,7 +2585,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
-def _consume_kanban_action_grant(command: str) -> bool:
+def _consume_kanban_action_grant(command: str, *, mutation_kind: str | None = None) -> bool:
     """Consume a durable exact-action grant when running as a Kanban worker."""
     task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
@@ -2553,14 +2603,17 @@ def _consume_kanban_action_grant(command: str) -> bool:
                 command=command,
                 profile=os.environ.get("HERMES_PROFILE", "default"),
                 workspace=workspace,
+                mutation_kind=mutation_kind,
             )
     except Exception as exc:
         logger.warning("Kanban action grant lookup failed closed: %s", exc)
         return False
 
 
-def _record_kanban_pending_action(command: str, summary: str) -> dict | None:
-    """Atomically park a Kanban worker behind an exact-action approval."""
+def _record_kanban_pending_action(
+    command: str, summary: str, *, mutation_kind: str | None = None,
+) -> dict | None:
+    """Atomically park a Kanban worker behind an exact-payload approval."""
     task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
     if not task_id or not workspace:
@@ -2579,13 +2632,38 @@ def _record_kanban_pending_action(command: str, summary: str) -> dict | None:
                 profile=os.environ.get("HERMES_PROFILE", "default"),
                 workspace=workspace,
                 expires_at=int(time.time()) + 86400,
+                mutation_kind=mutation_kind,
             )
     except Exception as exc:
         logger.warning("Could not atomically persist Kanban pending action: %s", exc)
         return None
 
 
-def check_all_command_guards(command: str, env_type: str,
+def _check_non_overridable_deny_floor(command: str) -> dict | None:
+    """Return a deny_hard result without entering approval lifecycle."""
+    # Hardline → sudo stdin → user deny is intentionally ordered: every caller
+    # that needs only this floor shares the central policy rather than copying
+    # pattern logic or letting a force-confirmation bypass it.
+    is_hardline, hardline_desc = detect_hardline_command(command)
+    if is_hardline:
+        logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
+        return dict(_guard_outcome(_hardline_block_result(hardline_desc), GUARD_DENY_HARD))
+
+    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
+    if is_sudo_guess:
+        logger.warning("Sudo stdin guard block: %s (command: %s)",
+                       sudo_guess_desc, command[:200])
+        return _guard_outcome(_sudo_stdin_block_result(sudo_guess_desc), GUARD_DENY_HARD)
+
+    deny_pattern = _match_user_deny_rule(command)
+    if deny_pattern is not None:
+        logger.warning("User deny rule %r blocked command: %s",
+                       deny_pattern, command[:200])
+        return _guard_outcome(_user_deny_block_result(deny_pattern), GUARD_DENY_HARD)
+    return None
+
+
+def _check_all_command_guards_legacy(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
@@ -2604,34 +2682,9 @@ def check_all_command_guards(command: str, env_type: str,
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
-    # Hardline floor: unconditional block for catastrophic commands
-    # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
-    # kill -1). Applies BEFORE yolo / mode=off / cron approve-mode so
-    # no session-level setting can bypass it.
-    is_hardline, hardline_desc = detect_hardline_command(command)
-    if is_hardline:
-        logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
-        return _hardline_block_result(hardline_desc)
-
-    # == Sudo stdin guard ==
-    # Like the hardline floor above, this is unconditional: there is never a
-    # legitimate reason for the agent to pipe passwords to sudo -S when no
-    # SUDO_PASSWORD has been configured.  This must fire BEFORE the yolo
-    # check so even yolo/smart approval/mode=off cannot bypass it.
-    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
-    if is_sudo_guess:
-        logger.warning("Sudo stdin guard block: %s (command: %s)",
-                       sudo_guess_desc, command[:200])
-        return _sudo_stdin_block_result(sudo_guess_desc)
-
-    # User-defined deny rules (approvals.deny in config.yaml): like the
-    # hardline floor, these fire BEFORE the yolo / mode=off bypass — a deny
-    # rule is the user saying "never, even under yolo".
-    deny_pattern = _match_user_deny_rule(command)
-    if deny_pattern is not None:
-        logger.warning("User deny rule %r blocked command: %s",
-                       deny_pattern, command[:200])
-        return _user_deny_block_result(deny_pattern)
+    deny_floor = _check_non_overridable_deny_floor(command)
+    if deny_floor is not None:
+        return dict(deny_floor)
 
     # Kanban grants are consume-once and action-bound. They are checked only
     # after unconditional hardline/deny floors, so operator approval cannot
@@ -2639,6 +2692,15 @@ def check_all_command_guards(command: str, env_type: str,
     if _consume_kanban_action_grant(command):
         return {"approved": True, "message": None,
                 "user_approved": True, "kanban_action_grant": True}
+
+    safe_alternative = _match_safe_readonly_heredoc(command)
+    if safe_alternative is not None:
+        return _guard_outcome({
+            "approved": False,
+            "reason_code": "readonly-heredoc-audit",
+            "safe_alternative": safe_alternative,
+            "message": "Read-only audit recognized; use read_file.",
+        }, GUARD_RETRY_SAFE)
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
@@ -2942,8 +3004,10 @@ def check_all_command_guards(command: str, env_type: str,
             "pattern_keys": all_keys,
             "description": _disp_combined_desc,
         })
+        from hermes_cli.kanban_db import _pending_action_mutation_kind
         return {
             "approved": False,
+            "mutation_kind": _pending_action_mutation_kind(command),
             "pattern_key": primary_key,
             "status": "pending_approval",
             "approval_pending": True,
@@ -3012,7 +3076,23 @@ def check_all_command_guards(command: str, env_type: str,
             "user_approved": True, "description": combined_desc}
 
 
-def check_execute_code_guard(code: str, env_type: str,
+def check_all_command_guards(command: str, env_type: str,
+                             approval_callback=None,
+                             has_host_access: bool = False) -> GuardOutcome:
+    """Return the closed P3 guard outcome while preserving legacy fields."""
+    result = _check_all_command_guards_legacy(
+        command, env_type, approval_callback, has_host_access,
+    )
+    if _semantic_outcome(result) == GUARD_RETRY_SAFE:
+        return result
+    if result.get("approved"):
+        return _guard_outcome(result, GUARD_ALLOW)
+    if result.get("status") == "pending_approval":
+        return _guard_outcome(result, GUARD_APPROVAL_REQUIRED)
+    return _guard_outcome(result, GUARD_DENY_HARD)
+
+
+def _check_execute_code_guard_legacy(code: str, env_type: str,
                              has_host_access: bool = False) -> dict:
     """Approve an execute_code script before its child process is spawned.
 
@@ -3038,14 +3118,54 @@ def check_execute_code_guard(code: str, env_type: str,
         "approval is one-shot for this run."
     )
 
-    # Isolated backends already sandbox the child — matches the container skip
-    # in check_all_command_guards / check_dangerous_command. Docker stops
-    # skipping once host paths are bind-mounted into the sandbox; vercel_sandbox
-    # has no host-bind concept so it stays always-skipped.
+    # Any Kanban marker means this is a durable control-plane context.  A
+    # partial binding is never an interactive/non-Kanban fallback: reject it
+    # before sandbox, YOLO, mode-off, or broad-approval shortcuts and do not
+    # touch the action lifecycle.  Only a complete active binding may reach the
+    # exact one-shot grant and durable pending-action paths.
+    _kanban_markers = {
+        "task": os.environ.get("HERMES_KANBAN_TASK", "").strip(),
+        "run": os.environ.get("HERMES_KANBAN_RUN_ID", "").strip(),
+        "workspace": os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip(),
+    }
+    _has_kanban_marker = any(_kanban_markers.values())
+    _kanban_exact_context = all(_kanban_markers.values())
+    if _has_kanban_marker and not _kanban_exact_context:
+        return _guard_outcome(
+            {"approved": False, "status": "blocked",
+             "message": "BLOCKED: incomplete Kanban action context."},
+            GUARD_DENY_HARD,
+        )
+    if _kanban_exact_context:
+        if _consume_kanban_action_grant(code, mutation_kind="execute-code-arbitrary"):
+            return _guard_outcome({"approved": True, "message": None,
+                                   "kanban_action_grant": True}, GUARD_ALLOW)
+        durable = _record_kanban_pending_action(
+            code, "An exact execute_code action is awaiting approval.",
+            mutation_kind="execute-code-arbitrary",
+        )
+        if durable is None:
+            return _guard_outcome(
+                {"approved": False, "status": "blocked",
+                 "message": "BLOCKED: exact approval could not be durably recorded."},
+                GUARD_DENY_HARD,
+            )
+        return _guard_outcome({
+            "approved": False,
+            "pattern_key": pattern_key,
+            "status": "pending_approval",
+            "approval_pending": True,
+            "description": "execute_code script execution requires exact approval.",
+            "message": "Approval is required before this execute_code script can run.",
+            "kanban_approval": durable,
+            "mutation_kind": "execute-code-arbitrary",
+        }, GUARD_APPROVAL_REQUIRED)
+
+    # Isolated non-Kanban backends retain their established shortcut semantics.
     if env_type == "vercel_sandbox":
-        return {"approved": True, "message": None}
+        return _guard_outcome({"approved": True, "message": None}, GUARD_ALLOW)
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return {"approved": True, "message": None}
+        return _guard_outcome({"approved": True, "message": None}, GUARD_ALLOW)
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()
@@ -3134,26 +3254,35 @@ def check_execute_code_guard(code: str, env_type: str,
         notify_cb = _gateway_notify_cbs.get(session_key)
 
     if notify_cb is None:
-        # No gateway callback registered (e.g. ask-mode without a notifier):
-        # surface a pending approval for backward compatibility.
-        submit_pending(session_key, {
-            "command": display_command,
-            "pattern_key": pattern_key,
-            "pattern_keys": [pattern_key],
-            "description": display_description,
-        })
-        return {
+        # Existing no-notifier whole-script fallback becomes durable only for a
+        # Kanban worker.  Outside Kanban retain the legacy in-memory queue.
+        durable = _record_kanban_pending_action(
+            code, "An exact execute_code action is awaiting approval.",
+            mutation_kind="execute-code-arbitrary",
+        )
+        if os.environ.get("HERMES_KANBAN_TASK", "").strip() and durable is None:
+            return _guard_outcome(
+                {"approved": False, "status": "blocked",
+                 "message": "BLOCKED: exact approval could not be durably recorded."},
+                GUARD_DENY_HARD,
+            )
+        if durable is None:
+            submit_pending(session_key, {
+                "command": display_command,
+                "pattern_key": pattern_key,
+                "pattern_keys": [pattern_key],
+                "description": display_description,
+            })
+        return _guard_outcome({
             "approved": False,
             "pattern_key": pattern_key,
             "status": "pending_approval",
             "approval_pending": True,
-            "command": display_command,
             "description": display_description,
-            "message": (
-                f"⚠️ {display_description}. Asking the user for approval.\n\n"
-                f"**Code:**\n```python\n{display_code}\n```"
-            ),
-        }
+            "message": "Approval is required before this execute_code script can run.",
+            "kanban_approval": durable,
+            "mutation_kind": "execute-code-arbitrary",
+        }, GUARD_APPROVAL_REQUIRED)
 
     approval_data = {
         "command": display_command,
@@ -3211,6 +3340,20 @@ def check_execute_code_guard(code: str, env_type: str,
 
     return {"approved": True, "message": None,
             "user_approved": True, "description": description}
+
+
+def check_execute_code_guard(code: str, env_type: str,
+                             has_host_access: bool = False) -> GuardOutcome:
+    """Normalize whole-script guard results to the P3 semantic protocol."""
+    result = _check_execute_code_guard_legacy(code, env_type, has_host_access)
+    if result.get("guard_outcome"):
+        return result  # type: ignore[return-value]
+    if result.get("approved"):
+        return _guard_outcome(result, GUARD_ALLOW)
+    if result.get("status") == "pending_approval":
+        return _guard_outcome(result, GUARD_APPROVAL_REQUIRED,
+                              mutation_kind="execute-code-arbitrary")
+    return _guard_outcome(result, GUARD_DENY_HARD)
 
 
 # =========================================================================

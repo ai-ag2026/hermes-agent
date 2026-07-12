@@ -1068,7 +1068,7 @@ def test_atomic_pending_action_block_hook_fires_once_after_commit_and_retry_is_s
     assert len(observed) == 1
     event, hooked_task_id, fields = observed[0]
     assert (event, hooked_task_id) == ("kanban_task_blocked", task_id)
-    assert fields["assignee"] == "backend-eng"
+    assert "assignee" not in fields
     assert fields["run_id"] == origin_run_id
     assert fields["reason"] == "terminal_approval_required"
 
@@ -1233,7 +1233,9 @@ def test_execute_code_and_terminal_pending_paths_create_same_durable_approval_co
     monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda _cfg: False)
     monkeypatch.setattr(code_execution_tool, "_execute_remote", Mock(side_effect=AssertionError("must not execute")))
     result = json.loads(code_execution_tool.execute_code("import os; os.unlink('x')"))
-    assert result["status"] == "error"
+    assert result["status"] == "pending_approval"
+    assert result["outcome"] == "approval_required"
+    assert set(result["kanban_approval"]) == {"action_id", "attention_id", "attention_status", "reused"}
 
     with kb.connect() as conn:
         terminal_action = kb.get_pending_action(conn, terminal_task)
@@ -1262,3 +1264,563 @@ def test_execute_code_and_terminal_pending_paths_create_same_durable_approval_co
                 event for event in kb.list_events(conn, task_id=action.task_id)
                 if event.kind == "terminal_approval_pending"
             ]) == 1
+
+
+@pytest.mark.parametrize("bypass", ["yolo", "mode_off", "session", "always", "smart"])
+def test_kanban_execute_code_requires_durable_exact_grant_despite_broad_bypasses(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch, bypass: str,
+) -> None:
+    """An arbitrary worker script is never authorized by broad policy state."""
+    from tools import approval
+
+    task_id = _create_running_task(monkeypatch)
+    code = "print('arbitrary worker script')"
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+    if bypass == "yolo":
+        monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", True)
+    elif bypass == "mode_off":
+        monkeypatch.setattr(approval, "_get_approval_mode", lambda: "off")
+    elif bypass in {"session", "always"}:
+        monkeypatch.setattr(approval, "is_approved", lambda *_args: True)
+    else:
+        monkeypatch.setattr(approval, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval, "_smart_approve", lambda *_args: "approve")
+
+    result = approval.check_execute_code_guard(code, "local")
+    assert result["guard_outcome"] == "approval_required"
+    assert result["status"] == "pending_approval"
+    with kb.connect() as conn:
+        action = kb.get_pending_action(conn, task_id)
+        assert action is not None and action.mutation_kind == "execute-code-arbitrary"
+
+
+def test_kanban_execute_code_exact_grant_is_byte_bound_and_consumed_once(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Line endings, Unicode normalization, and whitespace are distinct scripts."""
+    from tools import approval
+
+    task_id = _create_running_task(monkeypatch)
+    code_a = "print('é')\n"
+    variants = ("print('é')\r\n", "print('e\u0301')\n", "print('é')\n ")
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+    first = approval.check_execute_code_guard(code_a, "local")
+    assert first["guard_outcome"] == "approval_required"
+    action_id = first["kanban_approval"]["action_id"]
+    with kb.connect() as conn:
+        assert kb.approve_pending_action_and_unblock(conn, task_id, action_id)
+        resumed = kb.claim_task(conn, task_id, claimer="resumed-worker")
+        assert resumed is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resumed.current_run_id))
+    assert approval.check_execute_code_guard(code_a, "local")["guard_outcome"] == "allow"
+    for variant in variants:
+        assert variant.encode("utf-8") != code_a.encode("utf-8")
+        assert kb._pending_action_hash(variant) != kb._pending_action_hash(code_a)
+    # The exact grant was consumed; retrying A or offering B cannot reuse it.
+    assert approval.check_execute_code_guard(code_a, "local")["guard_outcome"] == "approval_required"
+    with kb.connect() as conn:
+        action = conn.execute("SELECT state, consumed_at FROM task_pending_actions WHERE id=?", (action_id,)).fetchone()
+        assert action["state"] == "consumed" and action["consumed_at"] is not None
+
+
+@pytest.mark.parametrize("env_type", ["local", "ssh"])
+def test_public_execute_code_pending_blocks_before_local_or_remote_spawn(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch, env_type: str,
+) -> None:
+    """F: the real wrapper blocks before either selected dispatch seam."""
+    from tools import code_execution_tool, terminal_tool
+
+    task_id = _create_running_task(monkeypatch)
+    code = "import pathlib; pathlib.Path('MUST_NOT_RUN').write_text('x')"
+    monkeypatch.setattr(code_execution_tool, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": env_type})
+    monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda _cfg: False)
+    monkeypatch.setattr(code_execution_tool.tempfile, "mkdtemp", Mock(side_effect=AssertionError("local spawn")))
+    monkeypatch.setattr(code_execution_tool, "_execute_remote", Mock(side_effect=AssertionError("remote spawn")))
+    result = json.loads(code_execution_tool.execute_code(code))
+    assert (result["status"], result["outcome"], result["tool_calls_made"]) == ("pending_approval", "approval_required", 0)
+    assert set(result["kanban_approval"]) == {"action_id", "attention_id", "attention_status", "reused"}
+    assert code not in json.dumps(result)
+    with kb.connect() as conn:
+        events = kb.list_events(conn, task_id=task_id)
+        assert sum(e.kind == "terminal_approval_pending" for e in events) == 1
+        assert sum(e.kind == "blocked" for e in events) == 1
+
+
+@pytest.mark.parametrize("env_type", ["docker", "vercel_sandbox"])
+def test_public_execute_code_isolated_backends_still_require_kanban_exact_grant(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch, env_type: str,
+) -> None:
+    """Isolation shortcuts never bypass a worker's durable exact grant."""
+    from tools import code_execution_tool, terminal_tool
+
+    task_id = _create_running_task(monkeypatch)
+    monkeypatch.setattr(code_execution_tool, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": env_type})
+    monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda _cfg: False)
+    monkeypatch.setattr(code_execution_tool, "_execute_remote", Mock(side_effect=AssertionError("must not spawn")))
+    result = json.loads(code_execution_tool.execute_code("print('guarded')"))
+    assert (result["status"], result["outcome"]) == ("pending_approval", "approval_required")
+    with kb.connect() as conn:
+        assert kb.get_pending_action(conn, task_id) is not None
+        assert len([event for event in kb.list_events(conn, task_id=task_id) if event.kind == "terminal_approval_pending"]) == 1
+
+
+@pytest.mark.parametrize("markers", [
+    {"HERMES_KANBAN_TASK": "task-only"},
+    {"HERMES_KANBAN_TASK": "task", "HERMES_KANBAN_WORKSPACE": "/workspace"},
+    {"HERMES_KANBAN_TASK": "task", "HERMES_KANBAN_RUN_ID": "1"},
+    {"HERMES_KANBAN_RUN_ID": "1", "HERMES_KANBAN_WORKSPACE": "/workspace"},
+])
+@pytest.mark.parametrize("bypass", ["yolo", "mode_off"])
+def test_partial_kanban_markers_fail_closed_without_durable_side_effects(
+    monkeypatch: pytest.MonkeyPatch, markers: dict[str, str], bypass: str,
+) -> None:
+    from tools import approval
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACE", raising=False)
+    for key, value in markers.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(approval, "_record_kanban_pending_action", Mock(side_effect=AssertionError("must not persist")))
+    monkeypatch.setattr(approval, "_consume_kanban_action_grant", Mock(side_effect=AssertionError("must not consume")))
+    if bypass == "yolo":
+        monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", True)
+    else:
+        monkeypatch.setattr(approval, "_get_approval_mode", lambda: "off")
+    result = approval.check_execute_code_guard("print('partial')", "vercel_sandbox")
+    assert result["guard_outcome"] == "deny_hard"
+    assert result["status"] == "blocked"
+
+
+def test_terminal_safe_heredoc_user_deny_wins_even_with_force_before_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import terminal_tool
+
+    command = "sh <<'SAFE_READ'\ncat -- '/etc/hosts'\nSAFE_READ\n"
+    denied = {"approved": False, "guard_outcome": "deny_hard", "description": "user deny", "message": "BLOCKED by user deny."}
+    guard = Mock(return_value=denied)
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", guard)
+    monkeypatch.setattr(terminal_tool, "_create_environment", Mock(side_effect=AssertionError("must not create environment")))
+    result = json.loads(terminal_tool.terminal_tool(command, force=True))
+    assert result["status"] == "error"
+    assert result["error"] == "BLOCKED by user deny."
+    guard.assert_called_once()
+
+
+def test_public_terminal_pending_has_one_correlated_durable_lifecycle(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """G: the real terminal wrapper surfaces IDs without double persistence."""
+    from tools import terminal_tool
+
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    fake_env = SimpleNamespace(execute=Mock(side_effect=AssertionError("must not execute")), cwd=str(isolated_board))
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "local", "cwd": str(isolated_board), "timeout": 30})
+    monkeypatch.setattr(terminal_tool, "_create_environment", lambda **_kwargs: fake_env)
+    monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda _cfg: False)
+    first = json.loads(terminal_tool.terminal_tool(command))
+    second = json.loads(terminal_tool.terminal_tool(command))
+    assert first["outcome"] == "approval_required"
+    assert first["mutation_kind"]
+    assert set(first["kanban_approval"]) == {"action_id", "attention_id", "attention_status", "reused"}
+    assert second["kanban_approval"] == {**first["kanban_approval"], "reused": True}
+    with kb.connect() as conn:
+        events = kb.list_events(conn, task_id=task_id)
+        action_id = first["kanban_approval"]["action_id"]
+        action = kb.get_pending_action(conn, task_id)
+        assert action is not None and first["mutation_kind"] == action.mutation_kind
+        assert conn.execute("SELECT COUNT(*) FROM task_pending_actions WHERE task_id=?", (task_id,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 1
+        pending = [e for e in events if e.kind == "terminal_approval_pending"]
+        blocked = [e for e in events if e.kind == "blocked"]
+        assert len(pending) == len(blocked) == 1
+        assert pending[0].payload["action_id"] == blocked[0].payload["action_id"] == action_id
+
+
+@pytest.mark.parametrize("env_type", ["local", "ssh"])
+def test_public_execute_code_persist_fault_is_full_rollback_and_no_spawn(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch, env_type: str,
+) -> None:
+    """I: injected post-persist failure returns hard-deny with an unchanged snapshot."""
+    from tools import approval, code_execution_tool, terminal_tool
+
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        run_id = kb.get_task(conn, task_id).current_run_id
+        before = _atomic_snapshot(conn, task_id, run_id)
+    monkeypatch.setattr(code_execution_tool, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": env_type})
+    monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda _cfg: False)
+    monkeypatch.setattr(approval, "submit_pending", Mock(side_effect=AssertionError("must not queue")))
+    monkeypatch.setattr(kb, "_pending_action_after_persist_hook", lambda: (_ for _ in ()).throw(RuntimeError("fault")))
+    monkeypatch.setattr(code_execution_tool.tempfile, "mkdtemp", Mock(side_effect=AssertionError("local spawn")))
+    monkeypatch.setattr(code_execution_tool, "_execute_remote", Mock(side_effect=AssertionError("remote spawn")))
+    result = json.loads(code_execution_tool.execute_code("print('fault')"))
+    assert result["status"] == "error" and result["outcome"] == "deny_hard"
+    with kb.connect() as conn:
+        assert _atomic_snapshot(conn, task_id, run_id) == before
+
+
+def test_public_execute_code_redacts_operator_surfaces_hook_and_logs(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """J: canonical private bindings remain private on every operator surface."""
+    import logging
+    from tools import code_execution_tool, terminal_tool
+
+    task_id = _create_running_task(monkeypatch)
+    source, profile = "credential='RAW_SOURCE_SECRET_MARKER'", "PROFILE_SECRET_MARKER"
+    workspace = isolated_board / "ABSOLUTE_WORKSPACE_SECRET_MARKER"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_PROFILE", profile)
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    with kb.connect() as conn:
+        run_id = kb.get_task(conn, task_id).current_run_id
+        conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (profile, task_id))
+        conn.execute("UPDATE task_runs SET profile=? WHERE id=?", (profile, run_id))
+    monkeypatch.setattr(code_execution_tool, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "local"})
+    monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda _cfg: False)
+    monkeypatch.setattr(code_execution_tool.tempfile, "mkdtemp", Mock(side_effect=AssertionError("spawn")))
+    captured: list[dict] = []
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", lambda _event, _task, **fields: captured.append(fields))
+    with caplog.at_level(logging.DEBUG):
+        result = json.loads(code_execution_tool.execute_code(source))
+    with kb.connect() as conn:
+        action, attention = kb.get_pending_action(conn, task_id), kb.get_current_attention(conn, task_id)
+        events = kb.list_events(conn, task_id=task_id)
+        assert action is not None and attention is not None and action.command_hash and action.fingerprint
+        public = json.dumps({"result": result, "attention": repr(attention), "events": [(e.kind, e.payload) for e in events], "hook": captured, "logs": [r.getMessage() for r in caplog.records]}, sort_keys=True)
+    for marker in (source, "RAW_SOURCE_SECRET_MARKER", action.command_hash, action.fingerprint, profile, str(workspace.resolve())):
+        assert marker not in public
+
+
+def test_exact_action_and_human_gate_authorizations_are_isolated(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M: an exact-action grant and a human gate cannot cross-authorize."""
+    action_task = _create_running_task(monkeypatch)
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    with kb.connect() as conn:
+        action_run = kb.get_task(conn, action_task).current_run_id
+        action = kb.record_pending_action_and_block(conn, task_id=action_task, run_id=action_run, command=command, summary="publish", profile="backend-eng", workspace=str(isolated_board), expires_at=2_000_000_000)
+        monkeypatch.delenv("HERMES_KANBAN_TASK")
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+        gate_task = kb.create_task(conn, title="separate human gate", assignee="backend-eng")
+        claimed = kb.claim_task(conn, gate_task, claimer="gate-worker")
+        assert claimed is not None
+        assert kb.block_task(conn, gate_task, kind="needs_input", reason="human", expected_run_id=claimed.current_run_id, human_gate=True)
+        gate_token = kb.issue_gate_token(conn, gate_task)
+        gate_hash = conn.execute("SELECT gate_token_hash FROM tasks WHERE id=?", (gate_task,)).fetchone()[0]
+        before = kb.get_pending_action_by_id(conn, action_task, action["action_id"])
+        assert gate_token and before is not None
+        assert kb.approve_pending_action(conn, action_task, action["action_id"])
+        assert conn.execute("SELECT gate_token_hash FROM tasks WHERE id=?", (gate_task,)).fetchone()[0] == gate_hash
+        assert kb.unblock_task(conn, action_task, token=gate_token) is False
+        after = kb.get_pending_action_by_id(conn, action_task, action["action_id"])
+        assert after is not None and (after.state, after.version) == ("approved", before.version + 1)
+        assert kb.unblock_task(conn, gate_task, token=gate_token)
+        assert kb.get_task(conn, gate_task).status == "ready"
+
+
+def test_exact_action_grant_cannot_cross_authorize_identical_active_cards(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identical payload/profile/workspace grants remain bound to their task/run."""
+    command = "print('same exact script')"
+    with kb.connect() as conn:
+        task_a = kb.create_task(conn, title="A", assignee="backend-eng")
+        task_b = kb.create_task(conn, title="B", assignee="backend-eng")
+        claimed_a = kb.claim_task(conn, task_a, claimer="a-origin")
+        claimed_b = kb.claim_task(conn, task_b, claimer="b-origin")
+        assert claimed_a is not None and claimed_b is not None
+        action_a = kb.record_pending_action_and_block(
+            conn, task_id=task_a, run_id=claimed_a.current_run_id, command=command,
+            summary="A", profile="backend-eng", workspace=str(isolated_board),
+            expires_at=2_000_000_000, mutation_kind="execute-code-arbitrary",
+        )
+        # Only A owns an approval; B remains a regular active card with an
+        # otherwise identical command/profile/workspace context.
+        assert kb.approve_pending_action_and_unblock(conn, task_a, action_a["action_id"])
+        resumed_a = kb.claim_task(conn, task_a, claimer="a-resumed")
+        assert resumed_a is not None and resumed_a.current_run_id is not None
+        assert claimed_b.current_run_id is not None
+        a_before = kb.get_pending_action_by_id(conn, task_a, action_a["action_id"])
+        assert a_before is not None and (a_before.state, a_before.consumed_at) == ("approved", None)
+
+        assert not kb.consume_approved_action(
+            conn, command=command, task_id=task_b, run_id=claimed_b.current_run_id,
+            profile="backend-eng", workspace=str(isolated_board), mutation_kind="execute-code-arbitrary",
+        )
+        a_after_b_attempt = kb.get_pending_action_by_id(conn, task_a, action_a["action_id"])
+        task_b_after = kb.get_task(conn, task_b)
+        assert a_after_b_attempt is not None
+        assert (a_after_b_attempt.state, a_after_b_attempt.consumed_at, a_after_b_attempt.version) == (
+            "approved", None, a_before.version,
+        )
+        assert task_b_after is not None
+        assert (task_b_after.status, task_b_after.current_run_id) == ("running", claimed_b.current_run_id)
+        assert not [e for e in kb.list_events(conn, task_id=task_b) if e.kind == "terminal_approval_consumed"]
+
+        assert kb.consume_approved_action(
+            conn, command=command, task_id=task_a, run_id=resumed_a.current_run_id,
+            profile="backend-eng", workspace=str(isolated_board), mutation_kind="execute-code-arbitrary",
+        )
+        a_after = kb.get_pending_action_by_id(conn, task_a, action_a["action_id"])
+        assert a_after is not None
+        assert a_after.state == "consumed" and a_after.consumed_at is not None
+        assert a_after.version == a_before.version + 1
+        a_consume_events = [e for e in kb.list_events(conn, task_id=task_a) if e.kind == "terminal_approval_consumed"]
+        assert len(a_consume_events) == 1
+        assert (a_consume_events[0].payload["action_id"], a_consume_events[0].run_id) == (
+            action_a["action_id"], resumed_a.current_run_id,
+        )
+        assert not [e for e in kb.list_events(conn, task_id=task_b) if e.kind == "terminal_approval_consumed"]
+
+
+def test_safe_readonly_heredoc_is_durable_noop_snapshot(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import approval
+
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        run_id = kb.get_task(conn, task_id).current_run_id
+        before = _atomic_snapshot(conn, task_id, run_id)
+    record, queued = Mock(), Mock()
+    monkeypatch.setattr(approval, "_record_kanban_pending_action", record)
+    monkeypatch.setattr(approval, "submit_pending", queued)
+    command = "sh <<'SAFE_READ'\ncat -- '/etc/hosts'\nSAFE_READ\n"
+
+    result = approval.check_all_command_guards(command, "local")
+
+    assert result["guard_outcome"] == "retry_with_safe_alternative"
+    record.assert_not_called()
+    queued.assert_not_called()
+    with kb.connect() as conn:
+        assert _atomic_snapshot(conn, task_id, run_id) == before
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_terminal_safe_readonly_heredoc_returns_redacted_structured_response_before_environment(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch, force: bool,
+) -> None:
+    from tools import terminal_tool
+
+    command = "sh <<'SAFE_READ'\ncat -- '/etc/hosts'\nSAFE_READ\n"
+    monkeypatch.setattr(
+        terminal_tool, "_create_environment",
+        Mock(side_effect=AssertionError("environment creation must not run")),
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command, force=force))
+
+    assert result == {
+        "output": "",
+        "exit_code": -1,
+        "error": "Read-only audit recognized; use read_file.",
+        "status": "safe_alternative_required",
+        "outcome": "retry_with_safe_alternative",
+        "guard_outcome": "retry_with_safe_alternative",
+        "reason_code": "readonly-heredoc-audit",
+        "safe_alternative": {
+            "tool": "read_file",
+            "kind": "literal-file-inspection",
+            "execution": "not_run",
+        },
+    }
+    public = json.dumps(result)
+    assert command not in public and "/etc/hosts" not in public
+
+
+def test_guard_outcome_matrix_only_approval_required_is_durable(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import approval
+
+    task_id = _create_running_task(monkeypatch)
+    bounded = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    _configure_terminal_pending_guard(monkeypatch, bounded)
+    cases = {
+        "allow": "echo harmless",
+        "deny_hard": "rm -rf /",
+        "retry_with_safe_alternative": "sh <<'SAFE_READ'\ncat -- '/etc/hosts'\nSAFE_READ\n",
+        "approval_required": bounded,
+    }
+    outcomes = {name: approval.check_all_command_guards(command, "local") for name, command in cases.items()}
+
+    assert {name: result["guard_outcome"] for name, result in outcomes.items()} == {
+        "allow": "allow", "deny_hard": "deny_hard",
+        "retry_with_safe_alternative": "retry_with_safe_alternative",
+        "approval_required": "approval_required",
+    }
+    assert outcomes["deny_hard"].get("kanban_approval") is None
+    assert outcomes["retry_with_safe_alternative"].get("kanban_approval") is None
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_pending_actions WHERE task_id=?", (task_id,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE task_id=?", (task_id,)).fetchone()[0] == 1
+        assert len([event for event in kb.list_events(conn, task_id=task_id) if event.kind in {"terminal_approval_pending", "blocked"}]) == 2
+    retry = approval.check_all_command_guards(bounded, "local")
+    assert retry["guard_outcome"] == "approval_required"
+    assert retry["kanban_approval"]["reused"] is True
+
+
+@pytest.mark.parametrize(
+    ("command", "user_deny"),
+    [
+        ("rm -rf /", None),
+        ("publish forbidden artifact", "publish forbidden *"),
+        ("printf guessed-password | sudo -S id", None),
+    ],
+    ids=["hardline", "user-deny", "sudo-stdin"],
+)
+@pytest.mark.parametrize("force", [False, True], ids=["guarded", "forced"])
+def test_public_terminal_hard_denies_are_kanban_durable_noops(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch, command: str, user_deny: str | None,
+    force: bool,
+) -> None:
+    """B: unconditional terminal denials never enter the Kanban approval lifecycle."""
+    from tools import approval, terminal_tool
+
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+        before = _atomic_snapshot(conn, task_id, run_id)
+    if user_deny is not None:
+        monkeypatch.setattr(approval, "_get_approval_config", lambda: {"deny": [user_deny]})
+    record = Mock(wraps=approval._record_kanban_pending_action)
+    queued = Mock(wraps=approval.submit_pending)
+    lifecycle = Mock(wraps=kb._fire_kanban_lifecycle_hook)
+    monkeypatch.setattr(approval, "_record_kanban_pending_action", record)
+    monkeypatch.setattr(approval, "submit_pending", queued)
+    monkeypatch.setattr(kb, "_fire_kanban_lifecycle_hook", lifecycle)
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "local", "cwd": str(isolated_board), "timeout": 30})
+    monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda _cfg: False)
+    create_environment = Mock(side_effect=AssertionError("environment spawn"))
+    monkeypatch.setattr(terminal_tool, "_create_environment", create_environment)
+
+    result = json.loads(terminal_tool.terminal_tool(command, force=force))
+
+    assert (result["status"], result["outcome"], result["guard_outcome"]) == (
+        "blocked", "deny_hard", "deny_hard",
+    )
+    create_environment.assert_not_called()
+    record.assert_not_called()
+    queued.assert_not_called()
+    lifecycle.assert_not_called()
+    with kb.connect() as conn:
+        assert _atomic_snapshot(conn, task_id, run_id) == before
+
+
+def test_public_terminal_force_executes_bounded_approvable_command_once(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """force remains an internal confirmation for commands outside the deny floor."""
+    from tools import terminal_tool
+
+    command = "git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic"
+    fake_env = SimpleNamespace(
+        cwd=str(isolated_board),
+        execute=Mock(return_value={"output": "done", "returncode": 0}),
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_get_env_config",
+        lambda: {"env_type": "local", "cwd": str(isolated_board), "timeout": 30},
+    )
+    monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda _cfg: False)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_create_environment", lambda **_kwargs: fake_env)
+
+    forced = json.loads(terminal_tool.terminal_tool(command, force=True))
+
+    assert forced["exit_code"] == 0
+    fake_env.execute.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["print('é')\r\n", "print('e\u0301')\n", "print('é')\n "],
+    ids=["crlf", "nfd", "whitespace"],
+)
+def test_public_execute_code_variants_never_reuse_approved_exact_grant_and_later_consume_original_grant(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch, variant: str,
+) -> None:
+    """H: byte variants make their own durable request and cannot consume A."""
+    from tools import code_execution_tool, terminal_tool
+
+    code_a = "print('é')\n"
+    assert variant.encode("utf-8") != code_a.encode("utf-8")
+    monkeypatch.setattr(code_execution_tool, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "local"})
+    monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda _cfg: False)
+
+    task_id = _create_running_task(monkeypatch)
+    pending_a = json.loads(code_execution_tool.execute_code(code_a))
+    assert (pending_a["status"], pending_a["outcome"]) == ("pending_approval", "approval_required")
+    action_a_id = pending_a["kanban_approval"]["action_id"]
+    with kb.connect() as conn:
+        assert kb.approve_pending_action_and_unblock(conn, task_id, action_a_id)
+        resumed = kb.claim_task(conn, task_id, claimer="resumed-a")
+        assert resumed is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resumed.current_run_id))
+        a_before = kb.get_pending_action_by_id(conn, task_id, action_a_id)
+        assert a_before is not None and (a_before.state, a_before.consumed_at) == ("approved", None)
+
+    no_spawn = Mock(side_effect=AssertionError("local spawn"))
+    monkeypatch.setattr(code_execution_tool.tempfile, "mkdtemp", no_spawn)
+    pending_b = json.loads(code_execution_tool.execute_code(variant))
+    assert (pending_b["status"], pending_b["outcome"], pending_b["tool_calls_made"]) == ("pending_approval", "approval_required", 0)
+    assert code_a not in json.dumps(pending_b, ensure_ascii=False)
+    action_b_id = pending_b["kanban_approval"]["action_id"]
+    assert action_b_id != action_a_id and no_spawn.call_count == 0
+    with kb.connect() as conn:
+        action_a = kb.get_pending_action_by_id(conn, task_id, action_a_id)
+        action_b = kb.get_pending_action_by_id(conn, task_id, action_b_id)
+        assert action_a is not None and action_b is not None
+        assert (action_a.state, action_a.consumed_at, action_a.version) == ("approved", None, a_before.version)
+        assert action_a.command_hash != action_b.command_hash
+        assert (action_b.state, action_b.consumed_at) == ("pending", None)
+        assert action_b.version >= 1
+
+    with kb.connect() as conn:
+        action_a_before_resolution = kb.get_pending_action_by_id(conn, task_id, action_a_id)
+        action_b_before_resolution = kb.get_pending_action_by_id(conn, task_id, action_b_id)
+        assert action_a_before_resolution is not None and action_b_before_resolution is not None
+        assert kb.resolve_pending_action(conn, task_id, action_b_id)
+        action_a_after_resolution = kb.get_pending_action_by_id(conn, task_id, action_a_id)
+        action_b_after_resolution = kb.get_pending_action_by_id(conn, task_id, action_b_id)
+        assert action_a_after_resolution is not None and action_b_after_resolution is not None
+        assert (action_a_after_resolution.state, action_a_after_resolution.consumed_at, action_a_after_resolution.version) == (
+            action_a_before_resolution.state, action_a_before_resolution.consumed_at, action_a_before_resolution.version,
+        )
+        assert action_b_after_resolution.state == "resolved" and action_b_after_resolution.consumed_at is None
+        assert kb.unblock_task(conn, task_id)
+        resumed_after_variant = kb.claim_task(conn, task_id, claimer="resumed-a-after-variant")
+        assert resumed_after_variant is not None and resumed_after_variant.current_run_id is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resumed_after_variant.current_run_id))
+    with pytest.raises(AssertionError, match="local spawn"):
+        code_execution_tool.execute_code(code_a)
+    with kb.connect() as conn:
+        consumed = kb.get_pending_action_by_id(conn, task_id, action_a_id)
+        action_b_final = kb.get_pending_action_by_id(conn, task_id, action_b_id)
+        assert consumed is not None and action_b_final is not None
+        assert consumed.state == "consumed" and consumed.consumed_at is not None
+        assert consumed.version == action_a_before_resolution.version + 1
+        assert (action_b_final.state, action_b_final.consumed_at, action_b_final.version) == (
+            "resolved", None, action_b_after_resolution.version,
+        )
+        consume_events = [e for e in kb.list_events(conn, task_id=task_id) if e.kind == "terminal_approval_consumed"]
+        assert len(consume_events) == 1
+        assert (consume_events[0].payload["action_id"], consume_events[0].run_id) == (
+            action_a_id, resumed_after_variant.current_run_id,
+        )

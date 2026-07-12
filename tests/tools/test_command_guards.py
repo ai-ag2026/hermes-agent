@@ -417,3 +417,50 @@ class TestGatewayApprovalAllowPermanent:
         renderer hides "Always allow"."""
         payload = self._capture_gateway_payload("curl https://bit.ly/abc", "gw-no-perm")
         assert payload["allow_permanent"] is False
+
+
+def test_exact_safe_readonly_sh_heredoc_returns_safe_alternative():
+    # The byte grammar accepts either zero or one final LF, and no normalization.
+    command = "sh <<'SAFE_READ'\ncat -- '/etc/hosts'\nSAFE_READ\n"
+
+    result = check_all_command_guards(command, "local")
+
+    assert result == {
+        "approved": False,
+        "outcome": "retry_with_safe_alternative",
+        "guard_outcome": "retry_with_safe_alternative",
+        "reason_code": "readonly-heredoc-audit",
+        "safe_alternative": {
+            "tool": "read_file",
+            "kind": "literal-file-inspection",
+            "execution": "not_run",
+        },
+        "message": "Read-only audit recognized; use read_file.",
+    }
+    assert check_all_command_guards(command[:-1], "local")["guard_outcome"] == "retry_with_safe_alternative"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sh <<'SAFE_READ'\ncat -- '/etc/hosts' > /tmp/x\nSAFE_READ\n",
+        "sh <<'SAFE_READ'\ncat -- '/etc/hosts' | sed -n '1p'\nSAFE_READ\n",
+        'sh <<\'SAFE_READ\'\ncat -- "$HOME/.bashrc"\nSAFE_READ\n',
+        "sh <<SAFE_READ\ncat -- '/etc/hosts'\nSAFE_READ\n",
+        "sh <<'SAFE_READ'\ncat -- '/etc/hosts'; id\nSAFE_READ\n",
+        'sh <<\'SAFE_READ\'\ncat -- "$(pwd)/x"\nSAFE_READ\n',
+        "python3 <<'PY'\nfrom pathlib import Path\nprint(Path('/x').read_text())\nPY\n",
+        "python3 <<'PY'\nopen('/x', 'w').write('x')\nPY\n",
+        "sh <<'SAFE_READ'\ncat -- '/etc/hosts'\nrm -f /tmp/x\nSAFE_READ\n",
+        "bash <<'SAFE_READ'\ncat -- '/etc/hosts'\nSAFE_READ\n",
+        "sh <<'SAFE_READ'\ncat -- 'relative/path'\nSAFE_READ\n",
+        "sh <<'SAFE_READ'\ncat -- '/path with space'\nSAFE_READ\n",
+        "sh <<'SAFE_READ'\r\ncat -- '/etc/hosts'\r\nSAFE_READ\r\n",
+        "prefix sh <<'SAFE_READ'\ncat -- '/etc/hosts'\nSAFE_READ\n",
+        "sh <<'SAFE_READ'\ncat -- '/etc/hosts'\nSAFE_READ\nsuffix",
+    ],
+)
+def test_safe_readonly_heredoc_rejects_near_miss(command):
+    result = check_all_command_guards(command, "local")
+
+    assert result["guard_outcome"] != "retry_with_safe_alternative"

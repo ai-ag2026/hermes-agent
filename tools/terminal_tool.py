@@ -254,6 +254,8 @@ def _reset_cached_sudo_passwords() -> None:
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
+    _check_non_overridable_deny_floor,
+    _match_safe_readonly_heredoc,
 )
 
 
@@ -2069,6 +2071,88 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
+        # force is a confirmation for approvable commands, never a bypass for
+        # hardline, sudo-stdin, or explicit user-deny policy. This narrow
+        # central floor runs before environment creation; force=False retains
+        # the existing single full-guard pass below.
+        if force:
+            deny_floor = _check_non_overridable_deny_floor(command)
+            if deny_floor is not None:
+                outcome = "deny_hard"
+                return json.dumps({
+                    "output": "", "exit_code": -1,
+                    "error": deny_floor.get("message") or "Command denied by approval guard.",
+                    "status": "blocked", "outcome": outcome,
+                    "guard_outcome": outcome,
+                }, ensure_ascii=False)
+
+        # Non-forced commands take exactly one central full-guard pass before
+        # any environment work. This preserves the central policy and its
+        # container shortcuts while keeping hard denials out of spawn.
+        _candidate_guard = None
+        if not force:
+            _candidate_guard = _check_all_guards(
+                command, env_type, has_host_access=_docker_has_host_access(config),
+            )
+            if not _candidate_guard.get("approved", False):
+                outcome = _candidate_guard.get("guard_outcome") or _candidate_guard.get("outcome")
+                if outcome == "approval_required":
+                    return json.dumps({
+                        "output": "", "exit_code": -1, "error": "",
+                        "status": "pending_approval", "approval_pending": True,
+                        "description": _candidate_guard.get("description", "command flagged"),
+                        "pattern_key": _candidate_guard.get("pattern_key", ""),
+                        "kanban_approval": _candidate_guard.get("kanban_approval"),
+                        "mutation_kind": _candidate_guard.get("mutation_kind"), "outcome": outcome,
+                    }, ensure_ascii=False)
+                if outcome == "retry_with_safe_alternative":
+                    return json.dumps({
+                        "output": "", "exit_code": -1,
+                        "error": _candidate_guard.get("message", ""),
+                        "status": "safe_alternative_required", "outcome": outcome,
+                        "guard_outcome": outcome,
+                        "reason_code": _candidate_guard.get("reason_code"),
+                        "safe_alternative": _candidate_guard.get("safe_alternative"),
+                    }, ensure_ascii=False)
+                desc = _candidate_guard.get("description", "command flagged")
+                return json.dumps({
+                    "output": "", "exit_code": -1,
+                    "error": _candidate_guard.get("message") or (
+                        f"Command denied: {desc}. Use the approval prompt to allow it, "
+                        "or rephrase the command."
+                    ),
+                    "status": "blocked", "outcome": outcome or "deny_hard",
+                    "guard_outcome": outcome or "deny_hard",
+                }, ensure_ascii=False)
+
+        # The private matcher is only a candidate fast path.  Central command
+        # guards remain the sole policy decision and run before any environment
+        # or subprocess machinery can be created; force never overrides a
+        # hard-deny for this recognized candidate.
+        _safe_candidate = _match_safe_readonly_heredoc(command) is not None
+        if _safe_candidate:
+            if _candidate_guard is None:
+                _candidate_guard = _check_all_guards(
+                    command, env_type, has_host_access=_docker_has_host_access(config),
+                )
+            _candidate_outcome = _candidate_guard.get("guard_outcome") or _candidate_guard.get("outcome")
+            if _candidate_outcome == "retry_with_safe_alternative":
+                return json.dumps({
+                    "output": "", "exit_code": -1,
+                    "error": _candidate_guard.get("message", "Read-only audit recognized; use read_file."),
+                    "status": "safe_alternative_required",
+                    "outcome": _candidate_outcome,
+                    "guard_outcome": _candidate_outcome,
+                    "reason_code": _candidate_guard.get("reason_code"),
+                    "safe_alternative": _candidate_guard.get("safe_alternative"),
+                }, ensure_ascii=False)
+            if not _candidate_guard.get("approved", False):
+                return json.dumps({
+                    "output": "", "exit_code": -1,
+                    "error": _candidate_guard.get("message") or "Command denied by approval guard.",
+                    "status": "error", "outcome": _candidate_outcome or "deny_hard",
+                }, ensure_ascii=False)
+
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
@@ -2280,24 +2364,26 @@ def terminal_tool(
         # an approved command can't be SIGINT-killed by a bit that landed during
         # the approval-wait (see clear_current_thread_interrupt).
         _approved_run = bool(force)
-        if not force:
+        if _candidate_guard is None and not force:
             approval = _check_all_guards(
                 command, env_type,
                 has_host_access=_docker_has_host_access(config),
             )
             if not approval["approved"]:
-                # Check if this is an approval_required (gateway ask mode)
-                if approval.get("status") == "pending_approval":
+                outcome = approval.get("guard_outcome") or approval.get("outcome")
+                if outcome == "approval_required":
                     return json.dumps({
-                        "output": "",
-                        "exit_code": -1,
-                        "error": "",
-                        "status": "pending_approval",
-                        "approval_pending": True,
-                        "command": approval.get("command", command),
+                        "output": "", "exit_code": -1, "error": "",
+                        "status": "pending_approval", "approval_pending": True,
                         "description": approval.get("description", "command flagged"),
                         "pattern_key": approval.get("pattern_key", ""),
+                        "kanban_approval": approval.get("kanban_approval"),
+                        "mutation_kind": approval.get("mutation_kind"), "outcome": outcome,
                     }, ensure_ascii=False)
+                if outcome == "retry_with_safe_alternative":
+                    return json.dumps({"output": "", "exit_code": -1,
+                                       "error": approval.get("message", ""),
+                                       "status": "safe_alternative_required", "outcome": outcome}, ensure_ascii=False)
                 # Command was blocked
                 desc = approval.get("description", "command flagged")
                 fallback_msg = (

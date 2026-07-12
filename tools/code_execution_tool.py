@@ -1159,11 +1159,21 @@ def execute_code(
         has_host_access=_docker_has_host_access(_env_config),
     )
     if not _guard.get("approved", False):
+        outcome = _guard.get("guard_outcome") or _guard.get("outcome")
+        if outcome == "approval_required":
+            return json.dumps({
+                "status": "pending_approval", "approval_pending": True,
+                "error": "", "tool_calls_made": 0, "duration_seconds": 0,
+                "kanban_approval": _guard.get("kanban_approval"),
+                "mutation_kind": _guard.get("mutation_kind"),
+                "outcome": outcome,
+            }, ensure_ascii=False)
+        if outcome == "retry_with_safe_alternative":
+            return json.dumps({"status": "safe_alternative_required", "error": _guard.get("message", ""),
+                               "tool_calls_made": 0, "duration_seconds": 0, "outcome": outcome}, ensure_ascii=False)
         return json.dumps({
-            "status": "error",
-            "error": _guard.get("message") or "execute_code blocked by approval guard.",
-            "tool_calls_made": 0,
-            "duration_seconds": 0,
+            "status": "error", "error": _guard.get("message") or "execute_code blocked by approval guard.",
+            "tool_calls_made": 0, "duration_seconds": 0, "outcome": outcome or "deny_hard",
         }, ensure_ascii=False)
 
     # Clean interrupt slate for a user-approved script before EITHER dispatch
