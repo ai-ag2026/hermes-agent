@@ -820,6 +820,38 @@ class UpdateTaskBody(BaseModel):
     metadata: Optional[dict] = None
 
 
+class ApproveTerminalActionBody(BaseModel):
+    action_id: int
+
+
+@router.post("/tasks/{task_id}/approve-terminal-action")
+def approve_terminal_action(
+    task_id: str,
+    payload: ApproveTerminalActionBody,
+    board: Optional[str] = Query(None),
+):
+    """Approve one exact durable terminal action and resume its card."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        action = kanban_db.get_pending_action(conn, task_id)
+        if action is None or action.id != payload.action_id:
+            raise HTTPException(
+                status_code=409,
+                detail="terminal action is missing, expired, changed, or already consumed",
+            )
+        if not kanban_db.approve_pending_action_and_unblock(
+            conn, task_id, payload.action_id, actor="dashboard",
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="terminal action cannot be approved from the current task state",
+            )
+        return {"ok": True, "task_id": task_id, "action_id": payload.action_id}
+    finally:
+        conn.close()
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -843,6 +875,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
+            pending_action = kanban_db.get_pending_action(conn, task_id)
+            if pending_action is not None and s not in ("blocked", "archived"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This card is waiting for an exact terminal action approval; "
+                        "use approve-terminal-action before changing its status"
+                    ),
+                )
             ok = True
             try:
                 if s == "done":
@@ -1035,6 +1076,9 @@ def _set_status_direct(
     must first run ``kanban gate <id> off``.
     """
     with kanban_db.write_txn(conn):
+        if new_status not in ("blocked", "archived"):
+            if kanban_db.get_pending_action(conn, task_id) is not None:
+                return False
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
             "SELECT status, current_run_id FROM tasks WHERE id = ?",

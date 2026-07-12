@@ -1220,12 +1220,15 @@ class PendingAction:
     task_id: str
     run_id: Optional[int]
     command_hash: str
+    fingerprint: str
+    mutation_kind: str
     summary: str
     profile: str
     workspace: str
     expires_at: int
     approved_at: Optional[int] = None
     consumed_at: Optional[int] = None
+    cancelled_at: Optional[int] = None
 
 
 @dataclass
@@ -1418,13 +1421,16 @@ CREATE TABLE IF NOT EXISTS task_pending_actions (
     task_id      TEXT NOT NULL,
     run_id       INTEGER,
     command_hash TEXT NOT NULL,
+    fingerprint  TEXT,
+    mutation_kind TEXT,
     summary      TEXT NOT NULL,
     profile      TEXT NOT NULL,
     workspace    TEXT NOT NULL,
     created_at   INTEGER NOT NULL,
     expires_at   INTEGER NOT NULL,
     approved_at  INTEGER,
-    consumed_at  INTEGER
+    consumed_at  INTEGER,
+    cancelled_at INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_actions_task
@@ -2260,6 +2266,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
+    action_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(task_pending_actions)")
+    }
+    if action_cols and "fingerprint" not in action_cols:
+        _add_column_if_missing(
+            conn, "task_pending_actions", "fingerprint", "fingerprint TEXT"
+        )
+    if action_cols and "mutation_kind" not in action_cols:
+        _add_column_if_missing(
+            conn, "task_pending_actions", "mutation_kind", "mutation_kind TEXT"
+        )
+    if action_cols and "cancelled_at" not in action_cols:
+        _add_column_if_missing(
+            conn, "task_pending_actions", "cancelled_at", "cancelled_at INTEGER"
+        )
+
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
@@ -4139,6 +4161,29 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # A raw status write, stale client, or old automation must not bypass an
+        # unresolved exact-action gate. Only the combined approve+unblock path
+        # can leave an approved grant on a ready task.
+        unresolved_action = conn.execute(
+            "SELECT id FROM task_pending_actions WHERE task_id = ? "
+            "AND approved_at IS NULL AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, now),
+        ).fetchone()
+        if unresolved_action is not None:
+            moved = conn.execute(
+                "UPDATE tasks SET status='blocked', claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL "
+                "WHERE id=? AND status='ready'",
+                (task_id,),
+            )
+            if moved.rowcount:
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "terminal_approval_pending",
+                     "action_id": int(unresolved_action["id"])},
+                )
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -7169,8 +7214,107 @@ def _assert_human_gate_open(
         (task_id,),
     )
     return True
+
+def _normalise_pending_action_command(command: str) -> str:
+    """Return the byte-preserving command representation used for approval.
+
+    Exact-action approval must distinguish every UTF-8 byte sequence that the
+    target shell or filesystem can distinguish. In particular, Unicode NFC/NFD
+    path spellings and CRLF/LF are not interchangeable on Linux. Shell quoting,
+    whitespace, wrappers, environment prefixes, refs, leases, and line endings
+    therefore all remain untouched.
+    """
+    return str(command)
+
+
 def _pending_action_hash(command: str) -> str:
-    return hashlib.sha256(command.encode("utf-8")).hexdigest()
+    canonical = _normalise_pending_action_command(command)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _pending_action_mutation_kind(command: str) -> str:
+    canonical = _normalise_pending_action_command(command)
+    lower = canonical.lower()
+    if re.search(r"\bgit\s+push\b", lower):
+        plain_force = bool(re.search(r"(?:^|\s)(?:--force|-f)(?:\s|$)", lower))
+        leased = "--force-with-lease" in lower
+        if leased and not re.search(
+            r"--force-with-lease=[^\s:]+:[0-9a-f]{7,64}(?:\s|$)", lower,
+        ):
+            raise ValueError(
+                "force-with-lease approval requires exact --force-with-lease=<ref>:<old-sha>"
+            )
+        if plain_force:
+            raise ValueError("plain git push --force is not approvable; use exact --force-with-lease=<ref>:<old-sha>")
+        return "git-push-force-with-lease" if leased else "git-push"
+    return "terminal-command"
+
+
+def _pending_action_board_identity(conn: sqlite3.Connection) -> str:
+    row = next(
+        (r for r in conn.execute("PRAGMA database_list") if r["name"] == "main"),
+        None,
+    )
+    raw = str(row["file"] if row is not None else "")
+    return str(Path(raw).resolve()) if raw else "memory"
+
+
+def _pending_action_fingerprint(
+    *,
+    board_identity: str,
+    task_id: str,
+    run_id: Optional[int],
+    command_hash: str,
+    mutation_kind: str,
+    profile: str,
+    workspace: str,
+    expires_at: int,
+) -> str:
+    manifest = {
+        "version": 1,
+        "board": board_identity,
+        "task_id": task_id,
+        "origin_run_id": run_id,
+        "command_hash": command_hash,
+        "mutation_kind": mutation_kind,
+        "profile": profile,
+        "workspace": workspace,
+        "expires_at": int(expires_at),
+    }
+    payload = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _pending_action_from_row(row: sqlite3.Row) -> PendingAction:
+    return PendingAction(
+        id=int(row["id"]), task_id=row["task_id"], run_id=row["run_id"],
+        command_hash=row["command_hash"],
+        fingerprint=row["fingerprint"] or "",
+        mutation_kind=row["mutation_kind"] or "terminal-command",
+        summary=row["summary"], profile=row["profile"], workspace=row["workspace"],
+        expires_at=int(row["expires_at"]),
+        approved_at=row["approved_at"], consumed_at=row["consumed_at"],
+        cancelled_at=row["cancelled_at"],
+    )
+
+
+def _pending_action_fingerprint_valid(
+    conn: sqlite3.Connection, row: sqlite3.Row,
+) -> bool:
+    fingerprint = str(row["fingerprint"] or "")
+    if not fingerprint:
+        return False
+    expected = _pending_action_fingerprint(
+        board_identity=_pending_action_board_identity(conn),
+        task_id=row["task_id"],
+        run_id=int(row["run_id"]),
+        command_hash=row["command_hash"],
+        mutation_kind=row["mutation_kind"] or "terminal-command",
+        profile=row["profile"],
+        workspace=row["workspace"],
+        expires_at=int(row["expires_at"]),
+    )
+    return secrets.compare_digest(fingerprint, expected)
 
 
 def record_pending_action(
@@ -7187,36 +7331,84 @@ def record_pending_action(
     """Persist an exact action fingerprint without storing raw command text."""
     now = int(time.time())
     command_hash = _pending_action_hash(command)
-    summary = (summary or "terminal command approval")[:500]
+    mutation_kind = _pending_action_mutation_kind(command)
+    try:
+        from agent.redact import redact_sensitive_text  # type: ignore[import-not-found]
+
+        summary = redact_sensitive_text(summary or "terminal command approval")
+    except Exception:
+        summary = summary or "terminal command approval"
+    summary = summary[:500]
     profile = profile or "default"
     workspace = str(Path(workspace).resolve())
+    expires_at = int(expires_at)
+    if expires_at <= now:
+        raise ValueError("pending action expiry must be in the future")
+    fingerprint = _pending_action_fingerprint(
+        board_identity=_pending_action_board_identity(conn),
+        task_id=task_id,
+        run_id=run_id,
+        command_hash=command_hash,
+        mutation_kind=mutation_kind,
+        profile=profile,
+        workspace=workspace,
+        expires_at=expires_at,
+    )
     with write_txn(conn):
-        conn.execute(
-            "UPDATE task_pending_actions SET consumed_at = ? "
-            "WHERE task_id = ? AND consumed_at IS NULL",
-            (now, task_id),
-        )
+        task = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if task is None:
+            raise ValueError(f"task {task_id!r} does not exist")
+        if task["status"] != "running" or task["current_run_id"] != run_id:
+            raise ValueError("pending action must be recorded by the task's current run")
+        existing = conn.execute(
+            "SELECT * FROM task_pending_actions WHERE task_id = ? AND run_id = ? "
+            "AND command_hash = ? AND fingerprint = ? AND profile = ? AND workspace = ? "
+            "AND approved_at IS NULL AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, run_id, command_hash, fingerprint, profile, workspace, now),
+        ).fetchone()
+        if existing is not None:
+            return _pending_action_from_row(existing)
+        superseded = conn.execute(
+            "SELECT id FROM task_pending_actions WHERE task_id = ? "
+            "AND consumed_at IS NULL AND cancelled_at IS NULL",
+            (task_id,),
+        ).fetchall()
+        for old in superseded:
+            conn.execute(
+                "UPDATE task_pending_actions SET cancelled_at = ? WHERE id = ? "
+                "AND consumed_at IS NULL AND cancelled_at IS NULL",
+                (now, int(old["id"])),
+            )
+            _append_event(
+                conn, task_id, "terminal_approval_cancelled",
+                {"action_id": int(old["id"]), "reason": "superseded"},
+                run_id=run_id,
+            )
         cur = conn.execute(
             "INSERT INTO task_pending_actions "
-            "(task_id, run_id, command_hash, summary, profile, workspace, "
-            "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (task_id, run_id, command_hash, summary, profile, workspace,
-             now, int(expires_at)),
+            "(task_id, run_id, command_hash, fingerprint, mutation_kind, summary, profile, workspace, "
+            "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, run_id, command_hash, fingerprint, mutation_kind, summary,
+             profile, workspace, now, expires_at),
         )
         if cur.lastrowid is None:
             raise RuntimeError("failed to persist pending action")
         action_id = int(cur.lastrowid)
         _append_event(
             conn, task_id, "terminal_approval_pending",
-            {"action_id": action_id, "command_hash": command_hash,
+            {"action_id": action_id, "mutation_kind": mutation_kind,
              "summary": summary, "profile": profile, "workspace": workspace,
-             "expires_at": int(expires_at)},
+             "expires_at": expires_at},
             run_id=run_id,
         )
     return PendingAction(
         id=action_id, task_id=task_id, run_id=run_id,
-        command_hash=command_hash, summary=summary, profile=profile,
-        workspace=workspace, expires_at=int(expires_at),
+        command_hash=command_hash, fingerprint=fingerprint,
+        mutation_kind=mutation_kind, summary=summary, profile=profile,
+        workspace=workspace, expires_at=expires_at,
     )
 
 
@@ -7226,45 +7418,61 @@ def get_pending_action(
     now = int(time.time()) if now is None else int(now)
     row = conn.execute(
         "SELECT * FROM task_pending_actions WHERE task_id = ? "
-        "AND consumed_at IS NULL AND expires_at >= ? ORDER BY id DESC LIMIT 1",
+        "AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ? ORDER BY id DESC LIMIT 1",
         (task_id, now),
     ).fetchone()
     if row is None:
         return None
-    return PendingAction(
-        id=int(row["id"]), task_id=row["task_id"], run_id=row["run_id"],
-        command_hash=row["command_hash"], summary=row["summary"],
-        profile=row["profile"], workspace=row["workspace"],
-        expires_at=int(row["expires_at"]), approved_at=row["approved_at"],
-        consumed_at=row["consumed_at"],
-    )
+    return _pending_action_from_row(row)
+
+
+def get_pending_action_by_id(
+    conn: sqlite3.Connection, task_id: str, action_id: int,
+) -> Optional[PendingAction]:
+    """Return an action for API conflict/gone classification, including history."""
+    row = conn.execute(
+        "SELECT * FROM task_pending_actions WHERE task_id = ? AND id = ?",
+        (task_id, int(action_id)),
+    ).fetchone()
+    return _pending_action_from_row(row) if row is not None else None
 
 
 def approve_pending_action(
     conn: sqlite3.Connection, task_id: str, action_id: int,
-    *, now: Optional[int] = None,
+    *, now: Optional[int] = None, actor: str = "operator",
 ) -> bool:
     """Grant one exact pending action; replay and expired grants fail closed."""
     now = int(time.time()) if now is None else int(now)
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT a.* FROM task_pending_actions a "
+            "JOIN tasks t ON t.id = a.task_id "
+            "JOIN task_runs r ON r.id = a.run_id AND r.task_id = a.task_id "
+            "WHERE a.id = ? AND a.task_id = ? AND a.approved_at IS NULL "
+            "AND a.consumed_at IS NULL AND a.cancelled_at IS NULL AND a.expires_at > ? "
+            "AND t.status = 'blocked' AND r.outcome = 'blocked'",
+            (int(action_id), task_id, now),
+        ).fetchone()
+        if row is None or not _pending_action_fingerprint_valid(conn, row):
+            return False
         cur = conn.execute(
             "UPDATE task_pending_actions SET approved_at = ? "
-            "WHERE id = ? AND task_id = ? AND approved_at IS NULL "
-            "AND consumed_at IS NULL AND expires_at >= ?",
-            (now, int(action_id), task_id, now),
+            "WHERE id = ? AND task_id = ? AND fingerprint = ? "
+            "AND approved_at IS NULL AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ?",
+            (now, int(action_id), task_id, row["fingerprint"], now),
         )
         if cur.rowcount != 1:
             return False
         _append_event(
             conn, task_id, "terminal_approval_granted",
-            {"action_id": int(action_id)},
+            {"action_id": int(action_id), "actor": actor},
         )
         return True
 
 
 def approve_pending_action_and_unblock(
     conn: sqlite3.Connection, task_id: str, action_id: int,
-    *, now: Optional[int] = None,
+    *, now: Optional[int] = None, actor: str = "operator",
 ) -> bool:
     """Atomically grant one exact action and return its blocked card to work."""
     now = int(time.time()) if now is None else int(now)
@@ -7272,14 +7480,17 @@ def approve_pending_action_and_unblock(
         task = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        if task is None or task["status"] != "blocked":
+        if task is None or task["status"] not in ("blocked", "triage", "todo", "ready"):
             return False
         action = conn.execute(
-            "SELECT id FROM task_pending_actions WHERE id = ? AND task_id = ? "
-            "AND approved_at IS NULL AND consumed_at IS NULL AND expires_at >= ?",
+            "SELECT a.* FROM task_pending_actions a "
+            "JOIN task_runs r ON r.id = a.run_id AND r.task_id = a.task_id "
+            "WHERE a.id = ? AND a.task_id = ? AND a.approved_at IS NULL "
+            "AND a.consumed_at IS NULL AND a.cancelled_at IS NULL AND a.expires_at > ? "
+            "AND r.outcome = 'blocked'",
             (int(action_id), task_id, now),
         ).fetchone()
-        if action is None:
+        if action is None or not _pending_action_fingerprint_valid(conn, action):
             return False
         undone_parent = conn.execute(
             "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
@@ -7287,10 +7498,14 @@ def approve_pending_action_and_unblock(
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parent else "ready"
-        conn.execute(
-            "UPDATE task_pending_actions SET approved_at = ? WHERE id = ?",
-            (now, int(action_id)),
+        cur = conn.execute(
+            "UPDATE task_pending_actions SET approved_at = ? "
+            "WHERE id = ? AND fingerprint = ? AND approved_at IS NULL "
+            "AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ?",
+            (now, int(action_id), action["fingerprint"], now),
         )
+        if cur.rowcount != 1:
+            return False
         conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL WHERE id = ?",
@@ -7298,11 +7513,12 @@ def approve_pending_action_and_unblock(
         )
         _append_event(
             conn, task_id, "terminal_approval_granted",
-            {"action_id": int(action_id)},
+            {"action_id": int(action_id), "actor": actor},
         )
         _append_event(
             conn, task_id, "unblocked",
-            {"status": new_status, "terminal_action_id": int(action_id)},
+            {"status": new_status, "terminal_action_id": int(action_id),
+             "actor": actor},
         )
         return True
 
@@ -7311,37 +7527,87 @@ def consume_approved_action(
     conn: sqlite3.Connection,
     *,
     task_id: str,
+    run_id: int,
     command: str,
     profile: str,
     workspace: str,
     now: Optional[int] = None,
 ) -> bool:
-    """Atomically consume a grant only for the identical worker action."""
+    """Atomically consume a grant from the currently running resumed attempt."""
     now = int(time.time()) if now is None else int(now)
     command_hash = _pending_action_hash(command)
+    mutation_kind = _pending_action_mutation_kind(command)
     workspace = str(Path(workspace).resolve())
     with write_txn(conn):
         row = conn.execute(
-            "SELECT id FROM task_pending_actions WHERE task_id = ? "
-            "AND command_hash = ? AND profile = ? AND workspace = ? "
-            "AND approved_at IS NOT NULL AND consumed_at IS NULL "
-            "AND expires_at >= ? ORDER BY id DESC LIMIT 1",
-            (task_id, command_hash, profile or "default", workspace, now),
+            "SELECT a.* FROM task_pending_actions a "
+            "JOIN tasks t ON t.id = a.task_id "
+            "JOIN task_runs origin ON origin.id = a.run_id AND origin.task_id = a.task_id "
+            "JOIN task_runs active ON active.id = ? AND active.task_id = a.task_id "
+            "WHERE a.task_id = ? AND a.command_hash = ? AND a.mutation_kind = ? "
+            "AND a.profile = ? AND a.workspace = ? AND a.approved_at IS NOT NULL "
+            "AND a.consumed_at IS NULL AND a.cancelled_at IS NULL AND a.expires_at > ? "
+            "AND t.status = 'running' AND t.current_run_id = active.id "
+            "AND active.status = 'running' AND active.ended_at IS NULL "
+            "AND active.profile = a.profile AND origin.outcome = 'blocked' "
+            "ORDER BY a.id DESC LIMIT 1",
+            (int(run_id), task_id, command_hash, mutation_kind,
+             profile or "default", workspace, now),
         ).fetchone()
         if row is None:
             return False
+        expected_fingerprint = _pending_action_fingerprint(
+            board_identity=_pending_action_board_identity(conn),
+            task_id=task_id,
+            run_id=row["run_id"],
+            command_hash=command_hash,
+            mutation_kind=mutation_kind,
+            profile=profile or "default",
+            workspace=workspace,
+            expires_at=int(row["expires_at"]),
+        )
+        if not row["fingerprint"] or not secrets.compare_digest(
+            str(row["fingerprint"]), expected_fingerprint
+        ):
+            return False
         cur = conn.execute(
             "UPDATE task_pending_actions SET consumed_at = ? "
-            "WHERE id = ? AND consumed_at IS NULL",
-            (now, int(row["id"])),
+            "WHERE id = ? AND fingerprint = ? AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ?",
+            (now, int(row["id"]), expected_fingerprint, now),
         )
         if cur.rowcount != 1:
             return False
         _append_event(
             conn, task_id, "terminal_approval_consumed",
-            {"action_id": int(row["id"]), "command_hash": command_hash},
+            {"action_id": int(row["id"]), "run_id": int(run_id)},
+            run_id=int(run_id),
         )
         return True
+
+
+def _cancel_approved_pending_action(
+    conn: sqlite3.Connection, task_id: str, *, now: int,
+    reason: str, run_id: Optional[int],
+) -> None:
+    """Cancel granted-but-unexecuted actions when their resumed run re-blocks."""
+    rows = conn.execute(
+        "SELECT id FROM task_pending_actions WHERE task_id = ? "
+        "AND approved_at IS NOT NULL AND consumed_at IS NULL "
+        "AND cancelled_at IS NULL AND expires_at > ?",
+        (task_id, int(now)),
+    ).fetchall()
+    for row in rows:
+        cur = conn.execute(
+            "UPDATE task_pending_actions SET cancelled_at = ? "
+            "WHERE id = ? AND consumed_at IS NULL AND cancelled_at IS NULL",
+            (int(now), int(row["id"])),
+        )
+        if cur.rowcount == 1:
+            _append_event(
+                conn, task_id, "terminal_approval_cancelled",
+                {"action_id": int(row["id"]), "reason": reason},
+                run_id=run_id,
+            )
 
 
 def block_task(
@@ -7461,6 +7727,13 @@ def block_task(
                 status="blocked",
                 summary=reason,
             )
+            _cancel_approved_pending_action(
+                conn,
+                task_id,
+                now=int(time.time()),
+                reason="resumed_run_reblocked",
+                run_id=run_id,
+            )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
@@ -7485,6 +7758,7 @@ def block_task(
 
     routed_to = "blocked"
     recurrences = 0
+    now = int(time.time())
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -7511,7 +7785,7 @@ def block_task(
 
         pending_terminal_action = (
             kind == "needs_input"
-            and get_pending_action(conn, task_id) is not None
+            and get_pending_action(conn, task_id, now=now) is not None
         )
         if recurrences >= BLOCK_RECURRENCE_LIMIT and not pending_terminal_action:
             # Loop detected — stop letting the unblocker spin this task. Route
@@ -7538,6 +7812,10 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+            )
+            _cancel_approved_pending_action(
+                conn, task_id, now=now,
+                reason="resumed_run_reblocked", run_id=run_id,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -7598,6 +7876,10 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+            )
+            _cancel_approved_pending_action(
+                conn, task_id, now=now,
+                reason="resumed_run_reblocked", run_id=run_id,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
@@ -7670,6 +7952,15 @@ def promote_task(
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
         )
+
+    now = int(time.time())
+    pending_action = conn.execute(
+        "SELECT 1 FROM task_pending_actions WHERE task_id = ? "
+        "AND approved_at IS NULL AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at > ? LIMIT 1",
+        (task_id, now),
+    ).fetchone()
+    if pending_action is not None:
+        return False, "exact terminal action approval is still pending"
 
     if not force:
         parents = conn.execute(
@@ -7756,7 +8047,7 @@ def unblock_task(
         gated = _assert_human_gate_open(conn, task_id, token=token, action="unblock")
         pending_action = conn.execute(
             "SELECT 1 FROM task_pending_actions WHERE task_id = ? "
-            "AND consumed_at IS NULL AND expires_at >= ? LIMIT 1",
+            "AND consumed_at IS NULL AND cancelled_at IS NULL AND expires_at >= ? LIMIT 1",
             (task_id, now),
         ).fetchone()
         if pending_action is not None:
@@ -7853,6 +8144,9 @@ def specify_triage_task(
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        if get_pending_action(conn, task_id) is not None:
+            # Stale status projection must not erase exact-action attention.
+            return False
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -8016,6 +8310,8 @@ def decompose_triage_task(
     now = int(time.time())
     child_ids: list[str] = []
     with write_txn(conn):
+        if get_pending_action(conn, task_id, now=now) is not None:
+            return None
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
@@ -8191,6 +8487,21 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        now = int(time.time())
+        pending = conn.execute(
+            "SELECT id FROM task_pending_actions WHERE task_id=? AND consumed_at IS NULL AND cancelled_at IS NULL",
+            (task_id,),
+        ).fetchall()
+        for action in pending:
+            conn.execute(
+                "UPDATE task_pending_actions SET cancelled_at=? WHERE id=? "
+                "AND consumed_at IS NULL AND cancelled_at IS NULL",
+                (now, int(action["id"])),
+            )
+            _append_event(
+                conn, task_id, "terminal_approval_cancelled",
+                {"action_id": int(action["id"]), "reason": "task_archived"},
+            )
         # If archive happened while a run was still in flight (e.g. user
         # archived a running task from the dashboard), close that run with
         # outcome='reclaimed' so attempt history isn't orphaned.
@@ -11346,15 +11657,6 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
-
-    # GitHub CLI auth is operator-scoped, not Hermes-profile-scoped. Reuse the
-    # existing gh config directory by reference (never copy tokens into a
-    # worker profile, task metadata, or subprocess argv). An explicit
-    # GH_CONFIG_DIR remains authoritative.
-    if not env.get("GH_CONFIG_DIR"):
-        gh_config_dir = Path.home() / ".config" / "gh"
-        if gh_config_dir.is_dir():
-            env["GH_CONFIG_DIR"] = str(gh_config_dir)
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the

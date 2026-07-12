@@ -73,7 +73,7 @@ def test_exact_terminal_action_requires_combined_approval_and_resume(client, tmp
             conn,
             task_id=task["id"],
             run_id=claimed.current_run_id,
-            command="git push --force-with-lease fork HEAD:topic",
+            command="git push --force-with-lease=refs/heads/topic:abcdef1 fork HEAD:topic",
             summary="git push --force-with-lease to topic",
             profile="backend-eng",
             workspace=str(workspace),

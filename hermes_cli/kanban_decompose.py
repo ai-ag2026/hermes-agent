@@ -283,11 +283,16 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        pending_action = kb.get_pending_action(conn, task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+    if pending_action is not None:
+        return DecomposeOutcome(
+            task_id, False, "task has unresolved exact terminal action approval"
         )
 
     cfg = _load_config()
@@ -525,4 +530,7 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+        return [
+            row.id for row in rows
+            if kb.get_pending_action(conn, row.id) is None
+        ]

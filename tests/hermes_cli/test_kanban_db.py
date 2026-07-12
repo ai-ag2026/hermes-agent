@@ -222,6 +222,21 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
             created_at INTEGER NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE task_pending_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            run_id INTEGER,
+            command_hash TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            profile TEXT NOT NULL,
+            workspace TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            approved_at INTEGER,
+            consumed_at INTEGER
+        )
+    """)
     conn.execute(
         "INSERT INTO tasks (id, title, status, created_at) "
         "VALUES ('legacy', 'old board task', 'ready', 1)"
@@ -237,6 +252,10 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
             row["name"]
             for row in migrated.execute("PRAGMA table_info(task_events)")
         }
+        action_columns = {
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(task_pending_actions)")
+        }
         indexes = {
             row["name"]
             for row in migrated.execute(
@@ -249,6 +268,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
     assert "run_id" in event_columns
+    assert {"fingerprint", "mutation_kind", "cancelled_at"} <= action_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
@@ -3176,9 +3196,10 @@ class TestSharedBoardPaths:
         # `-p <profile>` flag rewrites HERMES_HOME.
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
-        shared_gh_config = tmp_path / ".config" / "gh"
+        shared_gh_config = tmp_path / "broker" / "gh"
         shared_gh_config.mkdir(parents=True)
         self._set_home(monkeypatch, tmp_path, default_home)
+        monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
 
         captured = {}
 
@@ -3217,7 +3238,14 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
-        assert env["GH_CONFIG_DIR"] == str(shared_gh_config)
+        # Operator ~/.config/gh is not discovered or injected implicitly.
+        assert "GH_CONFIG_DIR" not in env
+
+        # A caller-provided least-privilege broker/delegation config remains
+        # authoritative; the dispatcher neither replaces nor copies it.
+        monkeypatch.setenv("GH_CONFIG_DIR", str(shared_gh_config))
+        kb._default_spawn(task, str(tmp_path / "ws"))
+        assert captured["env"]["GH_CONFIG_DIR"] == str(shared_gh_config)
 
 
 # ---------------------------------------------------------------------------

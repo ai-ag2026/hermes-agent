@@ -2539,14 +2539,17 @@ def _consume_kanban_action_grant(command: str) -> bool:
     """Consume a durable exact-action grant when running as a Kanban worker."""
     task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
-    if not task_id or not workspace:
+    run_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if not task_id or not workspace or not run_raw:
         return False
     try:
+        run_id = int(run_raw)
         from hermes_cli import kanban_db
         with contextlib.closing(kanban_db.connect()) as conn:
             return kanban_db.consume_approved_action(
                 conn,
                 task_id=task_id,
+                run_id=run_id,
                 command=command,
                 profile=os.environ.get("HERMES_PROFILE", "default"),
                 workspace=workspace,
