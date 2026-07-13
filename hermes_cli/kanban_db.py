@@ -2353,6 +2353,9 @@ def connect(
                     # process are cheap. The lock prevents same-process dispatcher
                     # threads from racing through the additive ALTER TABLE pass with
                     # stale PRAGMA snapshots during gateway startup.
+                    # Reject ambiguous legacy attention bindings before SCHEMA_SQL
+                    # or an additive migration can persist any partial schema.
+                    _preflight_task_attention_migration(conn)
                     conn.executescript(SCHEMA_SQL)
                     # Individual migrations use their own write transactions
                     # where they need a lock; keep this entry point compatible
@@ -2434,6 +2437,58 @@ def init_db(
     with contextlib.closing(connect(path, board=board)):
         pass
     return path
+
+
+def _preflight_task_attention_migration(conn: sqlite3.Connection) -> None:
+    """Reject ambiguous legacy attention data before any initializer mutation.
+
+    ``executescript`` commits any open transaction before its DDL, so these
+    fail-closed checks must run before it, every ALTER, index, rebuild, or
+    backfill.  Do not select an arbitrary duplicate during migration.
+    """
+    existing = {
+        str(row["name"])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('task_attentions', 'task_pending_actions')"
+        )
+    }
+    if "task_attentions" not in existing:
+        return
+    attention_cols = {
+        str(row["name"]) for row in conn.execute("PRAGMA table_info(task_attentions)")
+    }
+    if "action_id" not in attention_cols:
+        return
+    duplicate_action = conn.execute(
+        "SELECT action_id FROM task_attentions WHERE action_id IS NOT NULL "
+        "GROUP BY action_id HAVING COUNT(*) > 1 LIMIT 1"
+    ).fetchone()
+    if duplicate_action is not None:
+        raise RuntimeError("cannot rebuild task attentions: duplicate non-null action_id")
+    if "task_pending_actions" not in existing:
+        return
+    action_cols = {
+        str(row["name"]) for row in conn.execute("PRAGMA table_info(task_pending_actions)")
+    }
+    if "attention_id" in action_cols:
+        duplicate_attention = conn.execute(
+            "SELECT attention_id FROM task_pending_actions WHERE attention_id IS NOT NULL "
+            "GROUP BY attention_id HAVING COUNT(*) > 1 LIMIT 1"
+        ).fetchone()
+        if duplicate_attention is not None:
+            raise RuntimeError("cannot migrate pending actions: duplicate attention_id binding")
+        unbound = "a.attention_id IS NULL"
+    else:
+        unbound = "1=1"
+    if {"id", "task_id"} <= action_cols and {"task_id", "type"} <= attention_cols:
+        ambiguous = conn.execute(
+            "SELECT a.id FROM task_pending_actions a JOIN task_attentions x "
+            "ON x.action_id=a.id AND x.task_id=a.task_id AND x.type='exact_action' "
+            f"WHERE {unbound} GROUP BY a.id HAVING COUNT(*) != 1 LIMIT 1"
+        ).fetchone()
+        if ambiguous is not None:
+            raise RuntimeError("cannot migrate pending actions: ambiguous exact attention backfill")
 
 
 def _migrate_task_attention_shape(conn: sqlite3.Connection) -> None:
@@ -8208,11 +8263,16 @@ def approve_pending_action_and_unblock_versioned(
             "SELECT id, type FROM task_attentions WHERE task_id=? AND action_id=? "
             "ORDER BY id DESC LIMIT 1", (task_id, int(action_id)),
         ).fetchone()
-        if action["state"] != "pending" or int(action["expires_at"]) <= now:
-            return ApprovePendingActionResult("gone", task_id, int(action_id))
         if attention is None:
             return ApprovePendingActionResult("gone", task_id, int(action_id))
-        if (attention["type"] != "exact_action" or int(action["version"]) != int(expected_version)
+        # A version mismatch is a stale active CAS request even if another
+        # contender already approved the action. A caller that observes the
+        # current approved/terminal version reaches the following gone branch.
+        if int(action["version"]) != int(expected_version):
+            return ApprovePendingActionResult("conflict", task_id, int(action_id), int(attention["id"]))
+        if action["state"] != "pending" or int(action["expires_at"]) <= now:
+            return ApprovePendingActionResult("gone", task_id, int(action_id))
+        if (attention["type"] != "exact_action"
                 or task["status"] not in ("blocked", "triage", "todo", "ready")
                 or not _pending_action_fingerprint_valid(conn, action)):
             return ApprovePendingActionResult("conflict", task_id, int(action_id), int(attention["id"]))

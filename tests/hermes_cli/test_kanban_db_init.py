@@ -214,14 +214,30 @@ def _make_pre_typed_attention_db(path: Path, *, duplicate_projection: bool = Fal
     conn.close()
 
 
-def _attention_snapshot(path: Path) -> tuple[list[tuple], list[tuple], list[tuple]]:
+def _attention_snapshot(path: Path) -> dict[str, object]:
+    """Capture affected rows and schema before a fail-closed migration attempt."""
     conn = sqlite3.connect(path)
     try:
-        return (
-            conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='task_attentions'").fetchall(),
-            conn.execute("SELECT * FROM task_attentions ORDER BY id").fetchall(),
-            conn.execute("SELECT name FROM sqlite_master WHERE name='task_attentions_rebuild'").fetchall(),
-        )
+        tables = ("task_attentions", "task_pending_actions")
+        return {
+            "rows": {
+                table: conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+                for table in tables
+            },
+            "table_info": {
+                table: conn.execute(f"PRAGMA table_info({table})").fetchall()
+                for table in tables
+            },
+            "index_list": {
+                table: conn.execute(f"PRAGMA index_list({table})").fetchall()
+                for table in tables
+            },
+            "sqlite_master": conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE tbl_name IN (?, ?) OR name='task_attentions_rebuild' ORDER BY type, name",
+                tables,
+            ).fetchall(),
+        }
     finally:
         conn.close()
 

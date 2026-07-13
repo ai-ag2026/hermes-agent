@@ -2553,8 +2553,56 @@ def test_versioned_approval_is_cas_and_keeps_waiting_projection(
         waiting = kb.get_current_attention(conn, task_id, now=1_900_000_000)
         assert waiting is not None and waiting.id == attention.id and waiting.state == "approved"
         assert not waiting.approvable and not waiting.requires_human_action
+        current = kb.get_pending_action_by_id(conn, task_id, action.id)
+        assert current is not None
         assert kb.approve_pending_action_and_unblock_versioned(
-            conn, task_id, action.id, expected_version=attention.version, now=1_900_000_000,
+            conn, task_id, action.id, expected_version=current.version, now=1_900_000_000,
+        ).status == "gone"
+
+
+def test_parallel_versioned_approvals_return_approved_and_conflict_once(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale concurrent CAS request is conflict, not a terminal replay."""
+    task_id = _create_running_task(monkeypatch)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        action = kb.record_pending_action(
+            conn, task_id=task_id, run_id=task.current_run_id,
+            command="parallel-versioned-approve", summary="ignored", profile="backend-eng",
+            workspace=str(isolated_board), expires_at=2_000_000_000,
+        )
+        assert kb.block_task(conn, task_id, kind="needs_input", expected_run_id=task.current_run_id)
+        attention = kb.get_current_attention(conn, task_id, now=1_900_000_000)
+        assert attention is not None
+
+    barrier, results = threading.Barrier(2), []
+
+    def approve() -> None:
+        with kb.connect() as other:
+            barrier.wait(timeout=5)
+            results.append(kb.approve_pending_action_and_unblock_versioned(
+                other, task_id, action.id, expected_version=attention.version, now=1_900_000_000,
+            ).status)
+
+    workers = [threading.Thread(target=approve) for _ in range(2)]
+    [worker.start() for worker in workers]
+    [worker.join(timeout=5) for worker in workers]
+    assert not any(worker.is_alive() for worker in workers)
+    assert sorted(results) == ["approved", "conflict"]
+    with kb.connect() as conn:
+        current = kb.get_pending_action_by_id(conn, task_id, action.id)
+        assert current is not None and (current.state, current.version) == ("approved", action.version + 1)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='terminal_approval_granted'",
+            (task_id,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE id=? AND status='ready'", (task_id,),
+        ).fetchone()[0] == 1
+        assert kb.approve_pending_action_and_unblock_versioned(
+            conn, task_id, action.id, expected_version=current.version, now=1_900_000_000,
         ).status == "gone"
 
 
