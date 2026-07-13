@@ -6421,14 +6421,13 @@ def test_human_gate_ntfy_failure_is_fail_closed(kanban_home, monkeypatch):
             kb.unblock_task(conn, tid, actor="a", reason="x", token="anything")
         assert kb.get_task(conn, tid).status == "blocked"
 
-        # H1 (2026-07-13): `gate off` is no longer a free rescue — disabling a
-        # live gate now itself requires a fresh gate_off grant. With ntfy down (and
-        # ntfy is not a grant channel anyway) no such grant reaches the CLI, so gate
-        # off is fail-closed too. The old free rescue was the laundering hole.
-        with pytest.raises(kb.GateTokenError):
-            kb.set_human_gate(conn, tid, on=False, actor="manfred")
-        assert kb.get_task(conn, tid).status == "blocked"
-        assert kb.get_task(conn, tid).human_gate is True
+        # Step④ (2026-07-14): H1 removed — `gate off` is again the FREE rescue for a
+        # coarse human-gate hold (this card has no pending exact-action). ntfy being
+        # down no longer strands it: the operator lifts the soft hold directly (it is
+        # budget-bounded + logged + reversible). The exact-action approval — the real
+        # grant-enforced authority gate — is a separate mechanism, unaffected.
+        assert kb.set_human_gate(conn, tid, on=False, actor="manfred") is True
+        assert kb.get_task(conn, tid).human_gate is False
 
 
 def test_human_gate_missing_ntfy_config_is_fail_closed(kanban_home, monkeypatch):
@@ -6905,29 +6904,40 @@ def test_repair_reclaim_task_refuses_stall_blocked_gated_card(kanban_home):
         assert kb.get_task(conn, tid).status == "ready"
 
 
-def test_gate_off_requires_grant_h1(kanban_home, monkeypatch):
-    """H1 (2026-07-13): disabling a LIVE (blocked+gated) gate requires a fresh
-    gate_off grant. No token -> fail closed; wrong token -> refused; a valid token
-    turns the gate off. Closes the approval-laundering hole where any orchestrator/
-    session actor could strip a live gate with one unauth'd call."""
-    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+def test_gate_off_free_step4(kanban_home):
+    """Step④ (2026-07-14): H1 removed — disabling a LIVE (blocked+gated) gate is now
+    FREE (no grant). The human_gate is a soft, reversible hold; lifting it is bounded
+    by the Step② budget + logged. It cannot bypass the exact-action approval (that is
+    enforced by the pending_action/attention state machine, verified separately)."""
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="gated", assignee="worker")
         kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
-
-        with pytest.raises(kb.GateTokenError):
-            kb.set_human_gate(conn, tid, on=False, actor="op")
         assert kb.get_task(conn, tid).human_gate is True
-
-        token = kb.issue_gate_token(conn, tid, action="gate_off")
-        assert token is not None
-
-        with pytest.raises(kb.GateTokenError):
-            kb.set_human_gate(conn, tid, on=False, actor="op", token="wrong-token")
-        assert kb.get_task(conn, tid).human_gate is True
-
-        assert kb.set_human_gate(conn, tid, on=False, actor="op", token=token) is True
+        # No token needed anymore.
+        assert kb.set_human_gate(conn, tid, on=False, actor="op") is True
         assert kb.get_task(conn, tid).human_gate is False
+
+
+def test_gate_off_bulk_burst_hits_budget(kanban_home, monkeypatch):
+    """Step④ + Step②: a gate-off is free, but an ad-hoc BURST still trips the
+    mutation budget (blast-radius bound) — the structural replacement for H1."""
+    monkeypatch.setenv("HERMES_KANBAN_MUTATION_RATE_LIMIT", "3")
+    with kb.connect() as conn:
+        ids = []
+        for i in range(6):
+            t = kb.create_task(conn, title=f"g{i}", assignee="worker")
+            kb.block_task(conn, t, reason="x", kind="needs_input", human_gate=True)
+            ids.append(t)
+        done = 0
+        tripped = False
+        for t in ids:
+            try:
+                kb.set_human_gate(conn, t, on=False, actor="op")
+                done += 1
+            except kb.MutationBudgetError:
+                tripped = True
+                break
+        assert done == 3 and tripped is True
 
 
 def test_gate_off_free_when_not_live_gate_h1(kanban_home):
@@ -6940,29 +6950,23 @@ def test_gate_off_free_when_not_live_gate_h1(kanban_home):
         assert kb.get_task(conn, tid).human_gate is False
 
 
-def test_archive_running_requires_grant_h2(kanban_home, monkeypatch):
-    """H2 (2026-07-13): archiving a RUNNING card reclaims its run and kills the
-    worker, so it requires a fresh archive_running grant. No token -> fail closed
-    and the card stays running; a valid token archives it (incident's first act)."""
-    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+def test_archive_running_free_step4(kanban_home):
+    """Step④ (2026-07-14): H2 removed — archiving a RUNNING card no longer needs an
+    archive_running grant. Step③ verified the reclaim is non-destructive (session/
+    workspace/history preserved) and unarchive_task restores + resumes it, so nothing
+    is irreversibly destroyed. Blast radius is bounded by the Step② budget."""
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="running", assignee="worker")
         assert kb.claim_task(conn, tid) is not None
         assert kb.get_task(conn, tid).status == "running"
-
-        with pytest.raises(kb.GateTokenError):
-            kb.archive_task(conn, tid)
-        assert kb.get_task(conn, tid).status == "running"
-
-        token = kb.issue_gate_token(conn, tid, action="archive_running")
-        assert token is not None
-
-        with pytest.raises(kb.GateTokenError):
-            kb.archive_task(conn, tid, token="wrong")
-        assert kb.get_task(conn, tid).status == "running"
-
-        assert kb.archive_task(conn, tid, token=token) is True
+        # No token needed anymore.
+        assert kb.archive_task(conn, tid) is True
         assert kb.get_task(conn, tid).status == "archived"
+        # The reclaimed run is preserved (recoverable), not destroyed.
+        run = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)
+        ).fetchone()
+        assert run["outcome"] == "reclaimed"
 
 
 def test_archive_nonrunning_is_free_h2(kanban_home):

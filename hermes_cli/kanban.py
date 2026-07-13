@@ -2339,26 +2339,15 @@ def _cmd_gate(args: argparse.Namespace) -> int:
     on = args.state == "on"
     token = getattr(args, "token", None)
     with kb.connect_closing() as conn:
-        # H1: turning a LIVE gate off requires an operator grant (Telegram/WebUI).
-        # A gate flag on a non-blocked card is inert -> gate off stays free there.
-        if not on and token is None:
-            gated = conn.execute(
-                "SELECT human_gate, status FROM tasks WHERE id = ?", (args.task_id,)
-            ).fetchone()
-            if gated is None:
-                print(f"no such task: {args.task_id}", file=sys.stderr)
-                return 1
-            if gated["human_gate"] and gated["status"] in ("blocked", "scheduled"):
-                print(
-                    f"refused: {args.task_id} is human-gated. Disabling a live gate "
-                    "is a protected action — approve it via the WebUI kanban "
-                    "extension (Gate-off) or the Telegram Gate-off button. The CLI "
-                    "is not a grant channel (H1).",
-                    file=sys.stderr,
-                )
-                return 1
+        # Step④ (2026-07-14): H1 removed — gate-off is free (budget-bounded + logged
+        # + reversible). No grant channel needed; the CLI performs it directly. It can
+        # still raise MutationBudgetError on an ad-hoc gate-off burst without a
+        # manifest (Step② blast-radius bound).
         try:
             ok = kb.set_human_gate(conn, args.task_id, on=on, actor=author, token=token)
+        except kb.MutationBudgetError as exc:
+            print(f"refused (blast-radius bound): {exc}", file=sys.stderr)
+            return 1
         except kb.GateTokenError as exc:
             print(f"refused: {exc}", file=sys.stderr)
             return 1
@@ -2478,30 +2467,21 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         for tid in ids:
             try:
                 ok = kb.archive_task(conn, tid, token=token)
+            except kb.MutationBudgetError as exc:
+                # Step② blast-radius bound: an ad-hoc archive burst. For an intended
+                # bulk archive, declare a manifest (kb.open_mutation_manifest).
+                print(f"refused (blast-radius bound): {exc}", file=sys.stderr)
+                failed.append(tid)
+                continue
             except kb.GateTokenError as exc:
-                # H2: archiving a running card kills the worker and needs an
-                # operator grant. The CLI is not a grant channel; approve via the
-                # WebUI extension or the Telegram Archive-running button. A gated
-                # (blocked) card or a rejected token surfaces the refusal unchanged.
-                st = conn.execute(
-                    "SELECT status, current_run_id, worker_pid FROM tasks WHERE id = ?",
-                    (tid,),
-                ).fetchone()
-                is_live = bool(st) and (
-                    st["status"] == "running"
-                    or st["current_run_id"] is not None
-                    or st["worker_pid"] is not None
+                # Step④: H2 removed — a RUNNING card archives freely now. Only a
+                # manually human-gated (blocked/scheduled) card still refuses; lift
+                # the hold first with `kanban gate <id> off` (now free + logged).
+                print(
+                    f"refused: {tid} is human-gated — run `hermes kanban gate {tid} off` "
+                    f"first (gate-off is free), then archive. ({exc})",
+                    file=sys.stderr,
                 )
-                if is_live and token is None:
-                    print(
-                        f"refused: {tid} is running live work — archiving it kills "
-                        "the worker. Approve it via the WebUI kanban extension "
-                        "(Archive-running) or the Telegram Archive-running button. "
-                        "The CLI is not a grant channel (H2).",
-                        file=sys.stderr,
-                    )
-                else:
-                    print(f"refused: {exc}", file=sys.stderr)
                 failed.append(tid)
                 continue
             if not ok:

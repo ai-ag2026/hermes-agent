@@ -7841,14 +7841,15 @@ def set_human_gate(
         if on:
             conn.execute("UPDATE tasks SET human_gate = 1 WHERE id = ?", (task_id,))
         else:
-            # H1: require a valid gate_off grant when a live gate is being lifted.
-            # _assert_human_gate_open enforces only for a blocked/scheduled card
-            # with human_gate=1 (the real gated state) and consumes the one-shot
-            # token; it is a no-op for an ungated card, so this stays free there.
+            # Step④ (2026-07-14): H1 REMOVED. Lifting a gate no longer needs a grant.
+            # The human_gate flag is a SOFT hold: lifting it is free but bounded by the
+            # Step② mutation budget (rate/scope) + logged to mutation_log (the digest,
+            # Säule 3) + reversible (`gate on`). This cannot bypass the real authority
+            # gate: the exact-action approval is enforced by the pending_action/
+            # attention state machine — unblock_task refuses while either exists —
+            # independently of this flag. A free gate-off on a card with a pending
+            # exact action still cannot let it proceed unapproved.
             if row["human_gate"]:
-                _assert_human_gate_open(conn, task_id, token=token, action="gate_off")
-                # Step② (Säule 2): lifting a LIVE gate is authority-bearing — bound
-                # the rate of ad-hoc gate-offs; a bulk gate-off needs a manifest.
                 _enforce_mutation_budget(conn, task_id, "gate_off", actor=actor)
             conn.execute(
                 "UPDATE tasks SET human_gate = 0, gate_token_hash = NULL, "
@@ -10544,24 +10545,26 @@ def decompose_triage_task(
 def archive_task(conn: sqlite3.Connection, task_id: str, *, token: Optional[str] = None) -> bool:
     """Archive a task from any non-archived status.
 
-    Human-Gate v1, refuse-only (2026-07-11 repair review self-audit): a
-    ``blocked``/``scheduled``+``human_gate=1`` card always refuses — run
-    ``kanban gate <id> off`` first (itself H1-gated) if archiving a gated
-    card is genuinely needed.
+    Human-Gate v1 (coarse hold): a ``blocked``/``scheduled``+``human_gate=1`` card
+    still refuses via :func:`_assert_human_gate_open` — lift the hold with
+    ``kanban gate <id> off`` first (that gate-off is now free + logged + budget-
+    bounded, Step④). This keeps a manual hold a visible tripwire without a grant.
 
-    H2 (2026-07-13): archiving a card that is running live work reclaims its run.
-    Currently gated by an ``archive_running`` grant (``token``). NOTE (Step③,
-    2026-07-14): this reclaim is NON-destructive — ``_end_run`` preserves the run's
-    ``session_id``, the session file is kept, and archive touches NEITHER the
-    workspace/worktree NOR the conversation. Only the worker's unflushed in-memory
-    tail is lost. The card is soft-archived; :func:`unarchive_task` restores it and
-    arms a one-shot resume so the work CONTINUES. Because nothing is irreversibly
-    destroyed, Step④ can drop this H2 grant in favour of the Step② blast-radius
-    bound + this reversibility (see AUTONOMY-REDESIGN.md). Non-running, unbound cards
-    archive freely. Both refusals raise :class:`GateTokenError`.
+    H2 REMOVED (Step④, 2026-07-14): archiving a card that is running live work no
+    longer needs an ``archive_running`` grant. Step③ verified the reclaim is
+    NON-destructive — ``_end_run`` preserves the run's ``session_id``, the session
+    file is kept, and archive touches NEITHER the workspace/worktree NOR the
+    conversation (only the unflushed in-memory tail is lost); :func:`unarchive_task`
+    restores + resumes it. Blast radius is bounded by the Step② mutation budget
+    below. The ``token`` param is retained for backward compatibility and ignored.
     """
     with write_txn(conn):
-        _assert_running_archive_grant(conn, task_id, token=token)
+        # Step④ (2026-07-14): H2 REMOVED. Archiving a card that is running live work
+        # no longer needs an archive_running grant — Step③ verified the reclaim is
+        # non-destructive (session/workspace/history preserved) and unarchive_task
+        # restores + resumes it, so nothing is irreversibly destroyed. The Step②
+        # budget below bounds an archive burst; a gated (blocked/scheduled) card still
+        # needs an explicit (now free, logged) gate-off first via the guard below.
         _assert_human_gate_open(conn, task_id, token=None, action="archive")
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
