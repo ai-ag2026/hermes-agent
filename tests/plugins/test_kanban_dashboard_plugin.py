@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -110,6 +111,66 @@ def test_exact_terminal_action_requires_combined_approval_and_resume(client, tmp
         json={"attention_id": attention["id"], "attention_version": attention["version"]},
     )
     assert replay.status_code == 410
+
+
+def test_approve_terminal_action_race_conflicts_but_post_approval_replays_are_gone(
+    client, tmp_path, monkeypatch,
+):
+    """A pre-CAS pending contender conflicts; an observed approved replay is gone."""
+    task, _ = _pending_exact_action(client, tmp_path)
+    other, _ = _pending_exact_action(client, tmp_path / "other")
+    route = f"/api/plugins/kanban/tasks/{task['id']}/approve-terminal-action"
+    attention = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]["attention"]
+    payload = {"attention_id": attention["id"], "attention_version": attention["version"]}
+
+    # Foreign opaque attention and an active stale version remain ordinary
+    # not-found/conflict cases before the actual CAS race.
+    assert client.post(
+        f"/api/plugins/kanban/tasks/{other['id']}/approve-terminal-action", json=payload,
+    ).status_code == 404
+    assert client.post(route, json={**payload, "attention_version": attention["version"] + 1}).status_code == 409
+    with kb.connect() as conn:
+        unchanged = kb.get_action_by_attention_id(conn, task["id"], attention["id"])
+        task_before_race = kb.get_task(conn, task["id"])
+        assert unchanged is not None and (unchanged.state, unchanged.version) == ("pending", attention["version"])
+        assert task_before_race is not None and task_before_race.status == "blocked"
+
+    plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    barrier = threading.Barrier(2)
+    responses = []
+
+    def approve() -> None:
+        responses.append(client.post(route, json=payload))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            plugin,
+            "_approve_terminal_action_after_snapshot_hook",
+            lambda: barrier.wait(timeout=5),
+        )
+        workers = [threading.Thread(target=approve) for _ in range(2)]
+        [worker.start() for worker in workers]
+        [worker.join(timeout=5) for worker in workers]
+    assert not any(worker.is_alive() for worker in workers)
+    assert sorted(response.status_code for response in responses) == [200, 409]
+
+    with kb.connect() as conn:
+        action = kb.get_action_by_attention_id(conn, task["id"], attention["id"])
+        assert action is not None and (action.state, action.version) == ("approved", attention["version"] + 1)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='terminal_approval_granted'", (task["id"],),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='unblocked'", (task["id"],),
+        ).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE id=? AND status='ready'", (task["id"],)).fetchone()[0] == 1
+
+    # The original opaque version is now a terminal replay, while the current
+    # approved version is also non-actionable. Neither response leaks action IDs.
+    replay = client.post(route, json=payload)
+    current = client.post(route, json={**payload, "attention_version": attention["version"] + 1})
+    assert replay.status_code == current.status_code == 410
+    assert "action_id" not in repr({"replay": replay.json(), "current": current.json()})
 
 
 _ATTENTION_FIELDS = {

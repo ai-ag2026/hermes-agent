@@ -921,6 +921,10 @@ class ResumeApprovedActionRetryBody(BaseModel):
         extra = "forbid"
 
 
+def _approve_terminal_action_after_snapshot_hook() -> None:
+    """Internal test seam: synchronize contenders after their read-only snapshot."""
+
+
 def _attention_result_error(result: Any) -> HTTPException:
     outcome = getattr(result, "status", "conflict")
     if outcome == "not_found":
@@ -945,10 +949,17 @@ def approve_terminal_action(
         action = _attention_action(conn, task_id, payload.attention_id)
         if action is None:
             raise HTTPException(status_code=404, detail="terminal action not found")
+        # The snapshot establishes whether this request was a live contender.
+        # A pending snapshot that loses the Core CAS remains a 409; a request
+        # that already observed approved/terminal state is an opaque replay.
+        pre_call_state = action.state
+        _approve_terminal_action_after_snapshot_hook()
         result = kanban_db.approve_pending_action_and_unblock_versioned(
             conn, task_id, action.id, expected_version=payload.attention_version, actor="dashboard",
         )
         if not result:
+            if pre_call_state != "pending":
+                raise HTTPException(status_code=410, detail="terminal action is no longer available")
             raise _attention_result_error(result)
         return {
             "ok": True,
