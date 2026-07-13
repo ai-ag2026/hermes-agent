@@ -1501,6 +1501,40 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+-- Step② (2026-07-14) autonomy middle-way, Säule 2 (blast-radius bounds).
+-- A ledger of every ALLOWED rate-limited/destructive mutation (archive, gate_off,
+-- block). It is both the counting source for the ad-hoc rate ceiling and the
+-- source for the operator digest (Säule 3). Per-DB, so it is implicitly scoped to
+-- one board. ``manifest_id`` is NULL for an ad-hoc mutation, or the manifest that
+-- authorised a bulk one.
+CREATE TABLE IF NOT EXISTS mutation_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    op          TEXT NOT NULL,
+    task_id     TEXT,
+    actor       TEXT,
+    manifest_id INTEGER,
+    at          INTEGER NOT NULL
+);
+
+-- Scope-bound bulk manifest. A legitimate bulk operation declares its EXACT target
+-- set up front (auditable); mutations to those ids bypass the ad-hoc rate ceiling,
+-- but the total is capped at ``max_size`` and mutations OUTSIDE the set are rejected
+-- as scope-creep. This is what makes the 2026-07-13 incident (46 archives vs 30
+-- audited) structurally impossible without ever prompting the operator. Per-DB.
+CREATE TABLE IF NOT EXISTS mutation_manifest (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind          TEXT NOT NULL,            -- op this manifest authorises: archive|gate_off|block
+    task_ids_json TEXT NOT NULL,            -- JSON array of the bound task ids
+    max_size      INTEGER NOT NULL,         -- cap on consumed count
+    consumed      INTEGER NOT NULL DEFAULT 0,
+    actor         TEXT,
+    rationale     TEXT,
+    audit_hash    TEXT,                     -- optional binding to an external audit set
+    status        TEXT NOT NULL DEFAULT 'open',   -- open|closed|expired
+    created_at    INTEGER NOT NULL,
+    expires_at    INTEGER NOT NULL
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1641,6 +1675,8 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_mutation_log_op_at    ON mutation_log(op, at);
+CREATE INDEX IF NOT EXISTS idx_manifest_active       ON mutation_manifest(kind, status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task         ON task_artifacts(task_id, producer_run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
@@ -4203,6 +4239,217 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+
+
+# ---------------------------------------------------------------------------
+# Step② (2026-07-14) — mutation budget: rate ceiling + scope-bound manifest
+# ---------------------------------------------------------------------------
+# Autonomy middle-way, Säule 2 (blast-radius bounds). Destructive/authority
+# mutations (archive, gate_off, block) are bounded STRUCTURALLY so a runaway agent
+# cannot repeat the 2026-07-13 incident (46 archives in ~40s) — WITHOUT a per-action
+# human gate:
+#   * ad-hoc mutations are capped at a low rate ceiling per sliding window;
+#   * a legitimate BULK op declares a scope-bound manifest (its EXACT target set),
+#     which bypasses the ceiling for in-scope ids but rejects scope-creep and caps
+#     the total.
+# No operator prompt on the happy path; a rejection is a structural "declare a
+# manifest / raise the ceiling" nudge and is fully reversible.
+
+# Only the destructive/authority ops of the 2026-07-13 incident are enforced.
+# ``block`` is deliberately NOT here: dependency/loop blocking fires automatically
+# and is reversible, so rate-limiting it would false-trip. The mechanism is op-
+# agnostic, so it can be added later by wiring _enforce_mutation_budget(...,"block").
+RATE_LIMITED_OPS = frozenset({"archive", "gate_off"})
+DEFAULT_MUTATION_RATE_LIMIT = 20      # ad-hoc mutations of one op per window
+DEFAULT_MUTATION_RATE_WINDOW = 60     # seconds
+DEFAULT_MANIFEST_TTL_SECONDS = 900    # a declared bulk manifest is valid 15 min
+
+
+class MutationBudgetError(RuntimeError):
+    """Raised when a destructive/authority mutation exceeds the ad-hoc rate ceiling,
+    falls outside an active bulk manifest (scope-creep), or would overflow the
+    manifest's declared size. Structural blast-radius bound — no human prompt; the
+    write rolls back and the caller (tool/CLI) surfaces the reason. Fully reversible:
+    the operator can raise the ceiling or declare a manifest for the intended set."""
+
+
+def _mutation_budget_enabled() -> bool:
+    raw = os.environ.get("HERMES_KANBAN_MUTATION_BUDGET", "").strip().lower()
+    if raw in {"0", "off", "false", "no", "disable", "disabled"}:
+        return False
+    if raw in {"1", "on", "true", "yes", "enable", "enabled"}:
+        return True
+    try:
+        from hermes_cli.config import load_config
+        cfg = (load_config().get("kanban") or {}).get("mutation_budget") or {}
+        return bool(cfg.get("enabled", True))
+    except Exception:
+        return True
+
+
+def _mutation_budget_int(env_key: str, cfg_key: str, default: int) -> int:
+    raw = os.environ.get(env_key, "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    try:
+        from hermes_cli.config import load_config
+        cfg = (load_config().get("kanban") or {}).get("mutation_budget") or {}
+        v = int(cfg.get(cfg_key, default))
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+
+def _mutation_rate_limit() -> int:
+    return _mutation_budget_int(
+        "HERMES_KANBAN_MUTATION_RATE_LIMIT", "rate_limit", DEFAULT_MUTATION_RATE_LIMIT
+    )
+
+
+def _mutation_rate_window() -> int:
+    return _mutation_budget_int(
+        "HERMES_KANBAN_MUTATION_RATE_WINDOW", "rate_window_seconds", DEFAULT_MUTATION_RATE_WINDOW
+    )
+
+
+def _active_manifest_row(conn: sqlite3.Connection, op: str, *, now: int):
+    """Most-recent OPEN, unexpired manifest for ``op`` (or None). Lazily marks a
+    matching-but-expired manifest 'expired' so it stops binding. Mutates — call only
+    inside a write transaction."""
+    row = conn.execute(
+        "SELECT * FROM mutation_manifest WHERE kind=? AND status='open' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (op,),
+    ).fetchone()
+    if row is None:
+        return None
+    if int(row["expires_at"]) <= now:
+        conn.execute("UPDATE mutation_manifest SET status='expired' WHERE id=?", (row["id"],))
+        return None
+    return row
+
+
+def _enforce_mutation_budget(
+    conn: sqlite3.Connection, task_id: str, op: str, *, actor: Optional[str] = None
+) -> None:
+    """Structural blast-radius guard for a destructive/authority mutation.
+
+    MUST be called INSIDE the mutator's ``write_txn`` (before the state change) so
+    the ledger / consumed increment commits atomically with the mutation and rolls
+    back with it. Raises :class:`MutationBudgetError` (rolling back the whole write)
+    on scope-creep / manifest exhaustion / rate-ceiling violation. No-op when the
+    budget is disabled or ``op`` is not rate-limited. Fails OPEN if the Step② tables
+    are absent (un-migrated DB) so it can never brick an archive before deploy."""
+    if op not in RATE_LIMITED_OPS or not _mutation_budget_enabled():
+        return
+    now = int(time.time())
+    try:
+        manifest = _active_manifest_row(conn, op, now=now)
+        if manifest is not None:
+            try:
+                bound = set(json.loads(manifest["task_ids_json"]))
+            except (ValueError, TypeError):
+                bound = set()
+            if task_id not in bound:
+                raise MutationBudgetError(
+                    f"scope-creep: task {task_id} is not in the active '{op}' manifest "
+                    f"(#{manifest['id']}, {len(bound)} ids). A bulk manifest bounds the "
+                    "exact target set — extend or close it instead of reaching outside."
+                )
+            if int(manifest["consumed"]) >= int(manifest["max_size"]):
+                raise MutationBudgetError(
+                    f"manifest #{manifest['id']} exhausted: already consumed "
+                    f"{manifest['consumed']}/{manifest['max_size']} '{op}' mutations."
+                )
+            conn.execute(
+                "UPDATE mutation_manifest SET consumed = consumed + 1 WHERE id = ?",
+                (manifest["id"],),
+            )
+            conn.execute(
+                "INSERT INTO mutation_log (op, task_id, actor, manifest_id, at) VALUES (?,?,?,?,?)",
+                (op, task_id, actor, int(manifest["id"]), now),
+            )
+            return
+        # No active manifest -> ad-hoc rate ceiling.
+        window = _mutation_rate_window()
+        ceiling = _mutation_rate_limit()
+        recent = conn.execute(
+            "SELECT COUNT(*) AS n FROM mutation_log WHERE op=? AND at > ?",
+            (op, now - window),
+        ).fetchone()
+        if recent and int(recent["n"]) >= ceiling:
+            raise MutationBudgetError(
+                f"rate ceiling: {int(recent['n'])} '{op}' mutations in the last {window}s "
+                f"(limit {ceiling}). For an intended bulk change declare a scope-bound "
+                "manifest (open_mutation_manifest) with the exact target set; ad-hoc "
+                "bursts are capped to bound blast radius."
+            )
+        conn.execute(
+            "INSERT INTO mutation_log (op, task_id, actor, manifest_id, at) VALUES (?,?,?,?,?)",
+            (op, task_id, actor, None, now),
+        )
+    except sqlite3.OperationalError as exc:
+        # Un-migrated DB (no mutation_log/mutation_manifest yet): fail OPEN so the
+        # budget simply isn't active until the tables exist. Deploy migrates them.
+        if "no such table" in str(exc).lower():
+            _log.warning("mutation-budget tables absent; skipping budget check (%s)", exc)
+            return
+        raise
+
+
+def open_mutation_manifest(
+    conn: sqlite3.Connection,
+    *,
+    op: str,
+    task_ids,
+    actor: Optional[str] = None,
+    rationale: Optional[str] = None,
+    audit_hash: Optional[str] = None,
+    ttl_seconds: Optional[int] = None,
+) -> int:
+    """Declare a scope-bound bulk manifest; return its id. Authorises up to
+    len(unique task_ids) '<op>' mutations to EXACTLY those ids, bypassing the ad-hoc
+    rate ceiling; anything outside the set is rejected as scope-creep. Valid for
+    ``ttl_seconds`` (default :data:`DEFAULT_MANIFEST_TTL_SECONDS`)."""
+    if op not in RATE_LIMITED_OPS:
+        raise ValueError(f"op must be one of {sorted(RATE_LIMITED_OPS)}, got {op!r}")
+    ids = sorted({str(t) for t in (task_ids or []) if t})
+    if not ids:
+        raise ValueError("task_ids must be a non-empty list")
+    now = int(time.time())
+    ttl = int(ttl_seconds) if ttl_seconds else DEFAULT_MANIFEST_TTL_SECONDS
+    with write_txn(conn):
+        cur = conn.execute(
+            "INSERT INTO mutation_manifest "
+            "(kind, task_ids_json, max_size, consumed, actor, rationale, audit_hash, "
+            " status, created_at, expires_at) VALUES (?,?,?,0,?,?,?, 'open', ?, ?)",
+            (op, json.dumps(ids), len(ids), actor, rationale, audit_hash, now, now + ttl),
+        )
+        return int(cur.lastrowid)
+
+
+def close_mutation_manifest(conn: sqlite3.Connection, manifest_id: int) -> bool:
+    """Close an open manifest early (stops it binding). Returns True if it was open."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE mutation_manifest SET status='closed' WHERE id=? AND status='open'",
+            (int(manifest_id),),
+        )
+        return cur.rowcount == 1
+
+
+def get_active_manifest(conn: sqlite3.Connection, op: str):
+    """Read-only view of the active manifest for ``op`` (or None). Does not mutate."""
+    return conn.execute(
+        "SELECT * FROM mutation_manifest WHERE kind=? AND status='open' "
+        "AND expires_at > ? ORDER BY created_at DESC LIMIT 1",
+        (op, int(time.time())),
+    ).fetchone()
 
 
 def _end_run(
@@ -7571,6 +7818,9 @@ def set_human_gate(
             # token; it is a no-op for an ungated card, so this stays free there.
             if row["human_gate"]:
                 _assert_human_gate_open(conn, task_id, token=token, action="gate_off")
+                # Step② (Säule 2): lifting a LIVE gate is authority-bearing — bound
+                # the rate of ad-hoc gate-offs; a bulk gate-off needs a manifest.
+                _enforce_mutation_budget(conn, task_id, "gate_off", actor=actor)
             conn.execute(
                 "UPDATE tasks SET human_gate = 0, gate_token_hash = NULL, "
                 "gate_token_issued_at = NULL, gate_token_board = NULL, "
@@ -10288,6 +10538,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, token: Optional[str]
         )
         if cur.rowcount != 1:
             return False
+        # Step② (Säule 2): structural blast-radius bound — an ad-hoc archive burst
+        # trips the rate ceiling; a bulk archive must be inside a scope-bound
+        # manifest. Rolls back this archive on violation (no human prompt).
+        _enforce_mutation_budget(conn, task_id, "archive")
         now = int(time.time())
         _cancel_active_actions_for_terminal_task(
             conn, task_id, now=now, reason="task_archived",
