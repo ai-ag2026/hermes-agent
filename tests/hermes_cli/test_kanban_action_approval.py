@@ -625,7 +625,11 @@ def test_expiry_boundary_archive_and_workspace_drift_fail_closed(
         )
         assert not kb.approve_pending_action(conn, task_id, action.id, now=100)
         assert kb.get_pending_action(conn, task_id, now=100) is None
-        assert kb.archive_task(conn, task_id)
+        # H2 (2026-07-13): the task is still running, so archiving it (which kills
+        # the worker) now requires an archive_running grant. Issue+pass one.
+        arch_token = kb.issue_gate_token(conn, task_id, action="archive_running")
+        assert arch_token is not None
+        assert kb.archive_task(conn, task_id, token=arch_token)
         assert not kb.approve_pending_action(conn, task_id, action.id, now=99)
 
 

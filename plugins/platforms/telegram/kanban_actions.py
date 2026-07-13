@@ -51,7 +51,7 @@ ACTOR = "manfred-telegram"
 #   kbg:<n>        human-gate: issue + redeem token, then unblock
 #   kbr:<id>:go    pending reply answer <id>: unblock with the answer text
 #   kbr:<id>:ask   pending reply answer <id>: keep blocked, hand to the agent
-CB_PREFIXES = ("kbu:", "kbU", "kbd:", "kba:", "kbA:", "kbg:", "kbr:")
+CB_PREFIXES = ("kbu:", "kbU", "kbd:", "kba:", "kbA:", "kbg:", "kbGoff:", "kbr:")
 
 _CMD_RE = re.compile(
     r"^\s*(unblock|entsperre[n]?|details?|verwirf|verwerfen|archivier[e]?)\s+"
@@ -164,10 +164,15 @@ def keyboard_spec(index: int, *, gated: bool = False) -> List[List[Dict[str, str
     """Inline-keyboard layout for one card ping (as plain data, not PTB types)."""
     if gated:
         first = {"text": "🔓 Gate freigeben & weiterlaufen", "data": f"kbg:{index}"}
+        # H1 (2026-07-13): authenticated tap = the operator grant to disable the
+        # gate (server-side issue+redeem). Replaces the removed free `gate off`.
+        extra = [[{"text": "🔴 Gate abschalten (nur Gate)", "data": f"kbGoff:{index}"}]]
     else:
         first = {"text": "✅ Weiterlaufen lassen", "data": f"kbu:{index}"}
+        extra = []
     return [
         [first],
+        *extra,
         [
             {"text": "📄 Details", "data": f"kbd:{index}"},
             {"text": "🗄 Verwerfen", "data": f"kba:{index}"},
@@ -285,17 +290,82 @@ def _op_gate_unblock(board: str, tid: str, reason: str) -> Tuple[bool, str]:
             False, "Token-Einlösung fehlgeschlagen (Details im Gateway-Log).")
 
 
-def _op_archive(board: str, tid: str) -> Tuple[bool, str]:
+def _op_gate_off(board: str, tid: str, reason: str = "operator gate release") -> Tuple[bool, str]:
+    """H1: disable a LIVE human-gate. Issues a fresh gate_off token and redeems it
+    immediately server-side — the authorized tap IS the operator act, so the
+    plaintext token only ever exists in this function's local scope (never
+    delivered to a channel the agent could read). This is the grant surface that
+    replaces the removed free `gate off`."""
     kb = _kb()
     with kb.connect_closing(board=board) as conn:
         task = kb.get_task(conn, tid)
         if task is None:
             return False, "Karte nicht gefunden."
+        if not task.human_gate:
+            return False, "Karte ist nicht gegatet."
+        token = kb.issue_gate_token(conn, tid, action="gate_off", board=board)
+        if not token:
+            return False, "Gate-off-Token konnte nicht erzeugt werden (Karte nicht blocked?)."
+        kb.add_comment(
+            conn, tid, ACTOR,
+            "GATE-OFF via Telegram-Button (Token einmalig erzeugt und sofort "
+            f"eingelöst): {reason}",
+        )
+        try:
+            ok = kb.set_human_gate(conn, tid, on=False, actor=ACTOR, token=token)
+        except kb.GateTokenError as exc:
+            return False, f"Token-Einlösung fehlgeschlagen: {exc}"
+        return (True, "Gate abgeschaltet") if ok else (False, "Gate-off fehlgeschlagen.")
+
+
+def _op_archive_running(board: str, tid: str) -> Tuple[bool, str]:
+    """H2: archive a card that is running live work (reclaims the run, kills the
+    worker). Issues a fresh archive_running token and redeems it immediately
+    server-side (authorized tap = operator act; token never leaves the server)."""
+    kb = _kb()
+    with kb.connect_closing(board=board) as conn:
+        task = kb.get_task(conn, tid)
+        if task is None:
+            return False, "Karte nicht gefunden."
+        token = kb.issue_gate_token(conn, tid, action="archive_running", board=board)
+        if not token:
+            return False, "Archive-running-Token konnte nicht erzeugt werden (Karte nicht running?)."
+        kb.add_comment(
+            conn, tid, ACTOR,
+            "ARCHIVE-RUNNING via Telegram-Button (laufender Worker beendet; Token "
+            "einmalig erzeugt und sofort eingelöst).",
+        )
+        try:
+            ok = kb.archive_task(conn, tid, token=token)
+        except kb.GateTokenError as exc:
+            return False, f"Token-Einlösung fehlgeschlagen: {exc}"
+        return (True, "laufende Karte archiviert (Worker beendet)") if ok else (
+            False, "Archivieren fehlgeschlagen.")
+
+
+def _op_archive(board: str, tid: str) -> Tuple[bool, str]:
+    kb = _kb()
+    route_running = False
+    with kb.connect_closing(board=board) as conn:
+        task = kb.get_task(conn, tid)
+        if task is None:
+            return False, "Karte nicht gefunden."
         if task.human_gate:
-            return False, "Karte ist human-gated — Verwerfen nur via CLI."
-        kb.add_comment(conn, tid, ACTOR, "ARCHIVIERT via Telegram-Button.")
-        ok = kb.archive_task(conn, tid)
-        return (True, "archiviert") if ok else (False, "Archivieren fehlgeschlagen.")
+            return False, "Karte ist human-gated — erst Gate abschalten (Gate-off-Button)."
+        if task.status == "running":
+            route_running = True
+        else:
+            kb.add_comment(conn, tid, ACTOR, "ARCHIVIERT via Telegram-Button.")
+            try:
+                ok = kb.archive_task(conn, tid)
+                return (True, "archiviert") if ok else (False, "Archivieren fehlgeschlagen.")
+            except kb.GateTokenError:
+                # H2: a still-bound run on a non-running card also needs the grant.
+                route_running = True
+    # H2: live work -> archive_running grant via its own authorized issue+redeem.
+    if route_running:
+        return _op_archive_running(board, tid)
+    return False, "Archivieren fehlgeschlagen."
 
 
 def _op_details(board: str, tid: str) -> Tuple[bool, str]:
@@ -445,6 +515,14 @@ async def handle_callback(query: Any, data: str) -> bool:
         )
         await _finish(note, edit_suffix=(
             f"🔓 Gate freigegeben & entsperrt um {stamp}" if ok else f"⚠ {note}"))
+    elif verb == "kbGoff":
+        # H1: disable the live gate (grant issued+redeemed server-side).
+        ok, note = await asyncio.to_thread(
+            _op_gate_off, board, tid,
+            f"Gate-off via Telegram-Button durch {user}",
+        )
+        await _finish(note, edit_suffix=(
+            f"🔴 Gate abgeschaltet um {stamp}" if ok else f"⚠ {note}"))
     elif verb == "kbd":
         ok, text = await asyncio.to_thread(_op_details, board, tid)
         try:

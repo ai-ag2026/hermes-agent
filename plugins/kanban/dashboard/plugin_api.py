@@ -973,6 +973,44 @@ def approve_terminal_action(
         conn.close()
 
 
+@router.post("/tasks/{task_id}/gate-off")
+def gate_off(task_id: str, board: Optional[str] = Query(None)):
+    """H1 (2026-07-13): disable a LIVE human-gate. Disabling a gate is the master-
+    off switch for the whole human-gate system (the 2026-07-13 incident's first
+    act); it now requires an operator grant. A dashboard request is behind the web-
+    server auth gate, so an authenticated human IS the operator act: we issue +
+    redeem a one-time gate_off grant server-side (the token never leaves the
+    server — the boundary is the authenticated session, not a readable secret).
+    Refuses when the card is not a live (blocked/scheduled + gated) gate.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        if not task.human_gate:
+            raise HTTPException(status_code=409, detail="task is not human-gated")
+        token = kanban_db.issue_gate_token(conn, task_id, action="gate_off", board=board)
+        if not token:
+            raise HTTPException(
+                status_code=409,
+                detail="gate_off grant could not be issued (card not blocked/scheduled?)",
+            )
+        try:
+            ok = kanban_db.set_human_gate(conn, task_id, on=False, actor="dashboard", token=token)
+        except kanban_db.GateTokenError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "ok": bool(ok),
+            "board": _response_board(board),
+            "task_id": task_id,
+            "human_gate": False,
+        }
+    finally:
+        conn.close()
+
+
 @router.post("/tasks/{task_id}/resolve-terminal-action")
 def resolve_terminal_action(
     task_id: str,
@@ -1043,6 +1081,26 @@ def resume_approved_action_retry(
         }
     finally:
         conn.close()
+
+
+def _dashboard_archive(conn, task_id: str, board: Optional[str] = None) -> bool:
+    """Archive from the dashboard. H2 (2026-07-13): archiving a card that is
+    running live work reclaims its run and kills the worker, so the kernel now
+    requires an archive_running grant. A dashboard request is already behind the
+    web-server auth gate — an authenticated human archiving a running card IS the
+    operator act (same trust model as the Telegram Archive-running tap). So on the
+    live case we issue + redeem a one-time archive_running grant server-side; the
+    token never leaves the server. Non-running cards archive directly, unchanged.
+    Raises kanban_db.GateTokenError only if the grant itself cannot be issued
+    (e.g. the card left the running state under us) — callers already handle it.
+    """
+    try:
+        return kanban_db.archive_task(conn, task_id)
+    except kanban_db.GateTokenError:
+        token = kanban_db.issue_gate_token(conn, task_id, action="archive_running", board=board)
+        if not token:
+            raise
+        return kanban_db.archive_task(conn, task_id, token=token)
 
 
 @router.patch("/tasks/{task_id}")
@@ -1137,7 +1195,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                             # Direct status write for drag-drop (todo -> ready etc).
                             ok = _set_status_direct(conn, task_id, "ready")
                     elif s == "archived":
-                        ok = kanban_db.archive_task(conn, task_id)
+                        ok = _dashboard_archive(conn, task_id, board)
                     elif s == "running":
                         raise HTTPException(
                             status_code=400,
@@ -1486,7 +1544,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     results.append(entry)
                     continue
                 if payload.archive:
-                    if not kanban_db.archive_task(conn, tid):
+                    if not _dashboard_archive(conn, tid, board):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status
