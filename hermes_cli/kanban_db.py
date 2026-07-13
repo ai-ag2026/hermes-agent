@@ -8613,6 +8613,17 @@ def claim_attention_delivery(
         return dict(claimed) if claimed else None
 
 
+# 2026-07-13 (Claude review G1): cap attention-delivery retries. `attempts` is
+# incremented on every claim; after this many failed sends the delivery is
+# terminalized ('cancelled') instead of being reset to 'pending' every tick.
+# Without the cap a dead channel (revoked token/banned chat) that still had a
+# live human-required attention was re-sent every notifier tick forever — an
+# unthrottled per-channel retry storm, the exact class the shadow report exists
+# to flag. A genuinely new attention or re-subscription re-syncs the row back to
+# pending with attempts=0 (sync_attention_deliveries), so this only stops a loop.
+_ATTENTION_DELIVERY_MAX_ATTEMPTS = 5
+
+
 def finish_attention_delivery(conn: sqlite3.Connection, delivery: Mapping[str, Any], *, success: bool,
                               now: Optional[int] = None) -> bool:
     """CAS a lease to delivered or retry-pending, fenced by subscription generation."""
@@ -8627,7 +8638,19 @@ def finish_attention_delivery(conn: sqlite3.Connection, delivery: Mapping[str, A
         if success:
             cur = conn.execute("UPDATE kanban_attention_deliveries SET state='delivered', delivered_at=?, lease_until=NULL, last_error=NULL, updated_at=? WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? AND state='sending' AND lease_version=? AND subscription_generation=?", (now, now, *key, lease_version, subscription_generation))
         else:
-            cur = conn.execute("UPDATE kanban_attention_deliveries SET state='pending', lease_until=NULL, last_error='send_failed', updated_at=? WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? AND state='sending' AND lease_version=? AND subscription_generation=?", (now, *key, lease_version, subscription_generation))
+            # G1: terminalize as 'cancelled' after the attempt cap instead of
+            # resetting to 'pending' forever. attempts was already incremented on
+            # this claim, so it is the count of sends tried. 'cancelled' is the
+            # existing terminal state the claim query skips.
+            cur = conn.execute(
+                "UPDATE kanban_attention_deliveries "
+                "SET state=CASE WHEN attempts>=? THEN 'cancelled' ELSE 'pending' END, "
+                "    lease_until=NULL, "
+                "    last_error=CASE WHEN attempts>=? THEN 'send_failed_capped' ELSE 'send_failed' END, "
+                "    updated_at=? "
+                "WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=? "
+                "AND state='sending' AND lease_version=? AND subscription_generation=?",
+                (_ATTENTION_DELIVERY_MAX_ATTEMPTS, _ATTENTION_DELIVERY_MAX_ATTEMPTS, now, *key, lease_version, subscription_generation))
         return cur.rowcount == 1
 
 
@@ -8705,6 +8728,19 @@ def finalize_goal_block_or_reuse_current_attention(
                 "reason_code": "goal_closeout_missing", "recurrences": recurrences,
                 **({"limit": BLOCK_RECURRENCE_LIMIT} if routed_to == "triage" else {}),
             }, run_id=run_id)
+            # 2026-07-13 (Claude review K2): project a typed attention for the
+            # goal-closeout fallback too, else get_current_attention(s) is empty
+            # and this block is invisible to the notifier + dashboard. Always
+            # "protocol": ("protocol","goal_closeout_missing") is the valid cause
+            # pair (BLOCK_CAUSE_SCOPE_ENUMS); "loop_triage" only pairs with
+            # review_required, so it cannot carry goal_closeout_missing.
+            _upsert_current_typed_attention_in_txn(
+                conn, task_id=task_id,
+                attention_type="protocol",
+                reason_code="goal_closeout_missing",
+                cause_scope={"protocol": "goal_closeout"},
+                summary="goal_closeout_missing", origin_run_id=run_id, now=now,
+            )
             hook = (get_task(conn, task_id), run_id)
     if hook is not None:
         blocked_task, run_id = hook
@@ -9352,6 +9388,21 @@ def block_task(
                 }),
                 run_id=run_id,
             )
+            # 2026-07-13 (Claude review K2): the loop-breaker escalation to triage
+            # must also project a typed attention, or get_current_attention(s)
+            # returns nothing for a runaway loop -> no push notification and no
+            # dashboard "current attention". That is exactly the runaway-autonomy
+            # scenario the whole attention pipeline exists to surface. Mirror the
+            # else-branch upsert below. Keep the ORIGINAL attention_type: the
+            # dedicated "loop_triage" type is only a valid cause pair with
+            # reason_code="review_required" (BLOCK_CAUSE_SCOPE_ENUMS), so forcing
+            # it with the original reason_code would fail fingerprint validation.
+            if typed_cause and attention_type is not None and reason_code is not None:
+                _upsert_current_typed_attention_in_txn(
+                    conn, task_id=task_id, attention_type=attention_type,
+                    reason_code=reason_code, cause_scope=cause_scope,
+                    summary=reason_code, origin_run_id=run_id, now=now,
+                )
             routed_to = "triage"
         else:
             # COALESCE(?, human_gate): passing None leaves the existing flag
@@ -9425,7 +9476,10 @@ def block_task(
             if typed_cause and attention_type is not None and reason_code is not None:
                 _upsert_current_typed_attention_in_txn(
                     conn, task_id=task_id,
-                    attention_type="loop_triage" if routed_to == "triage" else attention_type,
+                    # routed_to is always "blocked" in this else branch (the loop
+                    # breaker returns above via its own upsert); the old
+                    # `if routed_to == "triage"` ternary here was dead code.
+                    attention_type=attention_type,
                     reason_code=reason_code, cause_scope=cause_scope,
                     summary=reason_code, origin_run_id=run_id, now=now,
                 )

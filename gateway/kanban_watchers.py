@@ -162,7 +162,14 @@ def _collect_attention_storm_metrics_readonly(db_path: str | Path, now: int) -> 
 def _should_emit_shadow_warning(last_warning: dict[tuple[str, str], int], board_slug: str, decision: BackpressureShadowDecision, now: int, cooldown: int) -> bool:
     if decision.action != "pause_new_fanout":
         return False
-    key = (board_slug, decision.fingerprint)
+    # 2026-07-13 (Claude review G5): key the cooldown by (board, action), NOT by
+    # the exact triggered reason-set fingerprint. During a sustained storm whose
+    # reason set flaps tick-to-tick (e.g. blocked_run_ratio_15m oscillating around
+    # its threshold), each distinct combination got its own cooldown clock, so the
+    # aggregate warning re-fired far more often than warning_cooldown_seconds —
+    # defeating the storm report's own anti-spam intent. action is constant
+    # ("pause_new_fanout") past the guard above, so this is effectively per-board.
+    key = (board_slug, decision.action)
     previous = last_warning.get(key)
     if previous is not None and now - previous < cooldown:
         return False
@@ -611,51 +618,65 @@ class GatewayKanbanWatchersMixin:
                 deliveries = collected["events"]
                 attention_deliveries = collected["attentions"]
                 for attention_item in attention_deliveries:
-                    sub = attention_item["sub"]
-                    delivery = attention_item["delivery"]
-                    attention = attention_item["attention"]
-                    board_slug = attention_item["board"]
-                    platform_str = (sub["platform"] or "").lower()
+                    # 2026-07-13 (Claude review G3): isolate each attention item.
+                    # Previously an unexpected error anywhere in this body (e.g. a
+                    # malformed item shape reaching int(attention.id)) aborted the
+                    # WHOLE tick and starved the terminal-event loop below, delaying
+                    # every unrelated completed/blocked/crashed ping by a full tick.
+                    # Self-heals next tick (the lease/cursor is not advanced), so a
+                    # per-item guard converts a tick-wide stall into a one-item skip.
                     try:
-                        plat = _Platform(platform_str)
-                    except ValueError:
-                        await asyncio.to_thread(self._kanban_finish_attention_delivery, delivery, False, board_slug)
-                        continue
-                    adapter = self._authorization_adapter(plat, sub.get("notifier_profile") or None)
-                    if adapter is None:
-                        await asyncio.to_thread(self._kanban_finish_attention_delivery, delivery, False, board_slug)
-                        continue
-                    # Revalidate immediately before the external side effect. A
-                    # resolved/replaced projection is cancelled, never sent.
-                    if not await asyncio.to_thread(self._kanban_attention_is_current, delivery, board_slug):
-                        continue
-                    task = attention_item["task"]
-                    title = (task.title if task else sub["task_id"])[:120]
-                    text = (
-                        f"Attention for Kanban {sub['task_id']}: {title}\n"
-                        f"{attention.type} ({attention.state}) — {attention.summary}"
-                    )
-                    metadata: dict[str, Any] = {
-                        "kanban_attention_identity": {
-                            "board": str(board_slug).strip().lower(),
-                            "attention_id": int(attention.id),
-                            "attention_version": int(attention.version),
-                        },
-                    }
-                    if sub.get("thread_id"):
-                        metadata["thread_id"] = sub["thread_id"]
-                    try:
-                        await adapter.send(sub["chat_id"], text, metadata=metadata)
-                    except Exception:
-                        # Exception prose can contain platform/user secrets. Keep
-                        # durable state and logs to the closed safe code only.
-                        await asyncio.to_thread(self._kanban_finish_attention_delivery, delivery, False, board_slug)
-                        logger.warning(
-                            "kanban attention delivery retry identity=%s/%s/%s",
-                            board_slug, attention.id, attention.version,
+                        sub = attention_item["sub"]
+                        delivery = attention_item["delivery"]
+                        attention = attention_item["attention"]
+                        board_slug = attention_item["board"]
+                        platform_str = (sub["platform"] or "").lower()
+                        try:
+                            plat = _Platform(platform_str)
+                        except ValueError:
+                            await asyncio.to_thread(self._kanban_finish_attention_delivery, delivery, False, board_slug)
+                            continue
+                        adapter = self._authorization_adapter(plat, sub.get("notifier_profile") or None)
+                        if adapter is None:
+                            await asyncio.to_thread(self._kanban_finish_attention_delivery, delivery, False, board_slug)
+                            continue
+                        # Revalidate immediately before the external side effect. A
+                        # resolved/replaced projection is cancelled, never sent.
+                        if not await asyncio.to_thread(self._kanban_attention_is_current, delivery, board_slug):
+                            continue
+                        task = attention_item["task"]
+                        title = (task.title if task else sub["task_id"])[:120]
+                        text = (
+                            f"Attention for Kanban {sub['task_id']}: {title}\n"
+                            f"{attention.type} ({attention.state}) — {attention.summary}"
                         )
-                    else:
-                        await asyncio.to_thread(self._kanban_finish_attention_delivery, delivery, True, board_slug)
+                        metadata: dict[str, Any] = {
+                            "kanban_attention_identity": {
+                                "board": str(board_slug).strip().lower(),
+                                "attention_id": int(attention.id),
+                                "attention_version": int(attention.version),
+                            },
+                        }
+                        if sub.get("thread_id"):
+                            metadata["thread_id"] = sub["thread_id"]
+                        try:
+                            await adapter.send(sub["chat_id"], text, metadata=metadata)
+                        except Exception:
+                            # Exception prose can contain platform/user secrets. Keep
+                            # durable state and logs to the closed safe code only.
+                            await asyncio.to_thread(self._kanban_finish_attention_delivery, delivery, False, board_slug)
+                            logger.warning(
+                                "kanban attention delivery retry identity=%s/%s/%s",
+                                board_slug, attention.id, attention.version,
+                            )
+                        else:
+                            await asyncio.to_thread(self._kanban_finish_attention_delivery, delivery, True, board_slug)
+                    except Exception:
+                        # Never let one malformed attention item abort the tick and
+                        # starve the terminal-event loop below. Message kept generic
+                        # so no platform/user prose can leak into logs.
+                        logger.warning("kanban attention delivery: item skipped this tick (unexpected error)")
+                        continue
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]

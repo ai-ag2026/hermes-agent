@@ -134,7 +134,13 @@ def test_warning_dedupe_and_safe_aggregate_log(caplog) -> None:
     assert _should_emit_shadow_warning(seen, "board-a", one, 100, 300)
     assert _should_emit_shadow_warning(seen, "board-b", one, 100, 300)
     assert not _should_emit_shadow_warning(seen, "board-a", one, 101, 300)
-    assert _should_emit_shadow_warning(seen, "board-a", changed, 101, 300)
+    # 2026-07-13 (Claude review G5): a CHANGED reason-set on the SAME board within
+    # the cooldown is now also suppressed. The cooldown keys on (board, action),
+    # not the flapping reason fingerprint, so a sustained storm whose triggered
+    # reasons wobble around their thresholds can no longer re-fire the aggregate
+    # warning every tick (the anti-spam intent). Previously this asserted a fresh
+    # warning here — that encoded the storm-fragmentation bug.
+    assert not _should_emit_shadow_warning(seen, "board-a", changed, 101, 300)
     assert _should_emit_shadow_warning(seen, "board-a", one, 400, 300)
     from gateway.kanban_watchers import _log_shadow_warning
     _log_shadow_warning(one)
