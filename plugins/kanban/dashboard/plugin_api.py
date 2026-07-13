@@ -1082,93 +1082,99 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 )
                 if not transitioned:
                     raise _attention_result_error(transitioned)
-                updated = kanban_db.get_task(conn, task_id)
-                return {"board": _response_board(board), "task": _task_dict(updated) if updated else None}
-            pending_action = kanban_db.get_pending_action(conn, task_id)
-            if pending_action is not None and s not in ("blocked", "archived"):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "This card is waiting for an exact terminal action approval; "
-                        "use approve-terminal-action before changing its status"
-                    ),
-                )
-            ok = True
-            try:
-                if s == "done":
-                    try:
-                        ok = kanban_db.complete_task(
-                            conn, task_id,
-                            result=payload.result,
-                            summary=payload.summary,
-                            metadata=payload.metadata,
-                            board=board,
-                        )
-                    except kanban_db.CompletionEvidenceError as exc:
+                # 2026-07-13 (Claude review DB1): do NOT return here — fall through
+                # to the shared priority/title/body tail below, so a combined PATCH
+                # (status + priority/title/body in one request) applies ALL of them
+                # like every other status branch. The old early return silently
+                # dropped priority/title/body whenever a caller unblocked a card and
+                # edited it in the same request. The legacy status handler is an
+                # `else` so Core's attention-CAS above is never re-run by it.
+            else:
+                pending_action = kanban_db.get_pending_action(conn, task_id)
+                if pending_action is not None and s not in ("blocked", "archived"):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "This card is waiting for an exact terminal action approval; "
+                            "use approve-terminal-action before changing its status"
+                        ),
+                    )
+                ok = True
+                try:
+                    if s == "done":
+                        try:
+                            ok = kanban_db.complete_task(
+                                conn, task_id,
+                                result=payload.result,
+                                summary=payload.summary,
+                                metadata=payload.metadata,
+                                board=board,
+                            )
+                        except kanban_db.CompletionEvidenceError as exc:
+                            raise HTTPException(
+                                status_code=409,
+                                detail={"kind": exc.kind, "message": str(exc), **exc.details},
+                            ) from exc
+                    elif s == "blocked":
+                        ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                    elif s == "scheduled":
+                        ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
+                    elif s == "ready":
+                        # Re-open a blocked/scheduled task, or just an explicit status set.
+                        current = kanban_db.get_task(conn, task_id)
+                        if current and current.status in ("blocked", "scheduled"):
+                            pending_action = kanban_db.get_pending_action(conn, task_id)
+                            if pending_action is not None:
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail=(
+                                        "This card is waiting for an exact terminal action approval; "
+                                        "use approve-terminal-action before resuming it"
+                                    ),
+                                )
+                            ok = kanban_db.unblock_task(conn, task_id)
+                        else:
+                            # Direct status write for drag-drop (todo -> ready etc).
+                            ok = _set_status_direct(conn, task_id, "ready")
+                    elif s == "archived":
+                        ok = kanban_db.archive_task(conn, task_id)
+                    elif s == "running":
                         raise HTTPException(
-                            status_code=409,
-                            detail={"kind": exc.kind, "message": str(exc), **exc.details},
-                        ) from exc
-                elif s == "blocked":
-                    ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
-                elif s == "scheduled":
-                    ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
-                elif s == "ready":
-                    # Re-open a blocked/scheduled task, or just an explicit status set.
-                    current = kanban_db.get_task(conn, task_id)
-                    if current and current.status in ("blocked", "scheduled"):
-                        pending_action = kanban_db.get_pending_action(conn, task_id)
-                        if pending_action is not None:
+                            status_code=400,
+                            detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
+                        )
+                    elif s in ("todo", "triage", "scheduled"):
+                        ok = _set_status_direct(conn, task_id, s)
+                    else:
+                        raise HTTPException(status_code=400, detail=f"unknown status: {s}")
+                except kanban_db.GateTokenError as exc:
+                    # Human-Gate v1: every branch above can now raise this for a
+                    # blocked/scheduled human_gate=1 card (2026-07-11 repair
+                    # review) — the dashboard has no token field, so this is
+                    # always a clean refusal, never a bypass.
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                if not ok:
+                    # For ``ready``, name the blocking parent(s) so the dashboard
+                    # can render an actionable toast instead of a silent no-op.
+                    # See #26744.
+                    if s == "ready":
+                        blockers = _parents_blocking_ready(conn, task_id)
+                        if blockers:
+                            names = ", ".join(
+                                f"{p['title']!r} ({p['id']}, status={p['status']})"
+                                for p in blockers
+                            )
                             raise HTTPException(
                                 status_code=409,
                                 detail=(
-                                    "This card is waiting for an exact terminal action approval; "
-                                    "use approve-terminal-action before resuming it"
+                                    f"Cannot move to 'ready': blocked by parent(s) "
+                                    f"not done — {names}"
                                 ),
                             )
-                        ok = kanban_db.unblock_task(conn, task_id)
-                    else:
-                        # Direct status write for drag-drop (todo -> ready etc).
-                        ok = _set_status_direct(conn, task_id, "ready")
-                elif s == "archived":
-                    ok = kanban_db.archive_task(conn, task_id)
-                elif s == "running":
                     raise HTTPException(
-                        status_code=400,
-                        detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
+                        status_code=409,
+                        detail=f"status transition to {s!r} not valid from current state",
                     )
-                elif s in ("todo", "triage", "scheduled"):
-                    ok = _set_status_direct(conn, task_id, s)
-                else:
-                    raise HTTPException(status_code=400, detail=f"unknown status: {s}")
-            except kanban_db.GateTokenError as exc:
-                # Human-Gate v1: every branch above can now raise this for a
-                # blocked/scheduled human_gate=1 card (2026-07-11 repair
-                # review) — the dashboard has no token field, so this is
-                # always a clean refusal, never a bypass.
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            if not ok:
-                # For ``ready``, name the blocking parent(s) so the dashboard
-                # can render an actionable toast instead of a silent no-op.
-                # See #26744.
-                if s == "ready":
-                    blockers = _parents_blocking_ready(conn, task_id)
-                    if blockers:
-                        names = ", ".join(
-                            f"{p['title']!r} ({p['id']}, status={p['status']})"
-                            for p in blockers
-                        )
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                f"Cannot move to 'ready': blocked by parent(s) "
-                                f"not done — {names}"
-                            ),
-                        )
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"status transition to {s!r} not valid from current state",
-                )
 
         # --- priority -----------------------------------------------------
         if payload.priority is not None:

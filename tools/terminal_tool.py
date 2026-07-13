@@ -2086,6 +2086,34 @@ def terminal_tool(
                     "guard_outcome": outcome,
                 }, ensure_ascii=False)
 
+        # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
+        # restart|stop targeting hermes-gateway) must never run inside the
+        # gateway process itself. The restart would SIGTERM the gateway, which
+        # kills this very subprocess before it can complete — the service may
+        # never restart. This mirrors the `hermes gateway restart` guard in
+        # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
+        # but applies unconditionally (force=True cannot help here).
+        # 2026-07-13 (Claude review TG1): this MUST run before the full-guard
+        # pass below, which consumes a one-shot Kanban exact-action grant. When
+        # it ran after (previous position), an approved gateway-restart action
+        # burned its durable grant and only THEN got vetoed here — command never
+        # ran, yet the operator had to re-approve. Veto before consuming.
+        if os.environ.get("_HERMES_GATEWAY") == "1":
+            from hermes_cli.cron import _contains_gateway_lifecycle_command
+            if _contains_gateway_lifecycle_command(command):
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": (
+                        "Blocked: cannot restart or stop the gateway from inside the "
+                        "gateway process. The gateway would kill this command before "
+                        "it could complete (SIGTERM propagates to child processes). "
+                        "Run `hermes gateway restart` from a separate shell outside "
+                        "the running gateway."
+                    ),
+                    "status": "error",
+                }, ensure_ascii=False)
+
         # Non-forced commands take exactly one central full-guard pass before
         # any environment work. This preserves the central policy and its
         # container shortcuts while keeping hard denials out of spawn.
@@ -2333,29 +2361,6 @@ def terminal_tool(
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
-        # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
-        # restart|stop targeting hermes-gateway) must never run inside the
-        # gateway process itself. The restart would SIGTERM the gateway, which
-        # kills this very subprocess before it can complete — the service may
-        # never restart. This mirrors the `hermes gateway restart` guard in
-        # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
-        # but applies unconditionally (force=True cannot help here).
-        if os.environ.get("_HERMES_GATEWAY") == "1":
-            from hermes_cli.cron import _contains_gateway_lifecycle_command
-            if _contains_gateway_lifecycle_command(command):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: cannot restart or stop the gateway from inside the "
-                        "gateway process. The gateway would kill this command before "
-                        "it could complete (SIGTERM propagates to child processes). "
-                        "Run `hermes gateway restart` from a separate shell outside "
-                        "the running gateway."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
-
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
@@ -2364,45 +2369,23 @@ def terminal_tool(
         # an approved command can't be SIGINT-killed by a bit that landed during
         # the approval-wait (see clear_current_thread_interrupt).
         _approved_run = bool(force)
-        if _candidate_guard is None and not force:
-            approval = _check_all_guards(
-                command, env_type,
-                has_host_access=_docker_has_host_access(config),
-            )
-            if not approval["approved"]:
-                outcome = approval.get("guard_outcome") or approval.get("outcome")
-                if outcome == "approval_required":
-                    return json.dumps({
-                        "output": "", "exit_code": -1, "error": "",
-                        "status": "pending_approval", "approval_pending": True,
-                        "description": approval.get("description", "command flagged"),
-                        "pattern_key": approval.get("pattern_key", ""),
-                        "kanban_approval": approval.get("kanban_approval"),
-                        "mutation_kind": approval.get("mutation_kind"), "outcome": outcome,
-                    }, ensure_ascii=False)
-                if outcome == "retry_with_safe_alternative":
-                    return json.dumps({"output": "", "exit_code": -1,
-                                       "error": approval.get("message", ""),
-                                       "status": "safe_alternative_required", "outcome": outcome}, ensure_ascii=False)
-                # Command was blocked
-                desc = approval.get("description", "command flagged")
-                fallback_msg = (
-                    f"Command denied: {desc}. "
-                    "Use the approval prompt to allow it, or rephrase the command."
-                )
-                return json.dumps({
-                    "output": "",
-                    "exit_code": -1,
-                    "error": approval.get("message", fallback_msg),
-                    "status": "blocked"
-                }, ensure_ascii=False)
-            # Track whether approval was explicitly granted by the user
-            if approval.get("user_approved"):
-                desc = approval.get("description", "flagged as dangerous")
+        # 2026-07-13 (Claude review TG3): the central full-guard pass already ran
+        # once above (_candidate_guard) and returned early on every non-approval.
+        # The old `if _candidate_guard is None and not force:` re-guard here was
+        # dead code — _candidate_guard is always set when `not force`, and when
+        # `force` the `not force` term is False — so it never executed. Because it
+        # never ran, _approved_run stayed False for an approved command and the
+        # stale-interrupt clear below never fired (reintroducing the documented
+        # approval-wait SIGINT race), and approval_note was silently dropped. Had
+        # it ever run it would also have consumed the one-shot Kanban grant a
+        # SECOND time. Derive the flag/note from the guard result we already have.
+        if _candidate_guard is not None:
+            if _candidate_guard.get("user_approved"):
+                desc = _candidate_guard.get("description", "flagged as dangerous")
                 approval_note = f"Command required approval ({desc}) and was approved by the user."
                 _approved_run = True
-            elif approval.get("smart_approved"):
-                desc = approval.get("description", "flagged as dangerous")
+            elif _candidate_guard.get("smart_approved"):
+                desc = _candidate_guard.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
         # Validate workdir against shell injection

@@ -2702,6 +2702,28 @@ def _check_all_command_guards_legacy(command: str, env_type: str,
             "message": "Read-only audit recognized; use read_file.",
         }, GUARD_RETRY_SAFE)
 
+    # 2026-07-13 (Claude review TG2): parity with _check_execute_code_guard_legacy.
+    # Any Kanban marker means a durable control-plane context; a PARTIAL binding
+    # (e.g. HERMES_KANBAN_RUN_ID unset because the worker's current_run_id was
+    # None — a genuinely reachable spawn state) must be a HARD DENY, never a
+    # silent fall-through into the YOLO / approvals.mode=off / permanent-allowlist
+    # / interactive shortcuts below. Terminal previously lacked this check, so a
+    # partial context degraded to the ambient (non-durable, non-action-bound)
+    # approval mode while execute_code correctly refused. Placed AFTER the safe
+    # read-only heredoc redirect (which runs nothing) but BEFORE any approval
+    # bypass. A complete active binding already returned via the grant path above.
+    _kanban_markers = {
+        "task": os.environ.get("HERMES_KANBAN_TASK", "").strip(),
+        "run": os.environ.get("HERMES_KANBAN_RUN_ID", "").strip(),
+        "workspace": os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip(),
+    }
+    if any(_kanban_markers.values()) and not all(_kanban_markers.values()):
+        return _guard_outcome(
+            {"approved": False, "status": "blocked",
+             "message": "BLOCKED: incomplete Kanban action context."},
+            GUARD_DENY_HARD,
+        )
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
@@ -3138,7 +3160,12 @@ def _check_execute_code_guard_legacy(code: str, env_type: str,
         )
     if _kanban_exact_context:
         if _consume_kanban_action_grant(code, mutation_kind="execute-code-arbitrary"):
+            # 2026-07-13 (Claude review TG4): mark user_approved for parity with
+            # the terminal grant branch; code_execution_tool gates its stale-
+            # interrupt clear on user_approved, so without this an approved
+            # execute_code never clears a bit that landed during the approval wait.
             return _guard_outcome({"approved": True, "message": None,
+                                   "user_approved": True,
                                    "kanban_action_grant": True}, GUARD_ALLOW)
         durable = _record_kanban_pending_action(
             code, "An exact execute_code action is awaiting approval.",

@@ -2513,21 +2513,31 @@ def _migrate_task_attention_shape(conn: sqlite3.Connection) -> None:
     duplicates = conn.execute("SELECT action_id FROM task_attentions WHERE action_id IS NOT NULL GROUP BY action_id HAVING COUNT(*) > 1 LIMIT 1").fetchone()
     if duplicates is not None:
         raise RuntimeError("cannot rebuild task attentions: duplicate non-null action_id")
-    conn.execute("DROP TABLE IF EXISTS task_attentions_rebuild")
-    conn.execute("CREATE TABLE task_attentions_rebuild ("
-                 "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, action_id INTEGER, "
-                 "type TEXT NOT NULL CHECK(type IN ('exact_action','decision','capability','transient','loop_triage','protocol','review')), "
-                 "cause_fingerprint TEXT NOT NULL, summary TEXT NOT NULL, created_at INTEGER NOT NULL, "
-                 "version INTEGER NOT NULL DEFAULT 1, origin_run_id INTEGER, UNIQUE(task_id, cause_fingerprint))")
     version_expr = "COALESCE(version, 1)" if "version" in columns else "1"
     origin_expr = "origin_run_id" if "origin_run_id" in columns else "NULL"
-    conn.execute("INSERT INTO task_attentions_rebuild (id, task_id, action_id, type, cause_fingerprint, summary, created_at, version, origin_run_id) "
-                 f"SELECT id, task_id, action_id, type, cause_fingerprint, summary, created_at, {version_expr}, {origin_expr} FROM task_attentions")
-    conn.execute("DROP TABLE task_attentions")
-    conn.execute("ALTER TABLE task_attentions_rebuild RENAME TO task_attentions")
-    conn.execute("CREATE UNIQUE INDEX uq_task_attentions_action_live ON task_attentions(action_id) WHERE action_id IS NOT NULL")
-    conn.execute("CREATE UNIQUE INDEX uq_task_attentions_task_cause ON task_attentions(task_id, cause_fingerprint)")
-    conn.execute("CREATE INDEX idx_task_attentions_task_created ON task_attentions(task_id, created_at DESC)")
+    # 2026-07-13 (Claude review K1): the rebuild MUST be atomic. Connections are
+    # autocommit (isolation_level=None), so each execute() below would commit on
+    # its own. A crash between `DROP TABLE task_attentions` and the RENAME would
+    # leave the DB with no task_attentions table at all; the next boot's
+    # SCHEMA_SQL recreates it EMPTY, this migration then sees the full shape and
+    # returns without ever recovering the orphaned task_attentions_rebuild rows
+    # -> silent total loss of every typed attention. write_txn (BEGIN IMMEDIATE)
+    # makes the whole DROP+RENAME+reindex one all-or-nothing unit, matching the
+    # sibling _migrate_pending_action_lifecycle. (Docstring already claimed this.)
+    with write_txn(conn):
+        conn.execute("DROP TABLE IF EXISTS task_attentions_rebuild")
+        conn.execute("CREATE TABLE task_attentions_rebuild ("
+                     "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, action_id INTEGER, "
+                     "type TEXT NOT NULL CHECK(type IN ('exact_action','decision','capability','transient','loop_triage','protocol','review')), "
+                     "cause_fingerprint TEXT NOT NULL, summary TEXT NOT NULL, created_at INTEGER NOT NULL, "
+                     "version INTEGER NOT NULL DEFAULT 1, origin_run_id INTEGER, UNIQUE(task_id, cause_fingerprint))")
+        conn.execute("INSERT INTO task_attentions_rebuild (id, task_id, action_id, type, cause_fingerprint, summary, created_at, version, origin_run_id) "
+                     f"SELECT id, task_id, action_id, type, cause_fingerprint, summary, created_at, {version_expr}, {origin_expr} FROM task_attentions")
+        conn.execute("DROP TABLE task_attentions")
+        conn.execute("ALTER TABLE task_attentions_rebuild RENAME TO task_attentions")
+        conn.execute("CREATE UNIQUE INDEX uq_task_attentions_action_live ON task_attentions(action_id) WHERE action_id IS NOT NULL")
+        conn.execute("CREATE UNIQUE INDEX uq_task_attentions_task_cause ON task_attentions(task_id, cause_fingerprint)")
+        conn.execute("CREATE INDEX idx_task_attentions_task_created ON task_attentions(task_id, created_at DESC)")
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
