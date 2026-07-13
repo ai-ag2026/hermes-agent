@@ -4368,12 +4368,23 @@ def _enforce_mutation_budget(
             except (ValueError, TypeError):
                 bound = set()
             if task_id not in bound:
+                # Step⑤ anomaly (Säule 3): a scope-creep attempt — exactly the
+                # 2026-07-13 incident's 46-vs-30 shape. Structured, greppable in
+                # journald (KANBAN_ANOMALY) for the ops digest / alert.
+                _log.warning(
+                    "KANBAN_ANOMALY kind=scope_creep op=%s task=%s actor=%s manifest=%s bound=%d",
+                    op, task_id, actor, manifest["id"], len(bound),
+                )
                 raise MutationBudgetError(
                     f"scope-creep: task {task_id} is not in the active '{op}' manifest "
                     f"(#{manifest['id']}, {len(bound)} ids). A bulk manifest bounds the "
                     "exact target set — extend or close it instead of reaching outside."
                 )
             if int(manifest["consumed"]) >= int(manifest["max_size"]):
+                _log.warning(
+                    "KANBAN_ANOMALY kind=manifest_exhausted op=%s task=%s actor=%s manifest=%s max=%s",
+                    op, task_id, actor, manifest["id"], manifest["max_size"],
+                )
                 raise MutationBudgetError(
                     f"manifest #{manifest['id']} exhausted: already consumed "
                     f"{manifest['consumed']}/{manifest['max_size']} '{op}' mutations."
@@ -4395,6 +4406,10 @@ def _enforce_mutation_budget(
             (op, now - window),
         ).fetchone()
         if recent and int(recent["n"]) >= ceiling:
+            _log.warning(
+                "KANBAN_ANOMALY kind=rate_ceiling op=%s task=%s actor=%s recent=%d window=%ds limit=%d",
+                op, task_id, actor, int(recent["n"]), window, ceiling,
+            )
             raise MutationBudgetError(
                 f"rate ceiling: {int(recent['n'])} '{op}' mutations in the last {window}s "
                 f"(limit {ceiling}). For an intended bulk change declare a scope-bound "
@@ -4462,6 +4477,93 @@ def get_active_manifest(conn: sqlite3.Connection, op: str):
         "AND expires_at > ? ORDER BY created_at DESC LIMIT 1",
         (op, int(time.time())),
     ).fetchone()
+
+
+# Step⑤ (2026-07-14) — detect-and-digest (Säule 3). The operator reviews a periodic
+# SUMMARY of what the board's automated actors did (archives, gate-offs, restores,
+# blocks), instead of pre-approving each action. Reversibility (Säule 1) makes any
+# item in the digest undoable; the budget (Säule 2) makes a runaway impossible. The
+# digest is the human-in-the-loop surface that replaces the removed per-action gates.
+
+# task_events kinds worth surfacing in the digest, grouped for the human.
+_DIGEST_EVENT_KINDS = (
+    "archived", "unarchived", "gate_set", "unblocked", "blocked",
+    "gate_token_rejected", "block_loop_detected",
+)
+
+
+def board_mutation_digest(conn: sqlite3.Connection, *, since_seconds: int = 86400) -> dict:
+    """Return a structured summary of recent board activity for the operator digest.
+
+    Reads the Step② ``mutation_log`` (every allowed rate-limited/destructive mutation)
+    + recent bulk manifests + the salient ``task_events``. Pure read; no mutation.
+    ``since_seconds`` bounds the window (default 24h)."""
+    now = int(time.time())
+    cutoff = now - max(1, int(since_seconds))
+    out: dict = {"window_seconds": int(since_seconds), "generated_at": now}
+
+    # Allowed destructive/authority mutations, split ad-hoc vs manifest-bound.
+    rows = conn.execute(
+        "SELECT op, manifest_id, actor, COUNT(*) AS n FROM mutation_log "
+        "WHERE at > ? GROUP BY op, (manifest_id IS NULL), actor ORDER BY n DESC",
+        (cutoff,),
+    ).fetchall()
+    mutations: dict = {}
+    for r in rows:
+        op = r["op"]
+        bucket = mutations.setdefault(op, {"total": 0, "ad_hoc": 0, "manifest": 0, "by_actor": {}})
+        bucket["total"] += r["n"]
+        if r["manifest_id"] is None:
+            bucket["ad_hoc"] += r["n"]
+        else:
+            bucket["manifest"] += r["n"]
+        if r["actor"]:
+            bucket["by_actor"][r["actor"]] = bucket["by_actor"].get(r["actor"], 0) + r["n"]
+    out["mutations"] = mutations
+
+    # Bulk manifests declared in the window (auditable scope-bound intents).
+    out["manifests"] = [
+        {"id": r["id"], "op": r["kind"], "size": r["max_size"], "consumed": r["consumed"],
+         "actor": r["actor"], "status": r["status"], "rationale": r["rationale"],
+         "created_at": r["created_at"]}
+        for r in conn.execute(
+            "SELECT id, kind, max_size, consumed, actor, status, rationale, created_at "
+            "FROM mutation_manifest WHERE created_at > ? ORDER BY created_at DESC",
+            (cutoff,),
+        ).fetchall()
+    ]
+
+    # Salient events, counted by kind.
+    ev = conn.execute(
+        "SELECT kind, COUNT(*) AS n FROM task_events "
+        "WHERE created_at > ? AND kind IN (%s) GROUP BY kind"
+        % ",".join("?" * len(_DIGEST_EVENT_KINDS)),
+        (cutoff, *_DIGEST_EVENT_KINDS),
+    ).fetchall()
+    out["events"] = {r["kind"]: r["n"] for r in ev}
+    return out
+
+
+def format_mutation_digest(digest: dict, *, board_label: str = "board") -> str:
+    """Render :func:`board_mutation_digest` output as a compact human-readable block."""
+    hrs = round(digest.get("window_seconds", 0) / 3600, 1)
+    lines = [f"=== Kanban digest ({board_label}, last {hrs}h) ==="]
+    muts = digest.get("mutations") or {}
+    if not muts:
+        lines.append("  no rate-limited mutations (archive/gate_off)")
+    for op, b in muts.items():
+        actors = ", ".join(f"{a}:{n}" for a, n in sorted(b["by_actor"].items(), key=lambda x: -x[1])) or "—"
+        lines.append(f"  {op}: {b['total']} (ad-hoc {b['ad_hoc']}, manifest {b['manifest']}) by {actors}")
+    mans = digest.get("manifests") or []
+    if mans:
+        lines.append(f"  bulk manifests: {len(mans)}")
+        for m in mans[:8]:
+            lines.append(f"    #{m['id']} {m['op']} {m['consumed']}/{m['size']} [{m['status']}] "
+                         f"by {m['actor'] or '—'}: {m['rationale'] or ''}")
+    ev = digest.get("events") or {}
+    if ev:
+        lines.append("  events: " + ", ".join(f"{k}={v}" for k, v in sorted(ev.items())))
+    return "\n".join(lines)
 
 
 def _end_run(

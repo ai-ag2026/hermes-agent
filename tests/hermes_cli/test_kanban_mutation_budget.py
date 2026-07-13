@@ -143,6 +143,35 @@ def test_open_manifest_validates_op_and_ids(kanban_home):
             kb.open_mutation_manifest(conn, op="archive", task_ids=[])     # empty
 
 
+# --- Step⑤ WP⑤.1 (2026-07-14): operator digest (Säule 3) -----------------------
+
+def test_digest_summarizes_adhoc_and_manifest_mutations(kanban_home):
+    with kb.connect() as conn:
+        # 2 ad-hoc archives.
+        for t in _mk(conn, 2, prefix="adhoc"):
+            kb.archive_task(conn, t)
+        # 3 manifest-bound archives.
+        bulk = _mk(conn, 3, prefix="bulk")
+        kb.open_mutation_manifest(conn, op="archive", task_ids=bulk, actor="curator",
+                                  rationale="cleanup")
+        for t in bulk:
+            kb.archive_task(conn, t)
+        d = kb.board_mutation_digest(conn, since_seconds=3600)
+        arch = d["mutations"]["archive"]
+        assert arch["total"] == 5 and arch["ad_hoc"] == 2 and arch["manifest"] == 3
+        assert len(d["manifests"]) == 1 and d["manifests"][0]["consumed"] == 3
+        assert d["events"].get("archived") == 5
+        text = kb.format_mutation_digest(d)
+        assert "archive: 5" in text and "bulk manifests: 1" in text
+
+
+def test_digest_empty_window(kanban_home):
+    with kb.connect() as conn:
+        d = kb.board_mutation_digest(conn, since_seconds=3600)
+        assert d["mutations"] == {}
+        assert "no rate-limited mutations" in kb.format_mutation_digest(d)
+
+
 def test_enforce_fails_open_when_tables_absent(kanban_home):
     # Drop the Step② tables to simulate an un-migrated DB: enforce must NOT brick.
     with kb.connect() as conn:

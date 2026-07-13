@@ -750,6 +750,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Do NOT arm the one-shot resume of a card archived mid-run",
     )
 
+    # --- digest (detect-and-digest, Säule 3) ---
+    p_digest = sub.add_parser(
+        "digest", help="Operator digest of recent board mutations (archives/gate-offs/restores)")
+    p_digest.add_argument("--since-hours", type=float, default=24.0,
+                          help="Window in hours (default 24)")
+    p_digest.add_argument("--json", action="store_true", help="Emit the raw digest as JSON")
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -1118,6 +1125,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "unarchive": _cmd_unarchive,
+            "digest":   _cmd_digest,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -2490,6 +2498,17 @@ def _cmd_archive(args: argparse.Namespace) -> int:
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_digest(args: argparse.Namespace) -> int:
+    since = int(max(0.0, float(getattr(args, "since_hours", 24.0))) * 3600) or 86400
+    with kb.connect_closing() as conn:
+        digest = kb.board_mutation_digest(conn, since_seconds=since)
+    if getattr(args, "json", False):
+        print(json.dumps(digest, ensure_ascii=False, indent=2))
+    else:
+        print(kb.format_mutation_digest(digest))
+    return 0
 
 
 def _cmd_unarchive(args: argparse.Namespace) -> int:
