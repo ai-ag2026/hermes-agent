@@ -1626,6 +1626,12 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     last_event_id INTEGER NOT NULL DEFAULT 0,
     active        INTEGER NOT NULL DEFAULT 1,
     generation    INTEGER NOT NULL DEFAULT 1,
+    -- Attention escalation tier (2026-07-13): 0 = deliver immediately. A channel
+    -- with escalate_after_seconds>0 (e.g. the Telegram ops channel) is only armed
+    -- for an attention that has gone unaddressed that long — the WebUI shows the
+    -- attention immediately, so this holds the ops push back until the delay
+    -- elapses; if the operator resolves it first, it is never delivered.
+    escalate_after_seconds INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2561,6 +2567,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "subscription_generation INTEGER NOT NULL DEFAULT 1",
         )
 
+    sub_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
+    }
+    if sub_cols and "escalate_after_seconds" not in sub_cols:
+        # 2026-07-13: per-subscription attention escalation delay (ops-channel tier).
+        _add_column_if_missing(
+            conn, "kanban_notify_subs", "escalate_after_seconds",
+            "escalate_after_seconds INTEGER NOT NULL DEFAULT 0",
+        )
+
     action_cols = {
         row["name"] for row in conn.execute("PRAGMA table_info(task_pending_actions)")
     }
@@ -3026,6 +3042,7 @@ _REBUILD_SPECS = {
         " notifier_profile TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,"
         " generation INTEGER NOT NULL DEFAULT 1,"
+        " escalate_after_seconds INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -8682,6 +8699,18 @@ def sync_attention_deliveries(
             cancelled += cur.rowcount
             subs = conn.execute("SELECT * FROM kanban_notify_subs WHERE task_id=? AND active=1", (task_id,)).fetchall()
             for sub in subs:
+                # Escalation tier (WebUI-first -> ops-channel after N seconds): a sub
+                # with escalate_after_seconds>0 is only armed once the attention has
+                # been current that long. The WebUI reads current attention directly,
+                # so it always shows immediately; this defers the ops push. If the
+                # operator resolves the attention first, it is no longer current next
+                # tick and this delivery is never created (no ops escalation).
+                escalate_after = (
+                    int(sub["escalate_after_seconds"] or 0)
+                    if "escalate_after_seconds" in sub.keys() else 0
+                )
+                if escalate_after > 0 and now < int(attention.created_at) + escalate_after:
+                    continue
                 key = (task_id, attention.id, attention.version, sub['platform'], sub['chat_id'], sub['thread_id'] or '')
                 row = conn.execute("SELECT subscription_generation FROM kanban_attention_deliveries WHERE task_id=? AND attention_id=? AND attention_version=? AND platform=? AND chat_id=? AND thread_id=?", key).fetchone()
                 if row is None:
@@ -13951,16 +13980,23 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
+    escalate_after_seconds: int = 0,
 ) -> None:
-    """Register a channel, reactivating a tombstone with a new ABA generation."""
+    """Register a channel, reactivating a tombstone with a new ABA generation.
+
+    ``escalate_after_seconds`` > 0 marks an escalation-tier channel (e.g. the
+    Telegram ops channel): its attention deliveries are only armed after the
+    attention has gone unaddressed that long (see ``sync_attention_deliveries``).
+    """
     now = int(time.time())
     thread = thread_id or ""
+    esc = int(escalate_after_seconds or 0)
     with write_txn(conn):
         row = conn.execute("SELECT active FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?", (task_id, platform, chat_id, thread)).fetchone()
         if row is None:
-            conn.execute("INSERT INTO kanban_notify_subs (task_id,platform,chat_id,thread_id,user_id,notifier_profile,created_at,active,generation) VALUES (?,?,?,?,?,?,?,?,1)", (task_id, platform, chat_id, thread, user_id, notifier_profile, now, 1))
+            conn.execute("INSERT INTO kanban_notify_subs (task_id,platform,chat_id,thread_id,user_id,notifier_profile,created_at,active,generation,escalate_after_seconds) VALUES (?,?,?,?,?,?,?,?,1,?)", (task_id, platform, chat_id, thread, user_id, notifier_profile, now, 1, esc))
         elif not int(row['active']):
-            conn.execute("UPDATE kanban_notify_subs SET active=1, generation=generation+1, user_id=COALESCE(?, user_id), notifier_profile=COALESCE(?, notifier_profile) WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?", (user_id, notifier_profile, task_id, platform, chat_id, thread))
+            conn.execute("UPDATE kanban_notify_subs SET active=1, generation=generation+1, user_id=COALESCE(?, user_id), notifier_profile=COALESCE(?, notifier_profile), escalate_after_seconds=? WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?", (user_id, notifier_profile, esc, task_id, platform, chat_id, thread))
         elif notifier_profile:
             conn.execute("UPDATE kanban_notify_subs SET notifier_profile=? WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? AND (notifier_profile IS NULL OR notifier_profile='')", (notifier_profile, task_id, platform, chat_id, thread))
 

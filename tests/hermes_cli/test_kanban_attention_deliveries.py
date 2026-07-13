@@ -17,6 +17,43 @@ def _attention_with_sub(tmp_path, monkeypatch, channels=1):
     return tid, attention
 
 
+def test_attention_escalation_tier_defers_ops_channel_until_delay(tmp_path, monkeypatch):
+    """WebUI-first -> ops-channel-after-N escalation (2026-07-13): a sub with
+    escalate_after_seconds>0 (the Telegram ops channel) is only armed once the
+    attention has been current that long; an immediate (0) sub arms at once. The
+    WebUI shows the attention immediately regardless (it reads current attention),
+    so this only defers the ops push."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "esc.db"))
+    kb.init_db()
+    conn = kb.connect()
+    tid = kb.create_task(conn, title="t", assignee="worker")
+    kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="dialog")  # immediate
+    kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="ops",
+                      escalate_after_seconds=900)
+    att = kb.upsert_current_typed_attention(
+        conn, task_id=tid, attention_type="decision", reason_code="credential_choice",
+        summary="need decision", now=1000,
+    )
+
+    def _armed(chat, now):
+        return kb.claim_attention_delivery(
+            conn, task_id=tid, attention_id=att.id, attention_version=att.version,
+            platform="telegram", chat_id=chat, now=now,
+        ) is not None
+
+    # At creation: only the immediate dialog channel is armed; ops is deferred.
+    assert kb.sync_attention_deliveries(conn, task_ids=[tid], now=1000)["created"] == 1
+    assert _armed("dialog", 1000)
+    assert not _armed("ops", 1000)
+    # Still before the delay: ops stays deferred (nothing new created).
+    assert kb.sync_attention_deliveries(conn, task_ids=[tid], now=1899)["created"] == 0
+    assert not _armed("ops", 1899)
+    # At the delay boundary: ops is now armed.
+    assert kb.sync_attention_deliveries(conn, task_ids=[tid], now=1900)["created"] == 1
+    assert _armed("ops", 1900)
+    conn.close()
+
+
 def test_attention_delivery_is_per_channel_durable_and_retryable(tmp_path, monkeypatch):
     tid, attention = _attention_with_sub(tmp_path, monkeypatch, channels=2)
     conn = kb.connect()
