@@ -657,6 +657,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_gate.add_argument("task_id")
     p_gate.add_argument("state", choices=["on", "off"])
+    p_gate.add_argument(
+        "--token", default=None,
+        help="One-time gate_off grant (H1). Turning a LIVE gate off is approved "
+             "via the WebUI kanban extension or the Telegram Gate-off button (grant "
+             "issued+redeemed server-side there). This flag is only for a human who "
+             "already holds a token; the CLI is not a grant channel.",
+    )
 
     p_gate_token = sub.add_parser(
         "gate-token",
@@ -720,6 +727,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         nargs="+",
         default=None,
         help="Permanently delete already-archived task ids from the board",
+    )
+    p_archive.add_argument(
+        "--token", default=None,
+        help="One-time archive_running grant (H2). Archiving a card that is "
+             "running live work (kills the worker) is approved via the WebUI kanban "
+             "extension or the Telegram Archive-running button (grant issued+"
+             "redeemed server-side there). This flag is only for a human who "
+             "already holds a token; the CLI is not a grant channel.",
     )
 
     # --- tail ---
@@ -2291,6 +2306,12 @@ def _cmd_gate(args: argparse.Namespace) -> int:
     Refused inside a worker session for the same reason `unblock` is
     (Audit 2026-07-10 pattern): a worker shelling out to `kanban gate
     <id> off` would otherwise be able to strip its own hard gate.
+
+    H1 (2026-07-13): turning a LIVE gate OFF requires an operator grant issued +
+    redeemed server-side on an authenticated Telegram-tap (Gate-off button) or
+    WebUI-extension action — ntfy is NOT a grant channel. The CLI is not a grant
+    channel either (an autonomous orchestrator reaches it too), so it refuses on a
+    live gate and points there.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         print(
@@ -2302,16 +2323,36 @@ def _cmd_gate(args: argparse.Namespace) -> int:
         return 1
     author = _profile_author()
     on = args.state == "on"
+    token = getattr(args, "token", None)
     with kb.connect_closing() as conn:
-        ok = kb.set_human_gate(conn, args.task_id, on=on, actor=author)
+        # H1: turning a LIVE gate off requires an operator grant (Telegram/WebUI).
+        # A gate flag on a non-blocked card is inert -> gate off stays free there.
+        if not on and token is None:
+            gated = conn.execute(
+                "SELECT human_gate, status FROM tasks WHERE id = ?", (args.task_id,)
+            ).fetchone()
+            if gated is None:
+                print(f"no such task: {args.task_id}", file=sys.stderr)
+                return 1
+            if gated["human_gate"] and gated["status"] in ("blocked", "scheduled"):
+                print(
+                    f"refused: {args.task_id} is human-gated. Disabling a live gate "
+                    "is a protected action — approve it via the WebUI kanban "
+                    "extension (Gate-off) or the Telegram Gate-off button. The CLI "
+                    "is not a grant channel (H1).",
+                    file=sys.stderr,
+                )
+                return 1
+        try:
+            ok = kb.set_human_gate(conn, args.task_id, on=on, actor=author, token=token)
+        except kb.GateTokenError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
     if on:
-        print(
-            f"{args.task_id}: human gate ON — if the card is blocked, a "
-            "one-time token will be pushed via ntfy within the next tick"
-        )
+        print(f"{args.task_id}: human gate ON")
     else:
         print(f"{args.task_id}: human gate OFF")
     return 0
@@ -2419,8 +2460,37 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                 else:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
+        token = getattr(args, "token", None)
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            try:
+                ok = kb.archive_task(conn, tid, token=token)
+            except kb.GateTokenError as exc:
+                # H2: archiving a running card kills the worker and needs an
+                # operator grant. The CLI is not a grant channel; approve via the
+                # WebUI extension or the Telegram Archive-running button. A gated
+                # (blocked) card or a rejected token surfaces the refusal unchanged.
+                st = conn.execute(
+                    "SELECT status, current_run_id, worker_pid FROM tasks WHERE id = ?",
+                    (tid,),
+                ).fetchone()
+                is_live = bool(st) and (
+                    st["status"] == "running"
+                    or st["current_run_id"] is not None
+                    or st["worker_pid"] is not None
+                )
+                if is_live and token is None:
+                    print(
+                        f"refused: {tid} is running live work — archiving it kills "
+                        "the worker. Approve it via the WebUI kanban extension "
+                        "(Archive-running) or the Telegram Archive-running button. "
+                        "The CLI is not a grant channel (H2).",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"refused: {exc}", file=sys.stderr)
+                failed.append(tid)
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:

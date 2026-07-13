@@ -6421,9 +6421,14 @@ def test_human_gate_ntfy_failure_is_fail_closed(kanban_home, monkeypatch):
             kb.unblock_task(conn, tid, actor="a", reason="x", token="anything")
         assert kb.get_task(conn, tid).status == "blocked"
 
-        # The only rescue path.
-        assert kb.set_human_gate(conn, tid, on=False, actor="manfred") is True
-        assert kb.unblock_task(conn, tid, actor="manfred", reason="rescued") is True
+        # H1 (2026-07-13): `gate off` is no longer a free rescue — disabling a
+        # live gate now itself requires a fresh gate_off grant. With ntfy down (and
+        # ntfy is not a grant channel anyway) no such grant reaches the CLI, so gate
+        # off is fail-closed too. The old free rescue was the laundering hole.
+        with pytest.raises(kb.GateTokenError):
+            kb.set_human_gate(conn, tid, on=False, actor="manfred")
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).human_gate is True
 
 
 def test_human_gate_missing_ntfy_config_is_fail_closed(kanban_home, monkeypatch):
@@ -6890,10 +6895,82 @@ def test_repair_reclaim_task_refuses_stall_blocked_gated_card(kanban_home):
         ).fetchone()
         assert still_locked["claim_lock"] is not None  # untouched by the refused attempt
 
-        # Rescue path: gate off, then reclaim succeeds normally.
-        assert kb.set_human_gate(conn, tid, on=False, actor="manfred") is True
+        # Rescue path: gate off, then reclaim succeeds normally. H1 (2026-07-13):
+        # gate off now itself requires a fresh gate_off grant; issue one directly
+        # (the delivery surface is not under test here) and pass it.
+        gate_off_token = kb.issue_gate_token(conn, tid, action="gate_off")
+        assert gate_off_token is not None
+        assert kb.set_human_gate(conn, tid, on=False, actor="manfred", token=gate_off_token) is True
         assert kb.reclaim_task(conn, tid, reason="operator abort") is True
         assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_gate_off_requires_grant_h1(kanban_home, monkeypatch):
+    """H1 (2026-07-13): disabling a LIVE (blocked+gated) gate requires a fresh
+    gate_off grant. No token -> fail closed; wrong token -> refused; a valid token
+    turns the gate off. Closes the approval-laundering hole where any orchestrator/
+    session actor could strip a live gate with one unauth'd call."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+
+        with pytest.raises(kb.GateTokenError):
+            kb.set_human_gate(conn, tid, on=False, actor="op")
+        assert kb.get_task(conn, tid).human_gate is True
+
+        token = kb.issue_gate_token(conn, tid, action="gate_off")
+        assert token is not None
+
+        with pytest.raises(kb.GateTokenError):
+            kb.set_human_gate(conn, tid, on=False, actor="op", token="wrong-token")
+        assert kb.get_task(conn, tid).human_gate is True
+
+        assert kb.set_human_gate(conn, tid, on=False, actor="op", token=token) is True
+        assert kb.get_task(conn, tid).human_gate is False
+
+
+def test_gate_off_free_when_not_live_gate_h1(kanban_home):
+    """H1: a human_gate flag on a non-blocked card is inert; gate off stays free
+    (no grant), matching _assert_human_gate_open's blocked/scheduled scope."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="plain", assignee="worker")
+        assert kb.set_human_gate(conn, tid, on=True, actor="op") is True  # gated but todo
+        assert kb.set_human_gate(conn, tid, on=False, actor="op") is True
+        assert kb.get_task(conn, tid).human_gate is False
+
+
+def test_archive_running_requires_grant_h2(kanban_home, monkeypatch):
+    """H2 (2026-07-13): archiving a RUNNING card reclaims its run and kills the
+    worker, so it requires a fresh archive_running grant. No token -> fail closed
+    and the card stays running; a valid token archives it (incident's first act)."""
+    monkeypatch.setenv("NTFY_TOPIC", "test-topic")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="running", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb.get_task(conn, tid).status == "running"
+
+        with pytest.raises(kb.GateTokenError):
+            kb.archive_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "running"
+
+        token = kb.issue_gate_token(conn, tid, action="archive_running")
+        assert token is not None
+
+        with pytest.raises(kb.GateTokenError):
+            kb.archive_task(conn, tid, token="wrong")
+        assert kb.get_task(conn, tid).status == "running"
+
+        assert kb.archive_task(conn, tid, token=token) is True
+        assert kb.get_task(conn, tid).status == "archived"
+
+
+def test_archive_nonrunning_is_free_h2(kanban_home):
+    """H2: archiving a non-running, unbound card stays free (no grant required)."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="todo", assignee="worker")
+        assert kb.archive_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "archived"
 
 
 def test_repair_promote_task_refuses_gated_blocked_card(kanban_home):

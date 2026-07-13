@@ -7374,7 +7374,15 @@ def issue_gate_token(
         row = conn.execute(
             "SELECT status, human_gate FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
-        if row is None or row["status"] != "blocked" or not row["human_gate"]:
+        if row is None:
+            return None
+        if action == "archive_running":
+            # H2: an archive_running grant is only meaningful while the card is
+            # actually running live work — the exact disposal we gate. (gate_off
+            # and the unblock-family still require blocked + human_gate below.)
+            if row["status"] != "running":
+                return None
+        elif row["status"] != "blocked" or not row["human_gate"]:
             return None
         board_slug = _normalize_board_slug(board) or get_current_board()
         scope_hash = governance_scope_hash(conn, task_id, board=board_slug)
@@ -7519,22 +7527,33 @@ def set_human_gate(
     *,
     on: bool,
     actor: Optional[str] = None,
+    token: Optional[str] = None,
 ) -> bool:
     """CLI-only: mark/unmark a card as human-gated (``kanban gate <id>
     on|off``). No tool surface exposes this — see kanban_tools.py.
 
-    Turning the gate off also clears any pending token hash. This is the
-    documented rescue path when ntfy delivery fails or was never
-    configured: since the plaintext token never existed anywhere in that
-    case, ``gate off`` is the only way back to ``ready``.
+    H1 (2026-07-13): turning a LIVE gate OFF is itself a protected action — it is
+    the master-off switch for the entire human-gate system, and the 2026-07-13
+    incident's first step was exactly ``gate off`` on four live gates followed by
+    archival. It now requires a valid ``gate_off`` grant (same action-bound,
+    governance-scoped, single-use token as unblock), issued + redeemed server-side
+    on an authenticated Telegram-tap / WebUI-extension action — ntfy is NOT a grant
+    channel. ``gate on`` is unprotected (enabling protection is always safe). A gate
+    flag on a non-blocked card is inert and stays free.
     """
     with write_txn(conn):
-        row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        row = conn.execute("SELECT id, human_gate FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
             return False
         if on:
             conn.execute("UPDATE tasks SET human_gate = 1 WHERE id = ?", (task_id,))
         else:
+            # H1: require a valid gate_off grant when a live gate is being lifted.
+            # _assert_human_gate_open enforces only for a blocked/scheduled card
+            # with human_gate=1 (the real gated state) and consumes the one-shot
+            # token; it is a no-op for an ungated card, so this stays free there.
+            if row["human_gate"]:
+                _assert_human_gate_open(conn, task_id, token=token, action="gate_off")
             conn.execute(
                 "UPDATE tasks SET human_gate = 0, gate_token_hash = NULL, "
                 "gate_token_issued_at = NULL, gate_token_board = NULL, "
@@ -7697,6 +7716,130 @@ def _assert_human_gate_open(
         (task_id,),
     )
     return True
+
+
+def _assert_running_archive_grant(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    token: Optional[str] = None,
+) -> bool:
+    """H2 enforcement: archiving a card that is running live work (which reclaims
+    its run and disposes of the worker's session) requires a fresh, out-of-band-
+    delivered operator grant bound to action ``archive_running``.
+
+    Mirrors :func:`_assert_human_gate_open` (TTL / board / task_id / action /
+    governance-scope / hash + brute-force lockout + atomic single-use consume) but
+    keys on live work instead of a ``blocked``/``scheduled`` human-gated card. The
+    danger here is not a bypassed decision-gate — it is silently killing a healthy
+    running worker via archive (the 2026-07-13 incident's very first act,
+    t_9ba6bae0). Broader trigger: status='running' OR a still-bound current_run_id/
+    worker_pid. A non-running, unbound card returns False (no-op). Raises
+    GateTokenError when the card IS live but ``token`` is missing/wrong/expired/
+    scope-changed. MUST run inside the archive's write_txn. Same GateTokenError
+    type archive_task already raises for gated cards, so callers already handle it.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id, worker_pid, gate_token_hash, gate_token_issued_at, "
+        "gate_token_board, gate_token_task_id, gate_token_action, "
+        "gate_scope_hash, gate_scope_version, "
+        "gate_failed_attempts, gate_failure_window_started_at, gate_locked_until "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or not (
+        row["status"] == "running"
+        or row["current_run_id"] is not None
+        or row["worker_pid"] is not None
+    ):
+        return False
+
+    now = int(time.time())
+    cfg = _human_gate_config()
+    locked_until = int(row["gate_locked_until"] or 0)
+    if locked_until > now:
+        raise GateTokenError(f"{task_id} archive-running grant is temporarily locked")
+    if locked_until:
+        conn.execute(
+            "UPDATE tasks SET gate_failed_attempts = 0, "
+            "gate_failure_window_started_at = NULL, gate_locked_until = NULL WHERE id = ?",
+            (task_id,),
+        )
+        row = dict(row)
+        row["gate_failed_attempts"] = 0
+        row["gate_failure_window_started_at"] = None
+        row["gate_locked_until"] = None
+
+    stored_hash = row["gate_token_hash"]
+    if not stored_hash:
+        raise GateTokenError(
+            f"{task_id} is running live work — archiving it reclaims the run and "
+            "kills the worker, so it requires an operator grant. Approve it via the "
+            "WebUI kanban extension (Archive-running) or the Telegram Archive-running "
+            "button."
+        )
+    scoped_board = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+    current_board = _normalize_board_slug(scoped_board) if scoped_board else get_current_board()
+    failure_reason = None
+    issued_at = row["gate_token_issued_at"]
+    if not issued_at or now - int(issued_at) > cfg["token_ttl_seconds"]:
+        failure_reason = "token has expired"
+    elif row["gate_token_board"] != current_board:
+        failure_reason = "token was issued for a different board"
+    elif row["gate_token_task_id"] != task_id:
+        failure_reason = "token was issued for a different task"
+    elif row["gate_token_action"] != "archive_running":
+        failure_reason = "token was issued for a different action"
+    elif (
+        row["gate_scope_version"] != GOVERNANCE_SCOPE_VERSION
+        or not row["gate_scope_hash"]
+        or not hmac.compare_digest(
+            row["gate_scope_hash"], governance_scope_hash(conn, task_id, board=current_board)
+        )
+    ):
+        failure_reason = "governance_scope_changed"
+    elif not token or not hmac.compare_digest(hash_gate_token(token), stored_hash):
+        failure_reason = "token was rejected"
+
+    if failure_reason:
+        if failure_reason == "governance_scope_changed":
+            raise GateTokenError(f"{task_id} archive-running grant: governance scope changed")
+        window_start = int(row["gate_failure_window_started_at"] or 0)
+        attempts = int(row["gate_failed_attempts"] or 0)
+        if not window_start or now - window_start > cfg["failure_window_seconds"]:
+            window_start, attempts = now, 0
+        attempts += 1
+        new_locked_until = (
+            now + cfg["lockout_seconds"]
+            if attempts >= cfg["max_failed_attempts"] else None
+        )
+        conn.execute(
+            "UPDATE tasks SET gate_failed_attempts = ?, "
+            "gate_failure_window_started_at = ?, gate_locked_until = ? WHERE id = ?",
+            (attempts, window_start, new_locked_until, task_id),
+        )
+        _append_event(conn, task_id, "gate_token_rejected", {
+            "action": "archive_running", "board": current_board,
+            "reason": failure_reason, "locked_until": new_locked_until,
+        })
+        _log.warning(
+            "archive_running grant rejected task=%s board=%s reason=%s",
+            task_id, current_board, failure_reason,
+        )
+        raise GateTokenError(
+            f"{task_id} archive-running grant: {failure_reason}", persist_failure=True
+        )
+
+    conn.execute(
+        "UPDATE tasks SET gate_token_hash = NULL, gate_token_issued_at = NULL, "
+        "gate_token_board = NULL, gate_token_task_id = NULL, gate_token_action = NULL, "
+        "gate_scope_hash = NULL, gate_scope_version = NULL, "
+        "gate_failed_attempts = 0, gate_failure_window_started_at = NULL, "
+        "gate_locked_until = NULL WHERE id = ?",
+        (task_id,),
+    )
+    return True
+
 
 def _normalise_pending_action_command(command: str) -> str:
     """Return the byte-preserving command representation used for approval.
@@ -10090,17 +10233,23 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(conn: sqlite3.Connection, task_id: str, *, token: Optional[str] = None) -> bool:
     """Archive a task from any non-archived status.
 
     Human-Gate v1, refuse-only (2026-07-11 repair review self-audit): a
-    ``blocked``/``scheduled``+``human_gate=1`` card always refuses —
-    archiving disposes of a card without ever requiring the human
-    decision the gate exists to force. No token parameter; run
-    ``kanban gate <id> off`` first if archiving a gated card is
-    genuinely needed.
+    ``blocked``/``scheduled``+``human_gate=1`` card always refuses — run
+    ``kanban gate <id> off`` first (itself H1-gated) if archiving a gated
+    card is genuinely needed.
+
+    H2 (2026-07-13): archiving a card that is running live work reclaims its
+    run and disposes of the worker's session (the incident's first act). That
+    now requires a fresh ``archive_running`` grant via ``token`` (issued +
+    redeemed server-side on an authenticated Telegram-tap / WebUI action).
+    Non-running, unbound cards archive freely as before. Both refusals raise the
+    same :class:`GateTokenError` every existing caller already handles.
     """
     with write_txn(conn):
+        _assert_running_archive_grant(conn, task_id, token=token)
         _assert_human_gate_open(conn, task_id, token=None, action="archive")
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
