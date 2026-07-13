@@ -1389,6 +1389,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
     current_run_id       INTEGER,
+    -- Step③ (2026-07-14) reversibility: a ONE-SHOT session id to resume on the
+    -- next claim. Set ONLY by unarchive_task when restoring a card that was
+    -- archived mid-run, so the killed work continues from the last flushed
+    -- message instead of starting over. Cleared the moment it is consumed. Never
+    -- set for TTL-stale reclaims, so the crash-resume audit invariants are
+    -- untouched.
+    resume_session_hint  TEXT,
     -- Forward-compat for v2 workflow routing. In v1 the kernel writes
     -- these when the task is opted into a template but otherwise ignores
     -- them; the dispatcher doesn't consult them for routing yet.
@@ -2688,6 +2695,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "idempotency_key" not in cols:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
+        )
+    if "resume_session_hint" not in cols:
+        # Step③ (2026-07-14): one-shot unarchive-resume pointer.
+        _add_column_if_missing(
+            conn, "tasks", "resume_session_hint", "resume_session_hint TEXT"
         )
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
@@ -4742,7 +4754,24 @@ def _resolve_worker_session(
 
     Must be called INSIDE claim_task's write_txn so the decision is atomic against
     parallel dispatchers (the ready->running CAS already serializes the claim).
+
+    Step③ (2026-07-14) reversibility: an explicit ONE-SHOT unarchive-resume hint
+    takes priority over everything below. It is set ONLY by :func:`unarchive_task`
+    when restoring a card that was archived mid-run, so it never fires for TTL-stale
+    reclaims (which set no hint) — the DEVCHAIN crash-resume invariants below are
+    untouched. Honoured independently of ``resume_on_reclaim`` (it is a deliberate
+    operator recovery), but still suppressed for review claims (``allow_resume``).
     """
+    if allow_resume:
+        hint_row = conn.execute(
+            "SELECT resume_session_hint FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if hint_row and hint_row["resume_session_hint"]:
+            sess = hint_row["resume_session_hint"]
+            conn.execute(
+                "UPDATE tasks SET resume_session_hint = NULL WHERE id = ?", (task_id,)
+            )  # one-shot: consume the hint so a later crash doesn't resume it again
+            return sess, True
     if not _resolve_resume_on_reclaim():
         return None, False
     max_attempts = _resolve_resume_max_attempts()
@@ -10520,12 +10549,16 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, token: Optional[str]
     ``kanban gate <id> off`` first (itself H1-gated) if archiving a gated
     card is genuinely needed.
 
-    H2 (2026-07-13): archiving a card that is running live work reclaims its
-    run and disposes of the worker's session (the incident's first act). That
-    now requires a fresh ``archive_running`` grant via ``token`` (issued +
-    redeemed server-side on an authenticated Telegram-tap / WebUI action).
-    Non-running, unbound cards archive freely as before. Both refusals raise the
-    same :class:`GateTokenError` every existing caller already handles.
+    H2 (2026-07-13): archiving a card that is running live work reclaims its run.
+    Currently gated by an ``archive_running`` grant (``token``). NOTE (Step③,
+    2026-07-14): this reclaim is NON-destructive — ``_end_run`` preserves the run's
+    ``session_id``, the session file is kept, and archive touches NEITHER the
+    workspace/worktree NOR the conversation. Only the worker's unflushed in-memory
+    tail is lost. The card is soft-archived; :func:`unarchive_task` restores it and
+    arms a one-shot resume so the work CONTINUES. Because nothing is irreversibly
+    destroyed, Step④ can drop this H2 grant in favour of the Step② blast-radius
+    bound + this reversibility (see AUTONOMY-REDESIGN.md). Non-running, unbound cards
+    archive freely. Both refusals raise :class:`GateTokenError`.
     """
     with write_txn(conn):
         _assert_running_archive_grant(conn, task_id, token=token)
@@ -10586,6 +10619,69 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
+
+
+def unarchive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    to_status: Optional[str] = None,
+    resume: bool = True,
+) -> bool:
+    """Restore an archived card — the reversibility primitive for Säule 1.
+
+    Archiving is SOFT (``archive_task`` only flips status), so a mis-archived card is
+    always recoverable. This brings it back WITHOUT any raw board SQL (which the
+    config-guard now gates for agents). Restores to ``to_status`` if given, else a
+    safe default: ``done`` when the card had completed before archival, otherwise
+    ``todo``; :func:`recompute_ready` then promotes it to ``ready`` when eligible.
+
+    Step③ resume: if the card was archived MID-RUN (its most recent run was reclaimed
+    with a live ``session_id``) and it is not a goal_mode task, arm a ONE-SHOT resume
+    hint so the next claim continues that worker session from the last flushed
+    message — killed work continues instead of restarting. Returns True if a card was
+    un-archived. Not rate-limited: an undo never needs a blast-radius bound."""
+    if to_status is not None and to_status not in ("todo", "ready", "done"):
+        raise ValueError("to_status must be one of todo|ready|done")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, result, goal_mode FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row or row["status"] != "archived":
+            return False
+        if to_status is not None:
+            target = to_status
+        else:
+            last = conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            completed = (last is not None and last["outcome"] == "completed") or bool(row["result"])
+            target = "done" if completed else "todo"
+        conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ? AND status = 'archived'",
+            (target, task_id),
+        )
+        armed_session = None
+        if resume and target in ("todo", "ready") and not row["goal_mode"]:
+            midrun = conn.execute(
+                "SELECT session_id FROM task_runs WHERE task_id = ? AND outcome = 'reclaimed' "
+                "AND session_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if midrun and midrun["session_id"]:
+                armed_session = midrun["session_id"]
+                conn.execute(
+                    "UPDATE tasks SET resume_session_hint = ? WHERE id = ?",
+                    (armed_session, task_id),
+                )
+        _append_event(
+            conn, task_id, "unarchived",
+            {"status": target, "resume_armed": bool(armed_session)},
+        )
+    # A restored card may relist dependents and needs a readiness re-evaluation.
+    recompute_ready(conn)
+    return True
 
 
 def delete_task(

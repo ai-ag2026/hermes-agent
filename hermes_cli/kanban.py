@@ -737,6 +737,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "already holds a token; the CLI is not a grant channel.",
     )
 
+    # --- unarchive (reversibility, Säule 1) ---
+    p_unarchive = sub.add_parser(
+        "unarchive", help="Restore one or more archived tasks (reversible undo)")
+    p_unarchive.add_argument("task_ids", nargs="+", help="Archived task ids to restore")
+    p_unarchive.add_argument(
+        "--status", dest="to_status", default=None, choices=["todo", "ready", "done"],
+        help="Status to restore to (default: 'done' if it had completed, else 'todo')",
+    )
+    p_unarchive.add_argument(
+        "--no-resume", dest="resume", action="store_false", default=True,
+        help="Do NOT arm the one-shot resume of a card archived mid-run",
+    )
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -1104,6 +1117,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "gate-token": _cmd_gate_token,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "unarchive": _cmd_unarchive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -2495,6 +2509,25 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:
                 print(f"Archived {tid}")
+    return 0 if not failed else 1
+
+
+def _cmd_unarchive(args: argparse.Namespace) -> int:
+    ids = list(args.task_ids or [])
+    if not ids:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    to_status = getattr(args, "to_status", None)
+    resume = getattr(args, "resume", True)
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            if kb.unarchive_task(conn, tid, to_status=to_status, resume=resume):
+                st = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+                print(f"Restored {tid} -> {st['status'] if st else '?'}")
+            else:
+                failed.append(tid)
+                print(f"cannot unarchive {tid} (must already be archived)", file=sys.stderr)
     return 0 if not failed else 1
 
 
