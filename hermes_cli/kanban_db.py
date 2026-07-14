@@ -4472,6 +4472,21 @@ def open_mutation_manifest(
     now = int(time.time())
     ttl = int(ttl_seconds) if ttl_seconds else DEFAULT_MANIFEST_TTL_SECONDS
     with write_txn(conn):
+        # F4 (2026-07-14 audit): only ONE manifest per op is ever consulted
+        # (_active_manifest_row takes the newest). Opening a second while one is still
+        # open would silently orphan the first — a task bound to the older manifest
+        # would then be rejected as scope-creep. Refuse explicitly so the operator
+        # closes the current one first (they are short-lived; TTL default 15 min).
+        existing = conn.execute(
+            "SELECT id FROM mutation_manifest WHERE kind=? AND status='open' AND expires_at>? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (op, now),
+        ).fetchone()
+        if existing is not None:
+            raise ValueError(
+                f"an open '{op}' manifest (#{existing['id']}) already exists — close it "
+                "(close_mutation_manifest) before opening another; only one is active at a time"
+            )
         cur = conn.execute(
             "INSERT INTO mutation_manifest "
             "(kind, task_ids_json, max_size, consumed, actor, rationale, audit_hash, "
@@ -4510,6 +4525,11 @@ def get_active_manifest(conn: sqlite3.Connection, op: str):
 _DIGEST_EVENT_KINDS = (
     "archived", "unarchived", "gate_set", "unblocked", "blocked",
     "gate_token_rejected", "block_loop_detected",
+    # 2026-07-14 audit: also surface terminal/authority transitions the operator
+    # should see — completing, review verdicts, manual promotion, scheduling — so the
+    # digest isn't blind to the mutators the config-guard now protects (complete_task/
+    # decide_task_review/promote_task/schedule_task).
+    "completed", "review_decided", "promoted_manual", "scheduled",
 )
 
 

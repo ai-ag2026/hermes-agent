@@ -2329,11 +2329,12 @@ def _cmd_gate(args: argparse.Namespace) -> int:
     (Audit 2026-07-10 pattern): a worker shelling out to `kanban gate
     <id> off` would otherwise be able to strip its own hard gate.
 
-    H1 (2026-07-13): turning a LIVE gate OFF requires an operator grant issued +
-    redeemed server-side on an authenticated Telegram-tap (Gate-off button) or
-    WebUI-extension action — ntfy is NOT a grant channel. The CLI is not a grant
-    channel either (an autonomous orchestrator reaches it too), so it refuses on a
-    live gate and points there.
+    Step④ (2026-07-14): H1 was REMOVED — gate-off no longer needs a grant. It is a
+    soft, reversible hold: turning it off is free, but bounded by the Step② mutation
+    budget (an ad-hoc gate-off burst raises MutationBudgetError) and logged to
+    mutation_log for the digest. The human_gate flag cannot bypass the exact-action
+    approval — that is enforced independently by the pending_action/attention state
+    machine (unblock/complete/schedule refuse while it is live).
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         print(
@@ -2502,7 +2503,10 @@ def _cmd_archive(args: argparse.Namespace) -> int:
 
 
 def _cmd_digest(args: argparse.Namespace) -> int:
-    since = int(max(0.0, float(getattr(args, "since_hours", 24.0))) * 3600) or 86400
+    # F6 (2026-07-14 audit): no `or 86400` — a computed 0 is falsy and silently
+    # became a 24h window. board_mutation_digest clamps non-positive input via
+    # max(1, ...), so `--since-hours 0` correctly yields a ~empty window.
+    since = int(max(0.0, float(getattr(args, "since_hours", 24.0))) * 3600)
     with kb.connect_closing() as conn:
         digest = kb.board_mutation_digest(conn, since_seconds=since)
     if getattr(args, "json", False):

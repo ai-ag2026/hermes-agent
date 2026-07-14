@@ -206,6 +206,38 @@ def test_digest_empty_window(kanban_home):
         assert "no rate-limited mutations" in kb.format_mutation_digest(d)
 
 
+def test_f4_second_open_manifest_same_op_rejected(kanban_home):
+    with kb.connect() as conn:
+        a = _mk(conn, 2, prefix="a")
+        b = _mk(conn, 2, prefix="b")
+        kb.open_mutation_manifest(conn, op="archive", task_ids=a, actor="op")
+        with pytest.raises(ValueError):
+            kb.open_mutation_manifest(conn, op="archive", task_ids=b, actor="op")
+
+
+def test_f4_reopen_allowed_after_close(kanban_home):
+    with kb.connect() as conn:
+        a = _mk(conn, 2, prefix="a")
+        b = _mk(conn, 2, prefix="b")
+        m1 = kb.open_mutation_manifest(conn, op="archive", task_ids=a, actor="op")
+        assert kb.close_mutation_manifest(conn, m1) is True
+        # A different op can always open concurrently.
+        kb.open_mutation_manifest(conn, op="gate_off", task_ids=["t_x"], actor="op")
+        # And the same op re-opens once the prior is closed.
+        assert kb.open_mutation_manifest(conn, op="archive", task_ids=b, actor="op") > 0
+
+
+def test_f6_digest_zero_window_not_silently_24h(kanban_home):
+    # F6: `--since-hours 0` must NOT be silently turned into a 24h (86400s) window.
+    # The CLI computes since_seconds=0; board_mutation_digest records the requested
+    # window verbatim (and clamps the cutoff to a ~1s lookback internally).
+    with kb.connect() as conn:
+        d = kb.board_mutation_digest(conn, since_seconds=0)
+        assert d["window_seconds"] == 0        # not 86400
+        d24 = kb.board_mutation_digest(conn, since_seconds=86400)
+        assert d24["window_seconds"] == 86400
+
+
 def test_enforce_fails_open_when_tables_absent(kanban_home):
     # Drop the Step② tables to simulate an un-migrated DB: enforce must NOT brick.
     with kb.connect() as conn:
