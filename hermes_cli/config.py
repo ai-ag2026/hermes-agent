@@ -88,6 +88,10 @@ def _backup_corrupt_config(config_path: Path) -> Optional[Path]:
         if backup_path.exists():
             return None
         shutil.copy2(config_path, backup_path)
+        # config.yaml may hold secrets (API keys, tokens); copy2 preserves the
+        # source mode, but harden the backup to 0600 anyway (container/managed
+        # aware) so a broken-config snapshot is never world-readable.
+        _secure_file(backup_path)
         return backup_path
     except Exception:
         return None

@@ -241,6 +241,10 @@ def apply_migration(
             f"{config_path.name}.bak-pre-migrate-xai-{ts}"
         )
         shutil.copy2(config_path, backup_path)
+        # config.yaml may hold secrets — keep the pre-migrate backup owner-only
+        # (container/managed aware via _secure_file).
+        from hermes_cli.config import _secure_file
+        _secure_file(backup_path)
 
     from hermes_cli.config import require_readable_config_before_write
 

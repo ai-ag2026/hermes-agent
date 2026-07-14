@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 from hermes_cli.config import (
+    _secure_file,
     check_config_version,
     get_config_path,
     get_env_path,
@@ -36,6 +37,9 @@ def _backup_existing(paths: Iterable[Path]) -> dict[Path, Path]:
             continue
         dest = _backup_path(path, stamp)
         shutil.copy2(path, dest)
+        # config/.env backups may hold secrets — harden to 0600 (no-op in
+        # containers, where _secure_file intentionally skips chmod).
+        _secure_file(dest)
         backups[path] = dest
     return backups
 

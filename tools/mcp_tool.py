@@ -1948,13 +1948,23 @@ class MCPServerTask:
                         self._reconnect_event.set()
                         break
         finally:
+            try:
+                _loop = asyncio.get_running_loop()
+            except RuntimeError:
+                _loop = None
             for t in (shutdown_task, reconnect_task):
-                if not t.done():
-                    t.cancel()
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                if t.done():
+                    continue
+                if _loop is None or _loop.is_closed():
+                    # Interpreter/event-loop already tearing down: cancelling or
+                    # awaiting here raises "Event loop is closed" (~145x/restart
+                    # shutdown spam). Nothing left to reclaim on a dead loop.
+                    continue
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         if self._shutdown_event.is_set():
             return "shutdown"
@@ -1992,13 +2002,23 @@ class MCPServerTask:
                 timeout=timeout,
             )
         finally:
+            try:
+                _loop = asyncio.get_running_loop()
+            except RuntimeError:
+                _loop = None
             for t in (shutdown_task, reconnect_task):
-                if not t.done():
-                    t.cancel()
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                if t.done():
+                    continue
+                if _loop is None or _loop.is_closed():
+                    # Interpreter/event-loop already tearing down: cancelling or
+                    # awaiting here raises "Event loop is closed" (~145x/restart
+                    # shutdown spam). Nothing left to reclaim on a dead loop.
+                    continue
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
         if self._shutdown_event.is_set():
             return "shutdown"
         self._reconnect_event.clear()

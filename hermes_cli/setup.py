@@ -2733,6 +2733,9 @@ def run_setup_wizard(args):
         try:
             import shutil
             shutil.copy2(config_path, _backup_path)
+            # config.yaml may hold secrets — keep the pre-setup backup owner-only.
+            from hermes_cli.config import _secure_file
+            _secure_file(_backup_path)
         except Exception:
             _backup_path = None
     else:
