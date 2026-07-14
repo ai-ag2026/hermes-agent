@@ -6793,13 +6793,19 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     write through this helper enforces the invariant in one place rather than
     relying on each of ~15 independent write sites to remember the guard.
 
-    ``kwargs`` are forwarded verbatim to ``atomic_yaml_write``
-    (``sort_keys``, ``default_flow_style``, ``extra_content``, ...).
+    Writes go through ``atomic_roundtrip_yaml_write`` so hand-written inline
+    comments in ``config.yaml`` survive programmatic saves (ruamel round-trip
+    merge against the on-disk file; fail-safe fresh dump otherwise). Only
+    ``extra_content`` from ``kwargs`` is honoured — layout kwargs (``sort_keys``,
+    ``default_flow_style``) no longer apply since the round-trip preserves the
+    existing file's ordering/layout.
     """
-    from utils import atomic_yaml_write
+    from utils import atomic_roundtrip_yaml_write
 
     require_readable_config_before_write(config_path)
-    atomic_yaml_write(config_path, data, **kwargs)
+    atomic_roundtrip_yaml_write(
+        config_path, data, extra_content=kwargs.get("extra_content")
+    )
 
 
 def load_config() -> Dict[str, Any]:
@@ -7216,7 +7222,7 @@ def save_config(
                     f"(managed by your administrator): {', '.join(sorted(_stripped))}",
                     file=sys.stderr,
                 )
-        from utils import atomic_yaml_write
+        from utils import atomic_roundtrip_yaml_write
 
         ensure_hermes_home()
         config_path = get_config_path()
@@ -7275,7 +7281,7 @@ def save_config(
         if not fb_is_valid:
             parts.append(_FALLBACK_COMMENT)
 
-        atomic_yaml_write(
+        atomic_roundtrip_yaml_write(
             config_path,
             normalized,
             extra_content="".join(parts) if parts else None,

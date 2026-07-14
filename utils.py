@@ -360,6 +360,108 @@ def atomic_roundtrip_yaml_update(
         raise
 
 
+def _rt_reconcile(disk_node: Any, target: Any) -> Any:
+    """Merge ``target`` (plain dict/list/scalar) into a ruamel round-trip node
+    ``disk_node`` in place, preserving comments on surviving mapping keys.
+
+    Returns the value to store in ``target``'s slot:
+    - dict target + CommentedMap disk: drop keys absent from target, recurse into
+      keys present in both (keeps their attached comments), append new keys; the
+      same CommentedMap is returned mutated.
+    - anything else (scalar, list, or type change): return ``target`` verbatim.
+      Assigning it back onto an existing key keeps the key's own comment (ruamel
+      stores comments on the parent map keyed by name, independent of value);
+      only comments *inside* a replaced list/scalar are lost. Config breadcrumbs
+      live on scalar keys, so they survive.
+    """
+    from ruamel.yaml.comments import CommentedMap
+
+    if isinstance(target, dict):
+        if not isinstance(disk_node, CommentedMap):
+            return target
+        for stale in [k for k in disk_node if k not in target]:
+            del disk_node[stale]
+        for key, value in target.items():
+            if key in disk_node:
+                disk_node[key] = _rt_reconcile(disk_node[key], value)
+            else:
+                disk_node[key] = value
+        return disk_node
+    return target
+
+
+def atomic_roundtrip_yaml_write(
+    path: Union[str, Path],
+    data: Any,
+    *,
+    extra_content: str | None = None,
+) -> None:
+    """Comment-preserving full-file YAML write for user-edited config files.
+
+    Drop-in replacement for :func:`atomic_yaml_write` at the ``config.yaml``
+    write chokepoints. Instead of dumping ``data`` from scratch (which discards
+    every inline comment, since comments are not part of the in-memory dict),
+    it loads the existing on-disk file with a ruamel round-trip parser, merges
+    ``data`` into that commented structure via :func:`_rt_reconcile`, and dumps
+    the result — so hand-written breadcrumbs/annotations survive programmatic
+    saves (``/model``, ``hermes config set``, dashboard writes, ...).
+
+    Fail-safe: if the on-disk file is absent, unparseable, or the merge raises,
+    it falls back to dumping ``data`` directly (same outcome as the old path —
+    valid file, comments lost that once) rather than blocking the write. Uses
+    the same temp-file + fsync + atomic-replace + mode/owner-preservation as the
+    other writers. ``extra_content`` is appended verbatim after the YAML.
+    """
+    from ruamel.yaml import YAML
+    from ruamel.yaml.comments import CommentedMap
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    yaml_rt = YAML(typ="rt")
+    yaml_rt.preserve_quotes = True
+    yaml_rt.allow_unicode = True
+    yaml_rt.default_flow_style = False
+    # Match atomic_roundtrip_yaml_update's layout so all round-trip writes emit
+    # a consistent (non-mixed) indentation that stricter parsers accept (#31999).
+    yaml_rt.indent(mapping=2, sequence=4, offset=2)
+
+    merged: Any = data
+    if isinstance(data, dict) and path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                disk = yaml_rt.load(f)
+            if isinstance(disk, CommentedMap):
+                merged = _rt_reconcile(disk, data)
+        except Exception:
+            merged = data  # fail-safe: fresh dump, never block the write
+
+    original_mode = _preserve_file_mode(path)
+    original_owner = _preserve_file_owner(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml_rt.dump(merged, f)
+            if extra_content:
+                f.write(extra_content)
+            f.flush()
+            os.fsync(f.fileno())
+        real_path = atomic_replace(tmp_path, path)
+        real_path_obj = Path(real_path)
+        _restore_file_owner(real_path_obj, original_owner)
+        _restore_file_mode(real_path_obj, original_mode)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 # ─── JSON Helpers ─────────────────────────────────────────────────────────────
 
 
