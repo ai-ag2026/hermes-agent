@@ -2472,9 +2472,10 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
         token = getattr(args, "token", None)
+        author = _profile_author()  # B4: attribute archives in the digest
         for tid in ids:
             try:
-                ok = kb.archive_task(conn, tid, token=token)
+                ok = kb.archive_task(conn, tid, token=token, actor=author)
             except kb.MutationBudgetError as exc:
                 # Step② blast-radius bound: an ad-hoc archive burst. For an intended
                 # bulk archive, declare a manifest (kb.open_mutation_manifest).

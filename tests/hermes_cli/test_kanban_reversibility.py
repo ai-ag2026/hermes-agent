@@ -123,12 +123,10 @@ def test_unarchive_arms_one_shot_resume_for_midrun_card(kanban_home):
         run_id = kb.get_task(conn, t).current_run_id
         with kb.write_txn(conn):
             conn.execute("UPDATE task_runs SET session_id='kbwrk_resume_me' WHERE id=?", (run_id,))
-        # Archive mid-run (reclaim the run), then unarchive.
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (t,))
-            kb._end_run(conn, t, outcome="reclaimed", status="reclaimed")
+        # Archive the RUNNING card via the real path -> reclaims the run AND stamps the
+        # session onto archived_run_session (B5). Then unarchive consumes that stamp.
+        assert kb.archive_task(conn, t) is True
         assert kb.unarchive_task(conn, t) is True
-        # Hint armed on the card.
         hint = conn.execute("SELECT resume_session_hint FROM tasks WHERE id=?", (t,)).fetchone()
         assert hint["resume_session_hint"] == "kbwrk_resume_me"
         # The next claim resolves to the pinned session AND clears the hint (one-shot).
@@ -146,12 +144,37 @@ def test_unarchive_no_resume_flag_skips_hint(kanban_home):
         run_id = kb.get_task(conn, t).current_run_id
         with kb.write_txn(conn):
             conn.execute("UPDATE task_runs SET session_id='s' WHERE id=?", (run_id,))
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (t,))
-            kb._end_run(conn, t, outcome="reclaimed", status="reclaimed")
+        assert kb.archive_task(conn, t) is True   # stamps archived_run_session='s'
         assert kb.unarchive_task(conn, t, resume=False) is True
+        row = conn.execute(
+            "SELECT resume_session_hint, archived_run_session FROM tasks WHERE id=?", (t,)
+        ).fetchone()
+        assert row["resume_session_hint"] is None
+        assert row["archived_run_session"] is None  # stamp cleared on unarchive
+
+
+def test_idle_card_with_stale_reclaim_history_does_not_resume_b5(kanban_home):
+    """B5: a card with a TTL-stale reclaim in its run HISTORY, archived while IDLE
+    (nothing running), must NOT arm resume — the pre-fix history query armed it from
+    the unrelated stale session; the stamp-at-archive approach only arms a real
+    mid-run archive."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="idle")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        # Simulate a past TTL-stale reclaim, then the card sitting idle in `ready`.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET session_id='s_stale', outcome='reclaimed', "
+                "status='reclaimed', ended_at=1 WHERE id=?", (run_id,))
+            conn.execute("UPDATE tasks SET status='ready', current_run_id=NULL WHERE id=?", (t,))
+        assert kb.archive_task(conn, t) is True          # idle archive -> no live run -> no stamp
+        assert kb.get_task(conn, t).status == "archived"
+        stamp = conn.execute("SELECT archived_run_session FROM tasks WHERE id=?", (t,)).fetchone()
+        assert stamp["archived_run_session"] is None
+        assert kb.unarchive_task(conn, t) is True
         hint = conn.execute("SELECT resume_session_hint FROM tasks WHERE id=?", (t,)).fetchone()
-        assert hint["resume_session_hint"] is None
+        assert hint["resume_session_hint"] is None       # NOT armed from stale history
 
 
 def test_ttl_stale_reclaim_does_not_auto_resume(kanban_home):

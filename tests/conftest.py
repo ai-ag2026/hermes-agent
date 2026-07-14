@@ -371,6 +371,21 @@ def _hermetic_environment(tmp_path, monkeypatch):
     backup_skills_stub.chmod(0o755)
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
+    # A3 (2026-07-14): the O-1 dispatch-freeze reads the ROOT ~/.hermes/config.yaml via
+    # Path.home() (deliberately HERMES_HOME-independent in prod so a profile gateway
+    # can't escape the freeze). In tests that would leak the operator's real freeze
+    # (breaking every dispatch/notifier test). Point its seam at the isolated
+    # HERMES_HOME so the freeze is hermetic — a test controls it by writing a
+    # `kanban: {dispatch_in_gateway: false}` block into its own HERMES_HOME/config.yaml.
+    try:
+        from hermes_cli import kanban_db as _kb_freeze_seam
+        monkeypatch.setattr(
+            _kb_freeze_seam, "_ROOT_CONFIG_PATH_OVERRIDE",
+            str(fake_hermes_home / "config.yaml"), raising=False,
+        )
+    except Exception:
+        pass
+
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
     monkeypatch.setenv("TZ", "UTC")

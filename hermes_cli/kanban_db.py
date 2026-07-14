@@ -1402,6 +1402,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set for TTL-stale reclaims, so the crash-resume audit invariants are
     -- untouched.
     resume_session_hint  TEXT,
+    -- Step③/B5 (2026-07-14): the session of the live run reclaimed BY an archive of
+    -- this card (NULL unless the card was archived mid-run, and cleared on any archive
+    -- that reclaimed nothing). unarchive_task consumes exactly this to arm a one-shot
+    -- resume — correlating the resume with the actual archival instead of re-deriving
+    -- "was there ever a reclaimed run" from history (which resumed idle cards too).
+    archived_run_session TEXT,
     -- Forward-compat for v2 workflow routing. In v1 the kernel writes
     -- these when the task is opted into a template but otherwise ignores
     -- them; the dispatcher doesn't consult them for routing yet.
@@ -2706,6 +2712,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # Step③ (2026-07-14): one-shot unarchive-resume pointer.
         _add_column_if_missing(
             conn, "tasks", "resume_session_hint", "resume_session_hint TEXT"
+        )
+    if "archived_run_session" not in cols:
+        # B5 (2026-07-14): the run session reclaimed by THIS card's archive.
+        _add_column_if_missing(
+            conn, "tasks", "archived_run_session", "archived_run_session TEXT"
         )
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
@@ -4292,9 +4303,13 @@ class MutationBudgetError(RuntimeError):
 
 
 def _mutation_budget_enabled() -> bool:
+    # B1 (2026-07-14 full audit): the budget must NOT be disableable by a per-command
+    # env var. `HERMES_KANBAN_MUTATION_BUDGET=off` was an agent-controllable bypass
+    # that also SUPPRESSED the mutation_log audit (a 46-in-40s burst would be invisible
+    # in the digest). The env may only FORCE-ENABLE (redundant with the default);
+    # disabling is operator-config-only (kanban.mutation_budget.enabled) — at least
+    # config-guard-gated for workers and visible in a config diff.
     raw = os.environ.get("HERMES_KANBAN_MUTATION_BUDGET", "").strip().lower()
-    if raw in {"0", "off", "false", "no", "disable", "disabled"}:
-        return False
     if raw in {"1", "on", "true", "yes", "enable", "enabled"}:
         return True
     try:
@@ -6882,6 +6897,20 @@ def _complete_task_locked(
     if task is None or task.status not in {"running", "ready", "blocked"}:
         return False
     if expected_run_id is not None and task.current_run_id != int(expected_run_id):
+        return False
+    # A1 (2026-07-14 full audit): a card with a LIVE exact-action awaiting approval
+    # (the "short list": upstream/prod/credentials/publish) must NOT be completed
+    # except through the approval path. unblock_task/promote_task already refuse this;
+    # complete_task did not — so an unscoped orchestrator could flip a blocked+pending
+    # card straight to 'done' and orphan the pending action (the 2026-07-13 incident's
+    # shape at a second door). Refuse before any evidence/artifact side effects. The
+    # approval path (approve_pending_action_and_unblock_versioned) resolves the action
+    # first, after which no pending/approved row remains and completion proceeds.
+    if conn.execute(
+        "SELECT 1 FROM task_pending_actions WHERE task_id = ? "
+        "AND state = 'pending' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None:
         return False
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -10650,7 +10679,8 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, token: Optional[str] = None) -> bool:
+def archive_task(conn: sqlite3.Connection, task_id: str, *, token: Optional[str] = None,
+                 actor: Optional[str] = None) -> bool:
     """Archive a task from any non-archived status.
 
     Human-Gate v1 (coarse hold): a ``blocked``/``scheduled``+``human_gate=1`` card
@@ -10685,7 +10715,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, token: Optional[str]
         # Step② (Säule 2): structural blast-radius bound — an ad-hoc archive burst
         # trips the rate ceiling; a bulk archive must be inside a scope-bound
         # manifest. Rolls back this archive on violation (no human prompt).
-        _enforce_mutation_budget(conn, task_id, "archive")
+        # B4 (2026-07-14 audit): thread the actor so the digest can attribute archives —
+        # archives are the incident's core action, and an unattributed burst is exactly
+        # the blind spot the digest exists to close.
+        _enforce_mutation_budget(conn, task_id, "archive", actor=actor)
         now = int(time.time())
         _cancel_active_actions_for_terminal_task(
             conn, task_id, now=now, reason="task_archived",
@@ -10699,6 +10732,22 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, token: Optional[str]
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+        # B5 (2026-07-14 audit): correlate a future resume with THIS archival. Stamp the
+        # reclaimed run's session ONLY when we actually reclaimed a live run (run_id set)
+        # and the task isn't goal_mode; otherwise clear any stale stamp. unarchive_task
+        # consumes exactly this, so an idle archive+unarchive can never resume an
+        # unrelated old session (the pre-fix history query resumed idle cards too).
+        midrun_session = None
+        if run_id is not None:
+            gm = conn.execute("SELECT goal_mode FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if gm is not None and not gm["goal_mode"]:
+                r = conn.execute(
+                    "SELECT session_id FROM task_runs WHERE id = ?", (run_id,)
+                ).fetchone()
+                midrun_session = r["session_id"] if r else None
+        conn.execute(
+            "UPDATE tasks SET archived_run_session = ? WHERE id = ?", (midrun_session, task_id)
+        )
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
@@ -10756,7 +10805,8 @@ def unarchive_task(
         raise ValueError("to_status must be one of todo|ready|done")
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, result, goal_mode FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, result, goal_mode, archived_run_session FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
@@ -10773,22 +10823,20 @@ def unarchive_task(
             "UPDATE tasks SET status = ? WHERE id = ? AND status = 'archived'",
             (target, task_id),
         )
-        armed_session = None
-        if resume and target in ("todo", "ready") and not row["goal_mode"]:
-            midrun = conn.execute(
-                "SELECT session_id FROM task_runs WHERE task_id = ? AND outcome = 'reclaimed' "
-                "AND session_id IS NOT NULL ORDER BY id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            if midrun and midrun["session_id"]:
-                armed_session = midrun["session_id"]
-                conn.execute(
-                    "UPDATE tasks SET resume_session_hint = ? WHERE id = ?",
-                    (armed_session, task_id),
-                )
+        # B5 (2026-07-14 audit): arm the one-shot resume ONLY from the session that
+        # THIS card's archive reclaimed (stamped by archive_task), correlated to the
+        # archival event — not re-derived from run history (which armed idle cards whose
+        # last run merely happened to be a TTL-stale reclaim). Always clear the stamp on
+        # unarchive so it can't leak into a later restore.
+        armed_session = row["archived_run_session"]
+        arm = bool(armed_session) and resume and target in ("todo", "ready") and not row["goal_mode"]
+        conn.execute(
+            "UPDATE tasks SET resume_session_hint = ?, archived_run_session = NULL WHERE id = ?",
+            (armed_session if arm else None, task_id),
+        )
         _append_event(
             conn, task_id, "unarchived",
-            {"status": target, "resume_armed": bool(armed_session)},
+            {"status": target, "resume_armed": arm},
         )
     # A restored card may relist dependents and needs a readiness re-evaluation.
     recompute_ready(conn)
@@ -11159,6 +11207,16 @@ def schedule_task(
     """
     with write_txn(conn):
         _assert_human_gate_open(conn, task_id, token=None, action="schedule")
+        # A1 (2026-07-14): same exact-action guard as complete_task/unblock_task —
+        # a card with a live pending/approved exact action must not be laundered out
+        # of 'blocked' into 'scheduled' (which hides it from the blocked column)
+        # without going through the approval path.
+        if conn.execute(
+            "SELECT 1 FROM task_pending_actions WHERE task_id = ? "
+            "AND state = 'pending' LIMIT 1",
+            (task_id,),
+        ).fetchone() is not None:
+            return False
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -11314,6 +11372,12 @@ class DispatchResult:
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
     skipped_locked: bool = False
+    skipped_frozen: bool = False
+    """A2 (2026-07-14): the dispatcher is frozen (kanban.dispatch_in_gateway=false in
+    the active profile OR the root config, or the env kill-switch). dispatch_once()
+    short-circuits here so EVERY caller — gateway watcher, `hermes kanban dispatch`
+    CLI, dashboard POST /dispatch, `daemon --force` — honours the freeze by
+    construction, not by each caller remembering to check."""
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
     DB writes this tick — the lock holder is making progress on the same
@@ -11921,13 +11985,18 @@ def enforce_max_runtime(
                     conn, task_id=tid, expected_run_id=int(row["current_run_id"]),
                     attention_type="transient", reason_code="runtime_timeout", now=now,
                 )
-            except Exception:
-                # K-1 defensive: a park failure (e.g. a future enum mismatch) must NOT
-                # crash the whole dispatcher tick and strand the task. Log + fall
-                # through to the normal timeout requeue below, which still releases
-                # the runaway worker (ready + timed_out event).
+            except ValueError:
+                # K-1 defensive (B6-narrowed): a park failure from an ENUM mismatch
+                # (a future unregistered attention_type/reason_code -> _block_cause_
+                # fingerprint raises ValueError) must not crash the whole dispatcher
+                # tick — fall through to the normal timeout requeue, which still
+                # releases the runaway worker (ready + timed_out event). Narrowed from
+                # `except Exception`: a RuntimeError like "technical retry provenance
+                # binding lost" signals a genuine invariant violation and MUST keep
+                # propagating (crash loudly) rather than being masked as a timeout.
                 _log.exception(
-                    "enforce_max_runtime: approved-action park failed for %s; requeuing", tid
+                    "enforce_max_runtime: approved-action park raised ValueError for %s; "
+                    "requeuing as timeout", tid,
                 )
                 parked = False
         if parked:
@@ -12919,6 +12988,54 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+# --- A2/A3 (2026-07-14): dispatcher freeze is enforced at the SINGLE choke point ---
+# dispatch_once(), so every caller honours it by construction. O-1's original fix
+# only gated the two gateway watchers, leaving `hermes kanban dispatch`, the dashboard
+# POST /dispatch endpoint, and `hermes kanban daemon --force` free to dispatch while
+# root-frozen. Test seam: point _ROOT_CONFIG_PATH_OVERRIDE at a clean file so the real
+# operator freeze in ~/.hermes/config.yaml doesn't leak into the test suite.
+_ROOT_CONFIG_PATH_OVERRIDE: Optional[str] = None
+
+
+def _root_config_path() -> Path:
+    if _ROOT_CONFIG_PATH_OVERRIDE is not None:
+        return Path(_ROOT_CONFIG_PATH_OVERRIDE)
+    return Path.home() / ".hermes" / "config.yaml"
+
+
+def _root_dispatch_frozen() -> bool:
+    """O-1 global kill-switch: True iff the ROOT ~/.hermes/config.yaml explicitly sets
+    kanban.dispatch_in_gateway=false — read directly, independent of HERMES_HOME/
+    profile, so one root setting freezes every lane. Fails OPEN on read error."""
+    try:
+        import yaml
+        p = _root_config_path()
+        if not p.is_file():
+            return False
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        kanban = data.get("kanban", {}) if isinstance(data, dict) else {}
+        return kanban.get("dispatch_in_gateway", True) is False
+    except Exception:
+        return False
+
+
+def dispatch_frozen() -> bool:
+    """True iff the kanban dispatcher is frozen. Frozen if ANY of: the env kill-switch
+    HERMES_KANBAN_DISPATCH_IN_GATEWAY in {0,false,no,off}; the active profile config
+    kanban.dispatch_in_gateway=false; or the ROOT config (O-1). Each source fails OPEN
+    independently (a read error on one never wedges an otherwise-enabled dispatcher)."""
+    raw = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return True
+    try:
+        from hermes_cli.config import load_config
+        if (load_config().get("kanban") or {}).get("dispatch_in_gateway", True) is False:
+            return True
+    except Exception:
+        pass
+    return _root_dispatch_frozen()
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -12959,6 +13076,11 @@ def dispatch_once(
     check, by design -- they're short-lived, human-triggered ticks, not the
     long-running loop the D-state/cgroup heuristic is built for.
     """
+    # A2 (2026-07-14): single freeze choke point — every dispatch caller (gateway
+    # watcher, `hermes kanban dispatch` CLI, dashboard POST /dispatch, standalone
+    # `daemon --force`) is gated here. No DB writes while frozen.
+    if dispatch_frozen():
+        return DispatchResult(skipped_frozen=True)
     try:
         db_path = kanban_db_path(board=board)
     except Exception:

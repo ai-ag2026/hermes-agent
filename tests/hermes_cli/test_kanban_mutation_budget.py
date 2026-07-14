@@ -47,12 +47,36 @@ def test_adhoc_archive_burst_trips_rate_ceiling(kanban_home):
         assert kb.get_task(conn, ids[5]).status != "archived"
 
 
-def test_disabled_budget_allows_unbounded(kanban_home, monkeypatch):
-    monkeypatch.setenv("HERMES_KANBAN_MUTATION_BUDGET", "off")
+def test_disabled_budget_via_config_allows_unbounded(kanban_home, monkeypatch):
+    # B1: disabling is operator-config-only now (env can't disable).
+    monkeypatch.delenv("HERMES_KANBAN_MUTATION_BUDGET", raising=False)
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  mutation_budget:\n    enabled: false\n", encoding="utf-8")
     with kb.connect() as conn:
         ids = _mk(conn, 12)
         for t in ids:
-            assert kb.archive_task(conn, t) is True          # no ceiling when off
+            assert kb.archive_task(conn, t) is True          # no ceiling when disabled
+
+
+def test_env_cannot_disable_budget_b1(kanban_home, monkeypatch):
+    # B1: a per-command HERMES_KANBAN_MUTATION_BUDGET=off must be IGNORED — the ceiling
+    # (5 from the fixture) still trips, and the burst is still logged for the digest.
+    monkeypatch.setenv("HERMES_KANBAN_MUTATION_BUDGET", "off")
+    with kb.connect() as conn:
+        ids = _mk(conn, 8)
+        done = 0
+        tripped = False
+        for t in ids:
+            try:
+                kb.archive_task(conn, t)
+                done += 1
+            except kb.MutationBudgetError:
+                tripped = True
+                break
+        assert done == 5 and tripped is True
+        # the allowed archives ARE in the ledger (digest visibility preserved)
+        n = conn.execute("SELECT COUNT(*) AS n FROM mutation_log WHERE op='archive'").fetchone()["n"]
+        assert n == 5
 
 
 # --- WP②.2 scope-bound manifest -------------------------------------------------
@@ -163,6 +187,16 @@ def test_digest_summarizes_adhoc_and_manifest_mutations(kanban_home):
         assert d["events"].get("archived") == 5
         text = kb.format_mutation_digest(d)
         assert "archive: 5" in text and "bulk manifests: 1" in text
+
+
+def test_digest_attributes_archives_to_actor(kanban_home):
+    # B4: archive_task threads actor -> the digest's by_actor bucket is populated.
+    with kb.connect() as conn:
+        for t in _mk(conn, 3):
+            kb.archive_task(conn, t, actor="tars")
+        d = kb.board_mutation_digest(conn, since_seconds=3600)
+        assert d["mutations"]["archive"]["by_actor"] == {"tars": 3}
+        assert "by tars:3" in kb.format_mutation_digest(d)
 
 
 def test_digest_empty_window(kanban_home):
