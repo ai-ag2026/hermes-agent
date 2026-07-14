@@ -1073,27 +1073,49 @@ def _profile_cache_roots() -> List[Path]:
 
 
 def _kanban_completion_artifact_roots() -> List[Path]:
-    """Return durable Kanban evidence roots, including named boards."""
+    """Return durable Kanban completion-evidence roots. Aligned (2026-07-14 merge) to
+    the import-free style of _kanban_attachment_roots — resolve via _HERMES_ROOT /
+    HERMES_KANBAN_HOME instead of importing kanban_db (avoids the import + a cycle)."""
+    override = os.environ.get("HERMES_KANBAN_ARTIFACTS_ROOT", "").strip()
+    if override:
+        return [Path(override).expanduser()]
+    home_override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    root = Path(home_override).expanduser() if home_override else _HERMES_ROOT
+    roots = [root / "kanban" / "artifacts"]
+    boards_root = root / "kanban" / "boards"
     try:
-        from hermes_cli import kanban_db as _kanban_db
-
-        override = os.environ.get("HERMES_KANBAN_ARTIFACTS_ROOT", "").strip()
-        if override:
-            return [Path(os.path.expanduser(override))]
-        home = _kanban_db.kanban_home()
-        roots = [home / "kanban" / "artifacts"]
-        boards_dir = home / "kanban" / "boards"
-        try:
-            roots.extend(
-                child / "artifacts"
-                for child in boards_dir.iterdir()
-                if child.is_dir() and not child.is_symlink()
-            )
-        except OSError:
-            pass
+        board_dirs = [
+            path for path in boards_root.iterdir()
+            if path.is_dir() and not path.is_symlink()
+            and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", path.name)
+            and (path / "kanban.db").is_file()
+        ]
+    except OSError:
         return roots
-    except Exception:
-        return []
+    roots.extend(path / "artifacts" for path in board_dirs)
+    return roots
+
+
+def _kanban_attachment_roots() -> List[Path]:
+    """Return durable Kanban attachment roots without importing kanban_db."""
+    override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
+    if override:
+        return [Path(override).expanduser()]
+    home_override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    root = Path(home_override).expanduser() if home_override else _HERMES_ROOT
+    roots = [root / "kanban" / "attachments"]
+    boards_root = root / "kanban" / "boards"
+    try:
+        board_dirs = [
+            path for path in boards_root.iterdir()
+            if path.is_dir() and not path.is_symlink()
+            and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", path.name)
+            and (path / "kanban.db").is_file()
+        ]
+    except OSError:
+        return roots
+    roots.extend(path / "attachments" for path in board_dirs)
+    return roots
 
 
 def _media_delivery_allowed_roots() -> List[Path]:
@@ -1101,6 +1123,7 @@ def _media_delivery_allowed_roots() -> List[Path]:
     roots = [Path(root) for root in MEDIA_DELIVERY_SAFE_ROOTS]
     roots.extend(_profile_cache_roots())
     roots.extend(_kanban_completion_artifact_roots())
+    roots.extend(_kanban_attachment_roots())
     extra_roots = os.environ.get(MEDIA_DELIVERY_ALLOW_DIRS_ENV, "")
     for chunk in extra_roots.split(os.pathsep):
         for raw_root in chunk.split(","):

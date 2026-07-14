@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -200,54 +201,6 @@ def _board_task(payload, task_id):
     return next(t for col in payload["columns"] for t in col["tasks"] if t["id"] == task_id)
 
 
-def test_current_attention_contract_and_redaction(client, tmp_path):
-    task, action = _pending_exact_action(client, tmp_path)
-    board_task = _board_task(client.get("/api/plugins/kanban/board").json(), task["id"])
-    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
-    assert board_task["attention"] == detail["task"]["attention"]
-    assert set(detail["task"]["attention"]) == _ATTENTION_FIELDS
-    public = repr({"board": board_task, "detail": detail})
-    for marker in ("P5_RAW_COMMAND_MARKER", "P5_SUMMARY_MARKER", "P5_PROFILE_MARKER", "P5_BLOCKER_MARKER", action.command_hash, action.fingerprint):
-        assert marker not in public
-    assert "pending_terminal_action" not in public
-
-
-def test_task_payload_is_a_recursive_public_whitelist(client, tmp_path):
-    task = client.post("/api/plugins/kanban/tasks", json={"title": "safe", "body": "public body", "assignee": "worker"}).json()["task"]
-    markers = {
-        "workspace_path": "P5_WORKSPACE_MARKER", "claim_lock": "P5_CLAIM_MARKER",
-        "last_failure_error": "P5_FAILURE_MARKER", "result": "P5_RESULT_MARKER",
-        "session_id": "P5_SESSION_MARKER", "run_summary": "P5_RUN_MARKER",
-        "run_error": "P5_RUN_ERROR_MARKER", "run_metadata": "P5_RUN_METADATA_MARKER",
-        "event_metadata": "P5_EVENT_METADATA_MARKER",
-    }
-    with kb.connect() as conn:
-        claimed = kb.claim_task(conn, task["id"], claimer="redaction-worker")
-        assert claimed is not None and claimed.current_run_id is not None
-        with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET workspace_path=?, claim_lock=?, last_failure_error=?, result=?, session_id=? WHERE id=?",
-                (markers["workspace_path"], markers["claim_lock"], markers["last_failure_error"], markers["result"], markers["session_id"], task["id"]),
-            )
-            conn.execute(
-                "UPDATE task_runs SET summary=?, metadata=?, error=? WHERE id=?",
-                (markers["run_summary"], markers["run_metadata"], markers["run_error"], claimed.current_run_id),
-            )
-            conn.execute("UPDATE task_events SET payload=? WHERE task_id=?", (markers["event_metadata"], task["id"]))
-    board = client.get("/api/plugins/kanban/board").json()
-    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
-    expected = {
-        "id", "title", "body", "assignee", "status", "priority", "tenant", "created_at", "started_at", "completed_at",
-        "max_runtime_seconds", "workflow_template_id", "current_step_key", "goal_mode", "goal_max_turns", "skills", "block_reason", "age", "latest_summary",
-    }
-    board_task = _board_task(board, task["id"])
-    assert expected <= set(board_task)
-    assert set(board_task) == expected | {"link_counts", "comment_count", "progress"}
-    assert set(detail["task"]) == expected
-    assert board_task["block_reason"] is None and detail["task"]["block_reason"] is None
-    public = repr({"board": board, "detail": detail}) + repr({"board": board, "detail": detail})
-    for marker in markers.values():
-        assert marker not in public
 
 
 def test_named_board_identity_is_returned_by_board_detail_update_and_approve(client, tmp_path):
@@ -379,6 +332,102 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_board_list_recommends_persistent_workspace_for_configured_workdir(
+    client, tmp_path
+):
+    """Board metadata should tell the UI which safe task default to use."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    kb.write_board_metadata("default", default_workdir=str(repo))
+
+    plain_dir = tmp_path / "notes"
+    plain_dir.mkdir()
+    kb.create_board("notes", default_workdir=str(plain_dir))
+    kb.create_board("disposable")
+
+    response = client.get("/api/plugins/kanban/boards")
+
+    assert response.status_code == 200
+    boards = {board["slug"]: board for board in response.json()["boards"]}
+    assert boards["default"]["default_workspace_kind"] == "worktree"
+    assert boards["notes"]["default_workspace_kind"] == "dir"
+    assert boards["disposable"]["default_workspace_kind"] == "scratch"
+
+
+def test_create_board_persists_project_directory(client, tmp_path):
+    """The dashboard board form should anchor future tasks to its project."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    response = client.post(
+        "/api/plugins/kanban/boards",
+        json={
+            "slug": "project-board",
+            "name": "Project Board",
+            "default_workdir": str(project_dir),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    board = response.json()["board"]
+    assert board["default_workdir"] == str(project_dir.resolve())
+    assert board["default_workspace_kind"] == "dir"
+    assert kb.read_board_metadata("project-board")["default_workdir"] == str(
+        project_dir.resolve()
+    )
+
+
+@pytest.mark.parametrize("path", ["relative/project", "~/missing-project"])
+def test_create_board_rejects_invalid_project_directory(client, path):
+    """A board must not persist a path that cannot anchor worker output."""
+    response = client.post(
+        "/api/plugins/kanban/boards",
+        json={"slug": "invalid-project", "default_workdir": path},
+    )
+
+    assert response.status_code == 400
+    assert "project directory" in response.json()["detail"].lower()
+
+
+def test_new_board_dialog_collects_project_directory():
+    """Board creation should expose the setting that controls safe task defaults."""
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    assert 'const [projectDirectory, setProjectDirectory] = useState("");' in bundle
+    assert "Project directory" in bundle
+    assert "Absolute path to the project folder" in bundle
+    assert "default_workdir: projectDirectory.trim() || undefined" in bundle
+
+
+def test_dashboard_workspace_picker_explains_persistence_contract():
+    """Task creation must make scratch deletion visible without a hover."""
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    assert "Temporary — deleted on completion" in bundle
+    assert "Git worktree — preserved" in bundle
+    assert "Directory — preserved" in bundle
+    assert "defaultWorkspacePath: (props.boardMeta && props.boardMeta.default_workdir) || \"\"" in bundle
+    assert (
+        "This workspace and any files left in it are deleted when the task completes."
+        in bundle
+    )
 
 
 def test_scheduled_tasks_have_their_own_column_not_todo(client):
@@ -2715,3 +2764,192 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+# ---------------------------------------------------------------------------
+# Final result visibility for Done cards
+# ---------------------------------------------------------------------------
+
+
+def test_task_detail_exposes_result_and_latest_summary_separately(client):
+    """The drawer receives both source fields without a duplicate alias."""
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Task with explicit result"},
+    )
+    task_id = r.json()["task"]["id"]
+    client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "done", "result": "The final answer is 42.", "summary": "short handoff"},
+    )
+    r = client.get(f"/api/plugins/kanban/tasks/{task_id}")
+    assert r.status_code == 200
+    data = r.json()["task"]
+    assert data["result"] == "The final answer is 42."
+    assert data["latest_summary"] == "short handoff"
+    assert "final_result" not in data
+
+
+def test_task_detail_exposes_latest_summary_when_result_is_empty(client):
+    """Summary-only completions remain available to the drawer fallback."""
+    conn = kb.connect()
+    task_id = kb.create_task(conn, title="Task with only run summary")
+    kb.claim_task(conn, task_id)
+    kb.complete_task(conn, task_id, summary="Report written to /output/report.md")
+    conn.close()
+
+    r = client.get(f"/api/plugins/kanban/tasks/{task_id}")
+    assert r.status_code == 200
+    data = r.json()["task"]
+    assert data["status"] == "done"
+    assert not data["result"]
+    assert data["latest_summary"] == "Report written to /output/report.md"
+
+
+def test_task_detail_latest_summary_none_when_nothing_recorded(client):
+    """When no run summary exists, the existing field remains None."""
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Task with no result at all"},
+    )
+    task_id = r.json()["task"]["id"]
+    r = client.get(f"/api/plugins/kanban/tasks/{task_id}")
+    assert r.status_code == 200
+    assert r.json()["task"]["latest_summary"] is None
+
+
+def test_board_tasks_include_latest_summary(client):
+    """Board cards already expose the summary used by the drawer fallback."""
+    conn = kb.connect()
+    task_id = kb.create_task(conn, title="Board card with summary only")
+    kb.claim_task(conn, task_id)
+    kb.complete_task(conn, task_id, summary="Done: see attachment")
+    conn.close()
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    done_col = next(c for c in r.json()["columns"] if c["name"] == "done")
+    card = next((t for t in done_col["tasks"] if t["id"] == task_id), None)
+    assert card is not None
+    assert "Done: see attachment" in card["latest_summary"]
+
+
+def test_dashboard_done_final_result_section_rendered_from_summary():
+    """Frontend must render Final Result section from run summary when task.result is empty."""
+    repo_root = Path(__file__).resolve().parents[2]
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    assert "t.result || t.latest_summary" in dist
+    assert "Final Result (run summary)" in dist
+    assert "No final result was recorded" in dist
+    assert "orchestrator" in dist or "parent task" in dist
+
+
+def test_task_detail_includes_child_result_summaries(client):
+    """Parent drawers should receive the child results they need to render."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="Research topic")
+        child = kb.create_task(conn, title="Collect sources")
+        kb.link_tasks(conn, parent, child)
+        kb.complete_task(conn, parent, summary="Delegated research to child tasks.")
+        kb.recompute_ready(conn)
+        kb.complete_task(conn, child, summary="Collected five primary sources.")
+
+    response = client.get(f"/api/plugins/kanban/tasks/{parent}")
+
+    assert response.status_code == 200
+    assert response.json()["child_results"] == [
+        {
+            "id": child,
+            "title": "Collect sources",
+            "status": "done",
+            "latest_summary": "Collected five primary sources.",
+            "result": None,
+        }
+    ]
+
+
+def test_dashboard_final_result_uses_existing_fields_without_alias():
+    """The drawer should not duplicate result/summary into another API field."""
+    repo_root = Path(__file__).resolve().parents[2]
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    api = (repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py").read_text()
+
+    assert "var finalResult = t.result || t.latest_summary || null;" in dist
+    assert "t.final_result" not in dist
+    assert 'd["final_result"]' not in api
+
+
+def test_dashboard_parent_notice_and_child_results_use_detail_links():
+    """Parent detection must use links.children, which exists in task detail."""
+    repo_root = Path(__file__).resolve().parents[2]
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    detail = dist[dist.index("function TaskDetail"):]
+
+    assert "links.children.length > 0" in detail
+    assert "t.link_counts" not in detail
+    assert "Child Results" in detail
+    assert "props.data.child_results" in detail
+
+
+def test_current_attention_contract_and_redaction(client, tmp_path):
+    task, action = _pending_exact_action(client, tmp_path)
+    board_task = _board_task(client.get("/api/plugins/kanban/board").json(), task["id"])
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    assert board_task["attention"] == detail["task"]["attention"]
+    assert set(detail["task"]["attention"]) == _ATTENTION_FIELDS
+    public = repr({"board": board_task, "detail": detail})
+    # Option 1 (2026-07-14 merge): the block reason now surfaces via latest_summary on
+    # the operator dashboard (upstream Done-card direction) — dropped from the redaction
+    # set. The raw exact-action command, the action summary, the profile, and the
+    # command hashes/fingerprint still NEVER leak.
+    for marker in ("P5_RAW_COMMAND_MARKER", "P5_SUMMARY_MARKER", "P5_PROFILE_MARKER", action.command_hash, action.fingerprint):
+        assert marker not in public
+    assert "pending_terminal_action" not in public
+
+
+def test_task_payload_is_a_recursive_public_whitelist(client, tmp_path):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "safe", "body": "public body", "assignee": "worker"}).json()["task"]
+    markers = {
+        "workspace_path": "P5_WORKSPACE_MARKER", "claim_lock": "P5_CLAIM_MARKER",
+        "last_failure_error": "P5_FAILURE_MARKER", "result": "P5_RESULT_MARKER",
+        "session_id": "P5_SESSION_MARKER", "run_summary": "P5_RUN_MARKER",
+        "run_error": "P5_RUN_ERROR_MARKER", "run_metadata": "P5_RUN_METADATA_MARKER",
+        "event_metadata": "P5_EVENT_METADATA_MARKER",
+    }
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task["id"], claimer="redaction-worker")
+        assert claimed is not None and claimed.current_run_id is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workspace_path=?, claim_lock=?, last_failure_error=?, result=?, session_id=? WHERE id=?",
+                (markers["workspace_path"], markers["claim_lock"], markers["last_failure_error"], markers["result"], markers["session_id"], task["id"]),
+            )
+            conn.execute(
+                "UPDATE task_runs SET summary=?, metadata=?, error=? WHERE id=?",
+                (markers["run_summary"], markers["run_metadata"], markers["run_error"], claimed.current_run_id),
+            )
+            conn.execute("UPDATE task_events SET payload=? WHERE task_id=?", (markers["event_metadata"], task["id"]))
+    board = client.get("/api/plugins/kanban/board").json()
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    expected = {
+        "id", "title", "body", "assignee", "status", "priority", "tenant", "created_at", "started_at", "completed_at",
+        "max_runtime_seconds", "workflow_template_id", "current_step_key", "goal_mode", "goal_max_turns", "skills", "block_reason", "age", "latest_summary",
+    }
+    board_task = _board_task(board, task["id"])
+    assert expected <= set(board_task)
+    assert set(board_task) == expected | {"link_counts", "comment_count", "progress"}
+    # Option 1 (2026-07-14 merge): the detail drawer additionally exposes `result`
+    # (upstream Done-card direction). The board LIST stays result-free (our privacy).
+    assert set(detail["task"]) == expected | {"result"}
+    assert board_task["block_reason"] is None and detail["task"]["block_reason"] is None
+    # `result` is now intentionally surfaced on the detail drawer, but must NOT leak
+    # into the board list; every OTHER internal marker still never surfaces anywhere.
+    assert markers["result"] not in repr(board)
+    public = repr({"board": board, "detail": detail}) + repr({"board": board, "detail": detail})
+    # Option 1 exposes `latest_summary` (the worker-authored run summary) on both the
+    # board and the drawer — so `run_summary` is intentionally public now. `result` is
+    # drawer-only. Every OTHER internal marker (command, hashes, profile, run_metadata,
+    # run_error, session_id, …) must still never surface anywhere.
+    for name, marker in markers.items():
+        if name in ("result", "run_summary"):
+            continue
+        assert marker not in public

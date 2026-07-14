@@ -2124,15 +2124,25 @@ def terminal_tool(
             )
             if not _candidate_guard.get("approved", False):
                 outcome = _candidate_guard.get("guard_outcome") or _candidate_guard.get("outcome")
-                if outcome == "approval_required":
-                    return json.dumps({
+                if outcome == "approval_required" or _candidate_guard.get("status") == "pending_approval":
+                    _pending = {
                         "output": "", "exit_code": -1, "error": "",
                         "status": "pending_approval", "approval_pending": True,
                         "description": _candidate_guard.get("description", "command flagged"),
                         "pattern_key": _candidate_guard.get("pattern_key", ""),
                         "kanban_approval": _candidate_guard.get("kanban_approval"),
-                        "mutation_kind": _candidate_guard.get("mutation_kind"), "outcome": outcome,
-                    }, ensure_ascii=False)
+                        "mutation_kind": _candidate_guard.get("mutation_kind"),
+                        "outcome": outcome or "approval_required",
+                    }
+                    # N1 kept OURS guard flow, but upstream's smart-deny owner-override
+                    # capabilities are an adopted approval feature: the CLI/TUI/gateway
+                    # read smart_denied/allow_permanent from this terminal payload to pick
+                    # the approval choices. Propagate them WHEN the guard supplies them so
+                    # normal (keyless) OURS denials keep their existing prompt behaviour.
+                    for _cap in ("smart_denied", "allow_permanent"):
+                        if _cap in _candidate_guard:
+                            _pending[_cap] = _candidate_guard[_cap]
+                    return json.dumps(_pending, ensure_ascii=False)
                 if outcome == "retry_with_safe_alternative":
                     return json.dumps({
                         "output": "", "exit_code": -1,

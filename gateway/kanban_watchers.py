@@ -319,16 +319,16 @@ def _root_dispatch_frozen() -> bool:
     EXPLICITLY freezes dispatch. Applied as an AND-condition to every gateway lane, so
     one root setting freezes all of them. Fails OPEN (returns False) on any read error
     so a transient/broken root config never wedges an otherwise-enabled dispatcher —
-    the profile gate remains the primary control."""
+    the profile gate remains the primary control.
+
+    A2/A3 (2026-07-14): delegate to the single source of truth in ``kanban_db`` so the
+    root-config read goes through its test-injectable ``_ROOT_CONFIG_PATH_OVERRIDE``
+    seam. Behaviour-neutral in prod (the seam is None → reads the real
+    ``~/.hermes/config.yaml``); in tests the conftest points the seam at the isolated
+    HERMES_HOME, so this watcher copy honours the freeze hermetically too."""
     try:
-        import yaml
-        root_cfg = Path.home() / ".hermes" / "config.yaml"
-        if not root_cfg.is_file():
-            return False
-        with open(root_cfg, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
-        kanban = data.get("kanban", {}) if isinstance(data, dict) else {}
-        return kanban.get("dispatch_in_gateway", True) is False
+        from hermes_cli import kanban_db as _kb
+        return _kb._root_dispatch_frozen()
     except Exception:
         return False
 

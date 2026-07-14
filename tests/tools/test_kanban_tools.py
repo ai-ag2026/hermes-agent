@@ -595,6 +595,7 @@ def test_complete_rejects_non_list_artifacts(worker_env):
     assert "artifacts must be a list" in err
 
 
+
 def test_complete_rejects_no_handoff(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({})
@@ -2747,3 +2748,33 @@ def test_create_tool_passes_task_class_and_max_retries(monkeypatch, worker_env):
         assert int(row["max_retries"]) == 4
     finally:
         conn.close()
+
+
+def test_complete_missing_scratch_artifact_stays_in_flight(worker_env):
+    """A false deliverable claim must return retry guidance, not mark Done."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, worker_env, workspace)
+
+    output = kt._handle_complete({
+        "summary": "report complete",
+        "artifacts": [str(workspace / "missing-report.md")],
+    })
+    result = json.loads(output)
+
+    # Choice A (2026-07-14 merge): our completion-artifact EVIDENCE validation runs
+    # BEFORE the write txn and fails closed on a non-existent deliverable — it
+    # pre-empts upstream's ArtifactPreservationError for the missing case. Either
+    # way the task stays in-flight (no state change) and the worker may retry.
+    assert result.get("success") is False
+    assert result.get("state_changed") is False
+    assert result.get("retryable") is True
+    assert "does not exist" in result.get("error", "")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+    assert workspace.exists()

@@ -2773,6 +2773,12 @@ def test_cleanup_workspace_removes_managed_scratch_dir(kanban_home):
     assert not ws.exists(), "Hermes-managed scratch dir should be cleaned up"
 
 
+
+
+
+
+
+
 def test_cleanup_workspace_refuses_path_outside_scratch_root(kanban_home, tmp_path):
     """A scratch task with a user path outside the workspaces root must NOT be deleted (#28818).
 
@@ -7288,3 +7294,65 @@ def test_spawn_env_strip_extendable_via_config(kanban_home, monkeypatch):
         task = kb.get_task(conn, t)
     _kb._default_spawn(task, str(kanban_home))
     assert "MY_EXTRA_SECRET" not in captured["env"]
+
+
+def test_complete_task_rejects_missing_declared_scratch_artifact(kanban_home):
+    """A declared scratch deliverable must not disappear behind a false Done."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="missing report")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        missing = ws / "report.md"
+
+        # Choice A (2026-07-14 merge): our completion-artifact EVIDENCE validation runs
+        # before the write txn and fails closed on a non-existent deliverable, pre-empting
+        # upstream's in-txn ArtifactPreservationError. Same safety outcome (no false Done,
+        # scratch kept for retry), our exception type.
+        with pytest.raises(kb.CompletionEvidenceError, match="does not exist"):
+            kb.complete_task(
+                conn,
+                t,
+                result="report complete",
+                metadata={"artifacts": [str(missing)]},
+            )
+
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.list_attachments(conn, t) == []
+    assert ws.exists(), "failed completion must keep scratch available for retry"
+
+
+def test_complete_task_rejects_out_of_root_artifact(
+    kanban_home,
+    tmp_path,
+):
+    """Choice A (2026-07-14 merge): our completion-artifact EVIDENCE validation is kept,
+    so a declared artifact OUTSIDE the allowed roots (the managed workspace / board
+    artifact roots) fails closed — even if the file really exists. This deliberately
+    diverges from upstream's opaque model (which let external paths ride into the payload
+    unchanged): under our posture, workers must place deliverables inside their workspace.
+    The task stays in-flight and the external file is left untouched."""
+    external = tmp_path / "report.md"
+    external.write_text("keep me here", encoding="utf-8")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="external report")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+
+        with pytest.raises(
+            kb.CompletionEvidenceError, match="outside allowed roots"
+        ):
+            kb.complete_task(
+                conn,
+                t,
+                result="ok",
+                metadata={"artifacts": [str(external)]},
+            )
+
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.list_attachments(conn, t) == []
+
+    assert external.exists(), "a rejected completion must not touch the external file"
+    assert ws.exists(), "failed completion keeps the scratch workspace for retry"
