@@ -137,6 +137,11 @@ VALID_BLOCK_ATTENTION_TYPES = frozenset({"decision", "capability", "transient", 
 VALID_BLOCK_REASON_CODES = frozenset({
     "credential_choice", "publication_approval", "missing_capability",
     "external_transient", "goal_closeout_missing", "review_required",
+    # K-1 (2026-07-14): enforce_max_runtime parks an approved-action attempt that hit
+    # its runtime cap with attention_type="transient", reason_code="runtime_timeout".
+    # It was missing from both enums, so _block_cause_fingerprint raised ValueError
+    # and crashed the whole dispatcher tick on a runtime-capped approved action.
+    "runtime_timeout",
 })
 BLOCK_CAUSE_VERSION = 1
 # Typed causes may use only a tiny product vocabulary. Scope is identity
@@ -147,6 +152,7 @@ BLOCK_CAUSE_SCOPE_ENUMS: dict[tuple[str, str], dict[str, frozenset[str]]] = {
     ("decision", "publication_approval"): {"required_decision": frozenset({"publication"})},
     ("capability", "missing_capability"): {"capability": frozenset({"access", "credential", "tool"})},
     ("transient", "external_transient"): {"subject": frozenset({"external_service"})},
+    ("transient", "runtime_timeout"): {"subject": frozenset({"runtime"})},  # K-1
     ("protocol", "goal_closeout_missing"): {"protocol": frozenset({"goal_closeout"})},
     ("review", "review_required"): {"subject": frozenset({"review"})},
     ("loop_triage", "review_required"): {"subject": frozenset({"loop"})},
@@ -11908,10 +11914,23 @@ def enforce_max_runtime(
 
         # An approved exact action is a separate, explicit retry lifecycle.
         # Park it before the legacy ready/requeue mutation loses the origin run.
-        if row["current_run_id"] is not None and _park_approved_action_on_technical_failure_if_current(
-            conn, task_id=tid, expected_run_id=int(row["current_run_id"]),
-            attention_type="transient", reason_code="runtime_timeout", now=now,
-        ):
+        parked = False
+        if row["current_run_id"] is not None:
+            try:
+                parked = _park_approved_action_on_technical_failure_if_current(
+                    conn, task_id=tid, expected_run_id=int(row["current_run_id"]),
+                    attention_type="transient", reason_code="runtime_timeout", now=now,
+                )
+            except Exception:
+                # K-1 defensive: a park failure (e.g. a future enum mismatch) must NOT
+                # crash the whole dispatcher tick and strand the task. Log + fall
+                # through to the normal timeout requeue below, which still releases
+                # the runaway worker (ready + timed_out event).
+                _log.exception(
+                    "enforce_max_runtime: approved-action park failed for %s; requeuing", tid
+                )
+                parked = False
+        if parked:
             timed_out.append(tid)
             continue
 

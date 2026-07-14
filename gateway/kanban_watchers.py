@@ -307,6 +307,32 @@ def _filter_operator_owned_triage_ids(
     return kept
 
 
+def _root_dispatch_frozen() -> bool:
+    """O-1 (2026-07-14): global dispatch freeze kill-switch.
+
+    The per-gateway dispatch gate reads ``load_config()`` — which is PROFILE-scoped
+    (no merge with root). Setting ``kanban.dispatch_in_gateway: false`` only in the
+    root ``~/.hermes/config.yaml`` therefore left a profile gateway (``-p work`` or
+    any of the other profiles that default to True) free to dispatch and silently
+    break the freeze. This reads the ROOT config directly — ``~/.hermes/config.yaml``,
+    independent of ``HERMES_HOME``/``HERMES_PROFILE`` — and reports whether it
+    EXPLICITLY freezes dispatch. Applied as an AND-condition to every gateway lane, so
+    one root setting freezes all of them. Fails OPEN (returns False) on any read error
+    so a transient/broken root config never wedges an otherwise-enabled dispatcher —
+    the profile gate remains the primary control."""
+    try:
+        import yaml
+        root_cfg = Path.home() / ".hermes" / "config.yaml"
+        if not root_cfg.is_file():
+            return False
+        with open(root_cfg, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        kanban = data.get("kanban", {}) if isinstance(data, dict) else {}
+        return kanban.get("dispatch_in_gateway", True) is False
+    except Exception:
+        return False
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -400,9 +426,10 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        if not kanban_cfg.get("dispatch_in_gateway", True) or _root_dispatch_frozen():
             logger.info(
-                "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
+                "kanban notifier: disabled via kanban.dispatch_in_gateway=false "
+                "(profile or O-1 root freeze)"
             )
             return
         from gateway.config import Platform as _Platform
@@ -1230,9 +1257,10 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        if not kanban_cfg.get("dispatch_in_gateway", True) or _root_dispatch_frozen():
             logger.info(
-                "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
+                "kanban dispatcher: disabled via kanban.dispatch_in_gateway=false "
+                "(profile or O-1 root freeze)"
             )
             return
 
