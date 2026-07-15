@@ -1280,6 +1280,12 @@ class Attention:
     expires_at: Optional[int]
     requires_human_action: bool
     approvable: bool
+    # The run whose technical failure parked an already-approved action. Only a
+    # technical projection (capability/transient) carries one. It is a required
+    # argument of resume_approved_action_retry -- the only escape from that
+    # park -- so without it here no UI can ever call that seam, which is exactly
+    # why the escape existed for months with no button anywhere (2026-07-15).
+    origin_run_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -9296,7 +9302,7 @@ def get_current_attentions(
         rows = conn.execute(
             "SELECT x.id AS attention_id, x.task_id, x.action_id, x.type, x.summary, "
             "x.created_at AS attention_created_at, x.version AS projection_version, a.state AS action_state, "
-            "a.version AS action_version, a.expires_at "
+            "a.version AS action_version, a.expires_at, x.origin_run_id "
             "FROM task_attentions x JOIN tasks t ON t.id=x.task_id "
             "LEFT JOIN task_pending_actions a ON a.id=x.action_id "
             f"WHERE x.task_id IN ({marks}) AND t.status NOT IN ('done','archived') "
@@ -9322,6 +9328,7 @@ def get_current_attentions(
                 expires_at=(int(row["expires_at"]) if row["expires_at"] is not None else None),
                 requires_human_action=(row["action_state"] == "pending") if exact else row["type"] in {"decision", "protocol", "review", "capability"},
                 approvable=exact and row["action_state"] == "pending",
+                origin_run_id=(int(row["origin_run_id"]) if row["origin_run_id"] is not None else None),
             )
     return result
 

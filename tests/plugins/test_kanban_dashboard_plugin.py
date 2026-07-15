@@ -231,9 +231,16 @@ def test_resume_approved_action_retry_is_opaque_and_versioned(client, tmp_path):
             conn, task_id=task["id"], action_id=action.id, expected_run_id=resumed.current_run_id,
             attention_type="capability", reason_code="missing_capability", now=int(time.time()),
         )
-        origin_run_id = resumed.current_run_id
+        db_origin_run_id = resumed.current_run_id
     technical = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]["attention"]
     assert technical["type"] == "capability"
+    # 2026-07-15: take origin_run_id from the API, not from the DB. This route
+    # requires it, and until now the schema never emitted it -- so this test
+    # passed while no real client could ever call the endpoint, and the only
+    # escape from a technical park sat unreachable behind a button that did not
+    # exist. Reading it out of the DB here hid exactly that.
+    origin_run_id = technical["origin_run_id"]
+    assert origin_run_id == db_origin_run_id
     route = f"/api/plugins/kanban/tasks/{task['id']}/resume-approved-action-retry"
     base = {"attention_id": technical["id"], "attention_version": technical["version"], "origin_run_id": origin_run_id}
     assert client.post(route, json={**base, "origin_run_id": origin_run_id + 1}).status_code == 409

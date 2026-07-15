@@ -229,7 +229,7 @@ def _attention_dict(attention: Optional[kanban_db.Attention]) -> Optional[dict[s
         requires_human_action = attention.requires_human_action
         approvable = False
         summary = attention.summary
-    return {
+    payload = {
         "id": attention.id,
         "type": attention.type,
         "requires_human_action": requires_human_action,
@@ -241,6 +241,15 @@ def _attention_dict(attention: Optional[kanban_db.Attention]) -> Optional[dict[s
         "version": attention.version,
         "operator_summary": summary,
     }
+    if attention.type != "exact_action" and attention.origin_run_id is not None:
+        # resume-approved-action-retry REQUIRES origin_run_id, and this closed
+        # schema never emitted it -- so the only escape from a technically
+        # parked approved action was uncallable by any client. Its own test only
+        # passed by reading the value straight out of the DB. Run ids are
+        # already public on this surface (events, /runs), so this leaks nothing
+        # new; action_id stays private authority and is still not resolved here.
+        payload["origin_run_id"] = attention.origin_run_id
+    return payload
 
 
 def _attention_action(conn: sqlite3.Connection, task_id: str, attention_id: int) -> Optional[kanban_db.PendingAction]:
