@@ -738,6 +738,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
 
     # --- unarchive (reversibility, Säule 1) ---
+    p_reopen = sub.add_parser(
+        "reopen",
+        help="Reopen a done/archived task (operator only) — lands in blocked, not ready",
+    )
+    p_reopen.add_argument("task_ids", nargs="+", help="Done or archived task ids to reopen")
+    p_reopen.add_argument(
+        "--reason", required=True,
+        help="Why the card is being reopened. Recorded in the 'reopened' event.",
+    )
+    p_reopen.add_argument(
+        "--status", dest="to_status", default="blocked", choices=["blocked", "todo"],
+        help=(
+            "Where to land (default: blocked). 'ready' is deliberately not offered: "
+            "the dispatcher claims ready cards within ~60s, which is how a finished "
+            "audit got re-run on 2026-07-15 before the operator could decide."
+        ),
+    )
+
     p_unarchive = sub.add_parser(
         "unarchive", help="Restore one or more archived tasks (reversible undo)")
     p_unarchive.add_argument("task_ids", nargs="+", help="Archived task ids to restore")
@@ -1124,6 +1142,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "gate-token": _cmd_gate_token,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "reopen": _cmd_reopen,
             "unarchive": _cmd_unarchive,
             "digest":   _cmd_digest,
             "tail":     _cmd_tail,
@@ -2514,6 +2533,28 @@ def _cmd_digest(args: argparse.Namespace) -> int:
     else:
         print(kb.format_mutation_digest(digest))
     return 0
+
+
+def _cmd_reopen(args: argparse.Namespace) -> int:
+    ids = list(args.task_ids or [])
+    if not ids:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    reason = str(getattr(args, "reason", "") or "").strip()
+    if not reason:
+        print("--reason is required", file=sys.stderr)
+        return 1
+    to_status = getattr(args, "to_status", "blocked")
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            if kb.reopen_task(conn, tid, actor="cli", reason=reason, to_status=to_status):
+                st = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+                print(f"Reopened {tid} -> {st['status'] if st else '?'}")
+            else:
+                failed.append(tid)
+                print(f"cannot reopen {tid} (must be done or archived)", file=sys.stderr)
+    return 0 if not failed else 1
 
 
 def _cmd_unarchive(args: argparse.Namespace) -> int:

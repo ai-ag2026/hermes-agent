@@ -11040,6 +11040,143 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def _demote_children_of_reopened_parent(conn: sqlite3.Connection, task_id: str, now: int) -> list[str]:
+    """A parent leaving a terminal state invalidates its ready-by-that-parent children.
+
+    ``recompute_ready`` can only ever promote (todo -> ready), never demote, so
+    without this a child sits in ``ready`` — dispatchable — on a dependency that
+    is no longer satisfied. This logic existed only in the dashboard's
+    ``_set_status_direct``; neither the Core nor the WebUI bridge had it, so the
+    same reopen through a different door left the board lying. It belongs here,
+    next to the transition that causes it.
+    """
+    demoted: list[str] = []
+    for row in conn.execute(
+        "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id", (task_id,),
+    ).fetchall():
+        child_id = row["child_id"]
+        if conn.execute(
+            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'", (child_id,),
+        ).rowcount == 1:
+            _append_event(conn, child_id, "status", {
+                "status": "todo", "reason": "parent_reopened", "parent": task_id,
+            })
+            demoted.append(str(child_id))
+    return demoted
+
+
+def reopen_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: Optional[str] = None,
+    reason: Optional[str] = None,
+    to_status: str = "blocked",
+    token: Optional[str] = None,
+) -> bool:
+    """Bring a ``done``/``archived`` card back to an open column — operator only.
+
+    There was no verb for this. ``block_task`` accepts only running/ready,
+    ``reclaim_task`` refuses anything not running, and ``unarchive_task`` starts
+    from ``archived``. On 2026-07-15 a card was auto-completed against its own
+    analyst's explicit advice, and both the operator and a later agent found the
+    same wall: the only way back was a raw status write. Two of them, in fact —
+    ``_set_status_direct`` in the dashboard and in the WebUI bridge both accept
+    any source status, so a PATCH to ``todo`` silently reopened a done card with
+    no ``reopened`` event, no ``completed_at`` cleanup and no child demotion.
+
+    Reopening is an OPERATOR act, never an agent's: a worker must not be able to
+    reopen the card it just finished. Callers in the agent/tool layer must not
+    expose this.
+
+    Defaults to ``blocked``, NOT ``ready``: the dispatcher claims ready cards
+    within ~60s, which on 2026-07-15 re-ran a finished audit before the operator
+    could decide anything. A reopened card waits for a human by default.
+
+    Clears ``completed_at``/``result`` so duration metrics and the digest do not
+    report a card as both open and finished (the archive→unarchive detour leaves
+    both standing). The old ``result`` is preserved as a comment first — it is
+    evidence, and a reopen must not silently delete it.
+
+    Note the workspace is NOT restored: ``complete_task`` cleaned it up and the
+    next claim creates a fresh one. That is the pre-existing contract for any
+    re-run, not something this verb changes.
+    """
+    if to_status not in ("blocked", "todo"):
+        # 'ready' is deliberately not offered: see the dispatcher note above.
+        raise ValueError("to_status must be one of blocked|todo")
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, result FROM tasks WHERE id = ? AND status IN ('done', 'archived')",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        previous_status = row["status"]
+        old_result = row["result"]
+        # Governance for completeness: `done`/`archived` are not gated states, so
+        # this is a no-op today. It is here so that every exit out of a terminal
+        # state passes the same guard, rather than this verb becoming the one
+        # door that never learned about gates.
+        _assert_human_gate_open(conn, task_id, token=token, action="unblock")
+        if old_result:
+            # Inlined rather than via add_comment(): that helper opens its own
+            # write_txn and would nest. Preserving the result and clearing it
+            # must be one atomic step anyway -- a crash between the two would
+            # destroy the evidence this comment exists to keep.
+            body = (
+                "REOPEN: bisheriges Ergebnis archiviert, bevor es zurückgesetzt wurde:\n\n"
+                + str(old_result)[:4000]
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, str(actor or "operator")[:120], body, now),
+            )
+            _append_event(conn, task_id, "commented",
+                          {"author": str(actor or "operator")[:120], "len": len(body)})
+        if conn.execute(
+            "UPDATE tasks SET status = ?, completed_at = NULL, result = NULL, "
+            "current_run_id = NULL, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "block_kind = CASE WHEN ? = 'blocked' THEN 'needs_input' ELSE NULL END "
+            "WHERE id = ? AND status IN ('done', 'archived')",
+            (to_status, to_status, task_id),
+        ).rowcount != 1:
+            return False
+        if to_status == "blocked":
+            # `recompute_ready` promotes blocked cards too, and only skips the
+            # ones that are gated, attention-bearing, or STICKY -- where sticky
+            # means "the most recent blocked/unblocked event is a block". A
+            # reopened card's last such event is whatever preceded its
+            # completion (usually an `unblocked`), so without emitting a real
+            # block here the very next readiness pass -- including the one at
+            # the bottom of this function -- would promote it straight to
+            # `ready` and hand it to the dispatcher. That is the 2026-07-15
+            # failure mode this default exists to prevent.
+            _append_event(conn, task_id, "blocked", {
+                "kind": "needs_input",
+                "reason": (str(reason)[:400] if reason else "reopened by operator; awaiting decision"),
+                "actor": str(actor or "operator")[:120],
+                "source": "reopen",
+            })
+        demoted = _demote_children_of_reopened_parent(conn, task_id, now)
+        payload: dict = {"status": to_status, "previous_status": previous_status}
+        if actor:
+            payload["actor"] = str(actor)[:120]
+        if reason:
+            payload["reason"] = str(reason)[:400]
+        if demoted:
+            payload["demoted_children"] = demoted
+        if old_result:
+            payload["result_archived_as_comment"] = True
+        _append_event(conn, task_id, "reopened", payload)
+    # A reopened parent may have just un-satisfied dependents; and a card landing
+    # in `todo` is only promoted by the normal readiness pass, never by this verb.
+    recompute_ready(conn)
+    return True
+
+
 def unarchive_task(
     conn: sqlite3.Connection,
     task_id: str,
