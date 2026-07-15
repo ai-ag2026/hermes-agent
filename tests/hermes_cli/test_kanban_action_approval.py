@@ -2646,7 +2646,13 @@ def test_versioned_approval_human_gate_requires_token_and_consumes_only_on_succe
         before = _atomic_snapshot(conn, task_id, origin_run_id)
         denied = kb.approve_pending_action_and_unblock_versioned(
             conn, task_id, action.id, expected_version=attention.version, now=1_900_000_000)
-        assert denied.status == "conflict"
+        # 2026-07-15: was "conflict". A gate refusal is structural (no token ->
+        # retrying is futile), a conflict is transient (someone was faster ->
+        # refresh and retry). Reporting the former as the latter made a live
+        # deadlock read as a race that never happened. This test's own subject --
+        # a token is required, and is consumed only on success -- is unchanged.
+        assert denied.status == "gate_refused"
+        assert not denied
         # Rejected gate attempts are auditable, but do not consume the token or
         # mutate the action/task lifecycle.
         after_denied = _atomic_snapshot(conn, task_id, origin_run_id)

@@ -953,6 +953,13 @@ def _attention_result_error(result: Any) -> HTTPException:
         return HTTPException(status_code=404, detail="terminal action not found")
     if outcome == "gone":
         return HTTPException(status_code=410, detail="terminal action is no longer available")
+    if outcome == "gate_refused":
+        # Structural, not a race: 409 would invite a retry that can never pass.
+        return HTTPException(
+            status_code=403,
+            detail="card is human-gated and no valid gate token was presented; "
+                   "the gate must be satisfied, retrying cannot help",
+        )
     return HTTPException(status_code=409, detail="terminal action version or state conflict")
 
 
@@ -966,7 +973,8 @@ def approve_terminal_action(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        if kanban_db.get_task(conn, task_id) is None:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
             raise HTTPException(status_code=404, detail="task not found")
         action = _attention_action(conn, task_id, payload.attention_id)
         if action is None:
@@ -976,8 +984,21 @@ def approve_terminal_action(
         # that already observed approved/terminal state is an opaque replay.
         pre_call_state = action.state
         _approve_terminal_action_after_snapshot_hook()
+        # Approving also unblocks the card, so a human_gate=1 card needs an OPEN
+        # gate for that half. A dashboard request is behind the web-server auth
+        # gate, so an authenticated human IS the operator act: issue + redeem a
+        # one-time grant server-side (same reasoning and shape as gate_off /
+        # archive_running below; the token never leaves the server). Without
+        # this the Core refused every approval of a gated card and the refusal
+        # surfaced as an opaque conflict -- the 2026-07-15 deadlock, where the
+        # card's only other exit (/unblock) refuses while an action is pending.
+        # Ungated cards mint nothing and pass no token: path unchanged.
+        gate_token = None
+        if getattr(task, "human_gate", 0):
+            gate_token = kanban_db.issue_gate_token(conn, task_id, action="unblock", board=board)
         result = kanban_db.approve_pending_action_and_unblock_versioned(
             conn, task_id, action.id, expected_version=payload.attention_version, actor="dashboard",
+            token=gate_token,
         )
         if not result:
             if pre_call_state != "pending":

@@ -1306,7 +1306,7 @@ class ResolvePendingActionResult:
 class ApprovePendingActionResult:
     """Committed, redacted result of versioned exact-action approval."""
 
-    status: Literal["approved", "not_found", "conflict", "gone"]
+    status: Literal["approved", "not_found", "conflict", "gone", "gate_refused"]
     task_id: str
     action_id: Optional[int] = None
     attention_id: Optional[int] = None
@@ -1321,7 +1321,7 @@ class ApprovePendingActionResult:
 class AttentionStatusTransitionResult:
     """Committed, redacted result of an attention-aware status transition."""
 
-    status: Literal["transitioned", "not_found", "conflict", "gone"]
+    status: Literal["transitioned", "not_found", "conflict", "gone", "gate_refused"]
     task_id: str
     task_status: Optional[Literal["ready", "todo", "triage"]] = None
     attention_id: Optional[int] = None
@@ -9112,7 +9112,12 @@ def approve_pending_action_and_unblock_versioned(
         try:
             _assert_human_gate_open(conn, task_id, token=token, action="unblock", persist_failures=False, consume=False)
         except GateTokenError:
-            return ApprovePendingActionResult("conflict", task_id, int(action_id), int(attention["id"]))
+            # NOT a conflict: a gate refusal is structural ("you hold no valid
+            # token"), not a lost race ("someone was faster"). Collapsing the two
+            # told the 2026-07-15 operator that state had moved on when nothing
+            # had moved at all, and it makes a retry look worthwhile when only a
+            # token can ever help. Callers map this to its own outcome.
+            return ApprovePendingActionResult("gate_refused", task_id, int(action_id), int(attention["id"]))
         # Consume only after the non-mutating validation passed; any following
         # CAS/fault exception rolls this one-shot grant back with the txn.
         _assert_human_gate_open(conn, task_id, token=token, action="unblock")
@@ -10439,7 +10444,11 @@ def transition_task_status_with_attention(
         try:
             _assert_human_gate_open(conn, task_id, token=token, action="change_status")
         except GateTokenError:
-            return AttentionStatusTransitionResult("conflict", task_id)
+            # Structural, not a race -- see ApprovePendingActionResult. Callers
+            # reach this through the TOCTOU window between the dashboard's
+            # human_gate pre-check and this transaction; a retry cannot help,
+            # so it must not be dressed up as a lost CAS.
+            return AttentionStatusTransitionResult("gate_refused", task_id)
         run_id = task["current_run_id"]
         if run_id is not None:
             conn.execute("UPDATE task_runs SET status='reclaimed', outcome='reclaimed', ended_at=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=? AND task_id=? AND ended_at IS NULL", (now, int(run_id), task_id))
