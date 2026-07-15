@@ -10,8 +10,11 @@ Two fixes, both covered here:
    cross-process init lock entirely (nothing left to serialize), so a held lock
    cannot block a steady-state connect.
 2. Bounded acquire: even on first-init, `_cross_process_init_lock` retries a
-   non-blocking acquire up to a deadline, then proceeds (with a WARNING) rather
-   than hanging.
+   non-blocking acquire up to a deadline, then **fails closed** with a
+   `TimeoutError` rather than hanging forever or racing non-idempotent
+   migration DDL without the cross-process lock (superseding the original
+   #36644 "proceed with a WARNING" behavior; see `harden(kanban): fail
+   closed across SQLite lifecycle hazards`).
 """
 
 from __future__ import annotations
@@ -73,20 +76,23 @@ def test_initialized_path_connect_skips_init_lock(kanban_home):
 
 
 def test_first_init_connect_is_bounded_when_lock_held(kanban_home, monkeypatch):
-    """First-init connect must time out the cross-process lock and proceed,
-    not hang forever, when another holder owns it."""
+    """First-init connect must time out the cross-process lock and fail
+    closed with an actionable TimeoutError, not hang forever, when another
+    holder owns it. Proceeding without the lock would risk racing
+    non-idempotent migration DDL against the lock holder, so a bounded
+    failure — not a bounded success — is the safe behavior here."""
     monkeypatch.setattr(kb, "_INIT_LOCK_TIMEOUT_SECONDS", 0.6)
     db_path = kb.kanban_db_path(board="default")
 
     release, t = _hold_init_lock(db_path)
     try:
         start = time.monotonic()
-        conn = kb.connect()  # path NOT yet initialized — must take the bounded path
-        conn.close()
+        with pytest.raises(TimeoutError, match="init lock"):
+            kb.connect()  # path NOT yet initialized — must take the bounded path
         elapsed = time.monotonic() - start
-        # Proceeded within roughly the timeout window (not unbounded).
+        # Failed within roughly the timeout window (not unbounded).
         assert 0.4 <= elapsed < 3.0, f"expected bounded ~0.6s acquire, got {elapsed:.2f}s"
-        assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
+        assert str(db_path.resolve()) not in kb._INITIALIZED_PATHS
     finally:
         release.set()
         t.join(timeout=5)

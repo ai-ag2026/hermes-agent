@@ -10147,14 +10147,24 @@ def block_task(
             else 0
         )
 
-        # Only an exact persisted typed fingerprint can continue a chain.
-        # Legacy callers intentionally receive a fresh recurrence every time.
+        # An exact persisted typed fingerprint continues a typed chain. Callers
+        # that supply no typed cause at all (the original, pre-fingerprint
+        # calling convention — kind only) fall back to the original kind-based
+        # comparison: a stored block_kind that matches the incoming kind means
+        # blocked -> unblocked -> about-to-re-block for the same cause. This
+        # keeps the 2026-06-25 unblock-loop breaker (5b5c79a8e) working for
+        # legacy/untyped callers instead of silently giving every re-block a
+        # fresh recurrence count (regression introduced by aaa78fbf1).
         cause_fingerprint = _block_cause_fingerprint(
             conn, task_id=task_id, attention_type=attention_type,
             reason_code=reason_code, scope=cause_scope,
         )
-        same_cause = (cause_fingerprint is not None
-                      and str(cur_row["block_cause_fingerprint"] or "") == cause_fingerprint)
+        if cause_fingerprint is not None:
+            same_cause = str(cur_row["block_cause_fingerprint"] or "") == cause_fingerprint
+        elif not typed_cause:
+            same_cause = prev_kind == kind
+        else:
+            same_cause = False
         recurrences = prev_recurrences + 1 if same_cause else 1
 
         pending_terminal_action = (
@@ -10343,11 +10353,18 @@ def promote_task(
             return None, "exact terminal action approval is still pending"
         if conn.execute("SELECT 1 FROM task_attentions WHERE task_id=? LIMIT 1", (task_id,)).fetchone():
             return None, "current attention requires its typed lifecycle operation"
-        if not force and conn.execute(
-            "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
-            "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1", (task_id,)
-        ).fetchone():
-            return None, "unsatisfied parent dependencies (use --force to override)"
+        if not force:
+            unsatisfied = [
+                r["id"] for r in conn.execute(
+                    "SELECT p.id AS id FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+                    "WHERE l.child_id=? AND p.status NOT IN ('done','archived')", (task_id,)
+                ).fetchall()
+            ]
+            if unsatisfied:
+                return None, (
+                    "unsatisfied parent dependencies: "
+                    f"{', '.join(unsatisfied)} (use --force to override)"
+                )
         return status, None
 
     if dry_run:

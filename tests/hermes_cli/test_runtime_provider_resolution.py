@@ -303,6 +303,12 @@ def test_resolve_runtime_provider_codex(monkeypatch):
 
 def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    # load_pool("qwen-oauth") auto-seeds from the real ~/.qwen/oauth_creds.json
+    # (agent/credential_pool.py) if one happens to exist on the machine running
+    # the tests. That would silently pre-empt the resolve_qwen_runtime_credentials
+    # mock below via the pool path. Force the no-pool-credentials branch so this
+    # test is hermetic regardless of the local Qwen CLI login state.
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",
@@ -363,6 +369,13 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     from hermes_cli.auth import AuthError
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    # Same hermeticity concern as test_resolve_runtime_provider_qwen_oauth: without
+    # this, a real ~/.qwen/oauth_creds.json on the test machine lets load_pool()
+    # auto-seed a usable pool entry, which short-circuits straight to the pool
+    # path and never reaches (or raises through) the mocked
+    # resolve_qwen_runtime_credentials below — defeating the fallthrough this
+    # test exists to verify.
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",
