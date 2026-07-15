@@ -1213,15 +1213,32 @@ def init_agent(
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
-    # Kanban worker/orchestrator lifecycle guidance is session-static:
-    # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
+    # Kanban worker/orchestrator lifecycle guidance is session-static and is
+    # written FOR a dispatcher-spawned worker: it states "you have been assigned
+    # ONE task", "your task id is in $HERMES_KANBAN_TASK", "you are running
+    # headless" and "do not call clarify". Injecting it into an interactive
+    # session is actively harmful — the agent then believes nobody is reading,
+    # must not ask questions, and should route instead of work.
+    #
+    # The tool-membership test alone does NOT identify a worker: kanban_show is
+    # also present in interactive sessions whenever `kanban` is in the config
+    # toolsets (see _check_kanban_mode in tools/kanban_tools.py, which is true
+    # for `HERMES_KANBAN_TASK` set OR `kanban` in toolsets). Gate on the env var
+    # the guidance itself refers to — that is what the dispatcher sets at spawn.
+    #
+    # Interactive sessions keep the kanban tools (orchestrator mode) and learn
+    # their use from the tool schemas + skills; they just don't get told they
+    # are a headless worker.
+    #
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
     from agent.prompt_builder import KANBAN_GUIDANCE
+    _is_kanban_worker = bool(os.environ.get("HERMES_KANBAN_TASK"))
     agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+        KANBAN_GUIDANCE
+        if (_is_kanban_worker and "kanban_show" in agent.valid_tool_names)
+        else ""
     )
 
     # Check tool requirements
