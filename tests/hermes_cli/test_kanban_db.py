@@ -2919,11 +2919,43 @@ def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeyp
     _init_git_repo(decoy_repo)
     monkeypatch.chdir(decoy_repo)
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
+        # Legacy-Zeile simulieren: create_task lehnt pfadlose worktree-Karten
+        # ohne Board-Default inzwischen an der Quelle ab (K-4) — der
+        # Dispatch-Zeit-Check hier bleibt der Backstop für Bestandszeilen.
+        t = kb.create_task(
+            conn, title="ship", workspace_kind="worktree",
+            workspace_path=str(tmp_path / "legacy" / "path"),
+        )
+        conn.execute(
+            "UPDATE tasks SET workspace_path = NULL WHERE id = ?", (t,)
+        )
+        conn.commit()
         task = kb.get_task(conn, t)
         assert task is not None
         with pytest.raises(ValueError, match="default_workdir"):
             kb.resolve_workspace(task)
+
+
+def test_create_worktree_task_without_path_rejected_at_source(kanban_home):
+    """K-4 (Vollaudit 2026-07-16): pathless worktree card on a board without
+    default_workdir is refused at CREATE time — the error goes to the
+    creating agent instead of burning spawn_failed/gave_up cycles later."""
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="default_workdir"):
+            kb.create_task(conn, title="ship", workspace_kind="worktree")
+
+
+def test_create_worktree_task_without_path_ok_with_board_default(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("wt-src-board", default_workdir=str(repo))
+    with kb.connect(board="wt-src-board") as conn:
+        t = kb.create_task(
+            conn, title="ship", workspace_kind="worktree", board="wt-src-board",
+        )
+        assert kb.get_task(conn, t) is not None
 
 
 def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):

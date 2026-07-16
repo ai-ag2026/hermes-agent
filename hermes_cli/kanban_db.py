@@ -3569,6 +3569,34 @@ def create_task(
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
 
+    if (
+        workspace_kind == "worktree"
+        and workspace_path is None
+        and project_repo is None
+    ):
+        # Reject at the source (K-4, Vollaudit 2026-07-16; gleiches Muster
+        # wie die Skill-Verfügbarkeitsprüfung unten): eine pfadlose
+        # worktree-Karte auf einem Board ohne default_workdir kann nie
+        # spawnen — sie scheiterte bisher erst zur Dispatch-Zeit und
+        # verbrannte spawn_failed/gave_up-Zyklen (4 Live-Karten, je mehrere
+        # Runden). Raising HIER gibt den Fehler an den erzeugenden Agenten
+        # zurück, der sich selbst korrigiert. Fail-open bei Metadata-
+        # Lesefehlern: der Dispatch-Zeit-Check bleibt der Backstop.
+        _ws_slug = _normalize_board_slug(board) or get_current_board()
+        try:
+            _board_default = (
+                read_board_metadata(_ws_slug).get("default_workdir") or ""
+            ).strip()
+        except Exception:
+            _board_default = "unreadable"
+        if not _board_default:
+            raise ValueError(
+                "workspace_kind=worktree without workspace_path, and board "
+                f"{_ws_slug!r} has no default_workdir — this card could never "
+                "spawn. Pass --workspace worktree:<absolute-repo-path>, or "
+                "set the board's default_workdir (a git repo) first."
+            )
+
     parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
