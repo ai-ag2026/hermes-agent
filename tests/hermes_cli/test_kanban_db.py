@@ -2488,6 +2488,37 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
     assert reason == "active_pr"
 
 
+def test_respawn_guard_active_pr_bypassed_by_requeue(kanban_home):
+    """An explicit re-queue after the newest PR-URL comment is a deliberate
+    re-run and must bypass the active_pr guard — mirrors the recent_success
+    bypass. Without it, a card whose job is repairing an existing PR (its
+    comments necessarily cite the PR URL) is deferred for the whole 24h
+    window and no WebUI unblock/ready can free it (2026-07-16, t_5a43abe1)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="repair-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Repairing https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        # Baseline: the PR URL in a fresh comment defers the respawn.
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+        # Operator re-queues AFTER that comment: bypass.
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'status', ?)",
+            (t, int(time.time()) + 1),
+        )
+        assert kb.check_respawn_guard(conn, t) is None
+        # A newer PR-URL comment re-arms the guard.
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'Updated https://github.com/totemx-AI/subsidysmart/pull/42', ?)",
+            (t, int(time.time()) + 2),
+        )
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:

@@ -13691,12 +13691,32 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Exception (mirrors guard 3): an explicit re-queue AFTER the newest
+    #    PR-URL comment is a deliberate operator "run it again" — honor it.
+    #    Without this, a card whose JOB is repairing an existing PR (its
+    #    comments necessarily cite the PR URL) is deferred for the whole
+    #    24h window, loops through the 30-min auto-block escalation, and no
+    #    WebUI unblock/ready can ever free it (2026-07-16, t_5a43abe1).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_pr_comment_at: Optional[int] = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            at = int(c["created_at"] or 0)
+            if latest_pr_comment_at is None or at > latest_pr_comment_at:
+                latest_pr_comment_at = at
+    if latest_pr_comment_at is not None:
+        requeued_after_pr = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND created_at >= ? "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "LIMIT 1",
+            (task_id, latest_pr_comment_at),
+        ).fetchone()
+        if not requeued_after_pr:
             return "active_pr"
 
     return None
