@@ -21,6 +21,18 @@ def _no_codex_backoff(monkeypatch):
     monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
 
 
+@pytest.fixture(autouse=True)
+def _commentary_stays_default_off(monkeypatch):
+    """This module asserts the DEFAULT commentary routing (-> reasoning).
+
+    codex_commentary_as_content() reads the live environment/config, and
+    importing run_agent loads ~/.hermes/.env into os.environ — so an
+    installation that opts in would silently flip every assertion here.
+    Pin the flag off; the opt-in behaviour has its own module
+    (test_codex_commentary_as_content.py)."""
+    monkeypatch.setenv("HERMES_CODEX_COMMENTARY_AS_CONTENT", "0")
+
+
 def _patch_agent_bootstrap(monkeypatch):
     monkeypatch.setattr(
         run_agent,

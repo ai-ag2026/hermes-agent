@@ -627,6 +627,7 @@ def _consume_codex_event_stream(
     on_first_delta=None,
     on_event=None,
     interrupt_check=None,
+    commentary_as_text: bool = False,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE event stream and return a final response.
 
@@ -660,6 +661,11 @@ def _consume_codex_event_stream(
     * ``on_event(event)`` — fires for every event before any other processing.
       Used for watchdog activity, debug logging, anything wire-shape-agnostic.
     * ``interrupt_check()`` — returns True to break the loop early.
+    * ``commentary_as_text`` — when True, ``commentary``/``analysis``-phase
+      deltas are treated like ordinary text deltas (collected into
+      ``output_text``; live streaming still obeys the tool-call gate) instead
+      of being routed to ``on_reasoning_delta``. See
+      ``codex_responses_adapter.codex_commentary_as_content()``.
     """
     collected_output_items: List[Any] = []
     collected_text_deltas: List[str] = []
@@ -718,7 +724,10 @@ def _consume_codex_event_stream(
 
         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
             delta_text = _event_field(event, "delta", "")
-            is_commentary_delta = active_message_phase in {"commentary", "analysis"}
+            is_commentary_delta = (
+                active_message_phase in {"commentary", "analysis"}
+                and not commentary_as_text
+            )
             if delta_text and is_commentary_delta:
                 # Commentary streams through the reasoning channel, not the
                 # visible answer stream (and stays out of output_text).
@@ -861,6 +870,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _on_reasoning_delta(text: str) -> None:
         agent._fire_reasoning_delta(text)
 
+    # Resolved once per request, not per delta — the flag reads config.
+    from agent.codex_responses_adapter import codex_commentary_as_content
+
+    _commentary_as_text = codex_commentary_as_content()
+
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
@@ -903,6 +917,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_first_delta=on_first_delta,
                     on_event=_on_event,
                     interrupt_check=_interrupt_check,
+                    commentary_as_text=_commentary_as_text,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:

@@ -23,6 +23,39 @@ from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 logger = logging.getLogger(__name__)
 
 
+def codex_commentary_as_content() -> bool:
+    """Opt-in: surface Codex ``commentary``/``analysis`` text as assistant content.
+
+    Upstream deliberately keeps commentary-phase text out of user-visible
+    content (it is tool preamble for a coding agent — "I'll call the tool
+    now"), routing it to the reasoning channel instead. For a conversational
+    assistant that narration IS the progress update the operator wants to see:
+    suppressing it turns long tool runs into silence in every channel that
+    does not render reasoning (verified 2026-07-16: the drop from 4.65 to
+    1.06 replies/turn tracked the deployment of that routing, not a model
+    change — gpt-5.5 and gpt-5.6 emit identical ``phase`` on the wire).
+
+    Default OFF (upstream behaviour unchanged). Enable via
+    ``HERMES_CODEX_COMMENTARY_AS_CONTENT=1`` (env wins) or
+    ``model.codex_commentary_as_content: true`` in config.yaml. The flag only
+    redirects where the text lands (content vs reasoning); replay items keep
+    their ``phase`` and the finish_reason/continuation semantics are untouched.
+    """
+    import os as _os
+
+    env = _os.environ.get("HERMES_CODEX_COMMENTARY_AS_CONTENT")
+    if env is not None:
+        return env.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        return bool(
+            (load_config_readonly().get("model") or {}).get("codex_commentary_as_content")
+        )
+    except Exception:
+        return False
+
+
 def _classify_responses_issuer(
     *,
     is_xai_responses: bool = False,
@@ -1222,7 +1255,12 @@ def _normalize_codex_response(
                 # but surface it through the reasoning channel so the CLI/
                 # gateway display it like thinking text.  The exact message
                 # item is still preserved below for replay/cache continuity.
-                if is_commentary_phase:
+                #
+                # codex_commentary_as_content() flips ONLY this landing spot:
+                # commentary becomes visible assistant text (the pre-2026-07
+                # behaviour this installation ran on), everything else —
+                # phase on replay items, finish_reason, continuation — stays.
+                if is_commentary_phase and not codex_commentary_as_content():
                     reasoning_parts.append(message_text)
                 else:
                     content_parts.append(message_text)
