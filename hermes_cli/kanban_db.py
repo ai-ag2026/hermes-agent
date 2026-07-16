@@ -3603,6 +3603,33 @@ def create_task(
             )
         skills_list = cleaned
 
+        # Availability check (operator decision 2026-07-16): a card must not
+        # demand skills its assignee profile cannot load. The dispatcher
+        # passes `--skills` blindly and the worker silently DROPS missing
+        # ones (cli worker start: warning only), so mismatches never surfaced
+        # — cards went "done" without the skills they demanded ever loading.
+        # Raising HERE hands the error back to the card-CREATING agent, which
+        # self-corrects (other assignee, other skills) with no human in the
+        # loop. Fail-open when the assignee has no profile skills dir
+        # (hermetic tests, ad-hoc lanes): nothing to validate against then.
+        if skills_list and assignee:
+            from hermes_constants import get_default_hermes_root
+            _skills_root = (
+                get_default_hermes_root() / "profiles" / str(assignee).strip() / "skills"
+            )
+            if _skills_root.is_dir():
+                available = {
+                    p.parent.name for p in _skills_root.rglob("SKILL.md")
+                }
+                missing = [s for s in skills_list if s not in available]
+                if missing:
+                    hint = ", ".join(sorted(available)[:20]) or "(none)"
+                    raise ValueError(
+                        f"assignee profile {assignee!r} does not have skill(s) "
+                        f"{missing!r}. Pick an assignee that has them, drop "
+                        f"them, or use one of this profile's skills: {hint}"
+                    )
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
