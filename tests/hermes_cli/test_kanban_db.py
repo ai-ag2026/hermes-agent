@@ -1684,11 +1684,74 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
         assert promoted == 0
         assert kb.get_task(conn, child).status == "blocked"
 
-        # Explicit unblock should still work and reset the counter.
-        assert kb.unblock_task(conn, child)
+        # K-3 (2026-07-16): a tripped breaker now projects a typed operator
+        # attention (so the cockpit shows a reason instead of a naked block).
+        # Attention-bearing cards are resolved through the typed seam
+        # (``transition_task_status_with_attention``); the legacy
+        # ``unblock_task`` fail-closes on any live projection by design.
+        att = kb.get_current_attention(conn, child)
+        assert att is not None and att.requires_human_action
+        assert kb.transition_task_status_with_attention(
+            conn, task_id=child, status="ready",
+            expected_attention_id=att.id,
+            expected_attention_version=att.version,
+        )
         task = kb.get_task(conn, child)
         assert task.status == "ready"
         assert task.consecutive_failures == 0
+
+
+def test_circuit_breaker_trip_leaves_operator_attention(kanban_home):
+    """K-3 (2026-07-16) regression: the consecutive-failure circuit breaker
+    must not leave a "naked block".
+
+    A card blocked by ``_record_task_failure`` used to land in ``blocked``
+    with NO ``block_kind``, NO ``block_reason_code``, NO ``blocked`` event,
+    and NO ``task_attentions`` row — only a ``gave_up`` event. The cockpit
+    reads ``get_current_attention`` as its operator surface, so such a card
+    rendered "Kein Grund hinterlegt." (no reason on file). This reproduces
+    the live symptom seen on card t_05ad5273 ("Repair WebUI PR #5836").
+
+    After the fix the trip stamps ``block_kind='needs_input'`` +
+    ``block_reason_code='gave_up'`` and projects a typed, human-actionable
+    attention with a meaningful summary.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="repair card", assignee="a")
+        kb.claim_task(conn, t)
+
+        # Trip the breaker with a single failure at limit=1 (mirrors the
+        # dispatcher spawn/crash path that blocked t_05ad5273).
+        tripped = kb._record_task_failure(
+            conn, t, error="pid 3592337 not alive",
+            outcome="crashed", release_claim=True, end_run=True,
+            failure_limit=1,
+        )
+        assert tripped is True
+
+        task = kb.get_task(conn, t)
+        assert task.status == "blocked"
+        # The durable block fields that were empty on the naked block.
+        assert task.block_kind == "needs_input"
+        reason_code = conn.execute(
+            "SELECT block_reason_code FROM tasks WHERE id=?", (t,),
+        ).fetchone()[0]
+        assert reason_code == "gave_up"
+
+        # The operator surface the cockpit actually reads must be populated
+        # and flagged as needing a human decision, with a non-empty summary.
+        att = kb.get_current_attention(conn, t)
+        assert att is not None, "gave_up trip must leave an operator attention"
+        assert att.type == "decision"
+        assert att.requires_human_action is True
+        assert att.summary and "gave up" in att.summary.lower()
+
+        # The lifecycle ``gave_up`` event is still emitted (and now
+        # self-describes the projection it created).
+        events = kb.list_events(conn, t)
+        gave_up = [e for e in events if e.kind == "gave_up"]
+        assert gave_up, f"expected gave_up event, got {[e.kind for e in events]}"
+        assert gave_up[-1].payload.get("reason_code") == "gave_up"
 
 
 def test_recompute_ready_recovers_below_limit(kanban_home):

@@ -142,6 +142,14 @@ VALID_BLOCK_REASON_CODES = frozenset({
     # It was missing from both enums, so _block_cause_fingerprint raised ValueError
     # and crashed the whole dispatcher tick on a runtime-capped approved action.
     "runtime_timeout",
+    # K-3 (2026-07-16): the consecutive-failure circuit breaker
+    # (``_record_task_failure``) flips a card to ``blocked`` after
+    # ``failure_limit`` crashes/timeouts/spawn-failures but historically wrote
+    # NO block_kind / reason / attention — a "naked block" the cockpit renders
+    # as "Kein Grund hinterlegt." The trip now projects a typed operator
+    # attention with this reason code so ``get_current_attention`` (the
+    # cockpit's operator surface) has a reason to show.
+    "gave_up",
 })
 BLOCK_CAUSE_VERSION = 1
 # Typed causes may use only a tiny product vocabulary. Scope is identity
@@ -156,6 +164,11 @@ BLOCK_CAUSE_SCOPE_ENUMS: dict[tuple[str, str], dict[str, frozenset[str]]] = {
     ("protocol", "goal_closeout_missing"): {"protocol": frozenset({"goal_closeout"})},
     ("review", "review_required"): {"subject": frozenset({"review"})},
     ("loop_triage", "review_required"): {"subject": frozenset({"loop"})},
+    # K-3 (2026-07-16): circuit-breaker give-up needs an operator decision
+    # (retry / repair / reject). No scope keys — the identity is just the
+    # (task, decision, gave_up) triple; failure counts live in the event/summary,
+    # never in the durable fingerprint (which must stay secret-free).
+    ("decision", "gave_up"): {},
 }
 
 # Goal-mode tasks may only block with kinds that represent a genuine external
@@ -13248,11 +13261,23 @@ def _record_task_failure(
 
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
+            #
+            # K-3 (2026-07-16): the breaker also stamps ``block_kind`` +
+            # ``block_reason_code`` and projects a typed operator attention
+            # below. Before this, a tripped breaker wrote status='blocked' with
+            # NO block_kind / reason / attention and only a ``gave_up`` event —
+            # a "naked block". The cockpit reads ``get_current_attention`` as its
+            # operator surface (see the loop-breaker K2 fix), so a naked block
+            # rendered "Kein Grund hinterlegt" and the operator could not tell
+            # what the card was waiting on. ``needs_input`` marks it as a human
+            # decision gate (worker auto-complete is refused); the attention
+            # gives the cockpit an actionable reason.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
+                    "block_kind = 'needs_input', block_reason_code = 'gave_up', "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
                     (failures, error[:500], task_id),
@@ -13263,6 +13288,7 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
+                    "block_kind = 'needs_input', block_reason_code = 'gave_up', "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
                     (failures, error[:500], task_id),
@@ -13287,12 +13313,38 @@ def _record_task_failure(
                 "limit_source": limit_source,
                 "error": error[:500],
                 "trigger_outcome": outcome,
+                # Self-describe the durable operator projection this trip creates.
+                "attention_type": "decision",
+                "reason_code": "gave_up",
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            # Project the typed operator attention so the dashboard/cockpit has a
+            # reason to show (mirrors block_task's typed path and the K2
+            # loop-breaker fix). Best-effort: a projection failure must never
+            # turn a breaker trip into an exception that aborts the whole
+            # dispatcher tick — the block itself is already committed above.
+            # ``outcome``/``failures``/``effective_limit`` are enums/ints, so the
+            # summary carries no secrets (unlike ``error``, deliberately omitted).
+            try:
+                _upsert_current_typed_attention_in_txn(
+                    conn, task_id=task_id, attention_type="decision",
+                    reason_code="gave_up",
+                    summary=(
+                        f"Automation gave up after {failures} consecutive "
+                        f"failure(s) (limit {effective_limit}, trigger: "
+                        f"{outcome}). Needs an operator decision: retry, "
+                        "repair, or reject."
+                    ),
+                    origin_run_id=run_id,
+                )
+            except Exception:  # pragma: no cover - defensive projection guard
+                _log.exception(
+                    "gave_up attention projection failed for %s", task_id,
+                )
             blocked = True
         else:
             # Below threshold.
