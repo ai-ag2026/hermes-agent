@@ -983,8 +983,9 @@ def test_detect_crashed_workers_systemic_failure_fast_block(
 
         for tid in task_ids:
             task = kb.get_task(conn, tid)
-            assert task.status == "blocked", (
-                f"task {tid} should be blocked (systemic), got {task.status}"
+            # Automation-first (2026-07-16): systemic fast-block routes to triage.
+            assert task.status == "triage", (
+                f"task {tid} should be triaged (systemic), got {task.status}"
             )
 
 
@@ -1260,7 +1261,9 @@ def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):
             kb.detect_crashed_workers(conn)
 
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked", (
+        # Automation-first (2026-07-16): the trip routes a never-decomposed
+        # card to triage instead of blocked.
+        assert task.status == "triage", (
             f"genuine crashes should still trip the breaker, got {task.status}"
         )
 
@@ -1675,14 +1678,16 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
             failure_limit=2,
         )
         task = kb.get_task(conn, child)
-        assert task.status == "blocked"
+        # Automation-first (2026-07-16): breaker trip routes to triage.
+        assert task.status == "triage"
         assert task.consecutive_failures >= 2
 
         # recompute_ready must NOT promote this task — the circuit
-        # breaker has tripped and it should stay blocked.
+        # breaker has tripped; automation-first (2026-07-16) parks it in
+        # triage and recompute_ready must not promote it either way.
         promoted = kb.recompute_ready(conn)
         assert promoted == 0
-        assert kb.get_task(conn, child).status == "blocked"
+        assert kb.get_task(conn, child).status == "triage"
 
         # K-3 (2026-07-16): a tripped breaker now projects a typed operator
         # attention (so the cockpit shows a reason instead of a naked block).
@@ -1730,8 +1735,10 @@ def test_circuit_breaker_trip_leaves_operator_attention(kanban_home):
         assert tripped is True
 
         task = kb.get_task(conn, t)
-        assert task.status == "blocked"
-        # The durable block fields that were empty on the naked block.
+        # Automation-first (2026-07-16): a FIRST trip on a never-decomposed
+        # card routes to triage so the decompose automat tries before a human
+        # is paged. The durable block fields are stamped either way.
+        assert task.status == "triage"
         assert task.block_kind == "needs_input"
         reason_code = conn.execute(
             "SELECT block_reason_code FROM tasks WHERE id=?", (t,),
@@ -1752,6 +1759,54 @@ def test_circuit_breaker_trip_leaves_operator_attention(kanban_home):
         gave_up = [e for e in events if e.kind == "gave_up"]
         assert gave_up, f"expected gave_up event, got {[e.kind for e in events]}"
         assert gave_up[-1].payload.get("reason_code") == "gave_up"
+
+
+def test_circuit_breaker_trip_after_decompose_blocks_for_human(kanban_home):
+    """Cascade guard for automation-first routing (2026-07-16): a card the
+    triage automat already decomposed once must NOT re-enter automation on the
+    next breaker trip — it blocks for a human, exactly the pre-change
+    behavior."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="already decomposed", assignee="a")
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'decomposed', ?)",
+            (t, int(time.time())),
+        )
+        kb.claim_task(conn, t)
+        tripped = kb._record_task_failure(
+            conn, t, error="pid gone", outcome="crashed",
+            release_claim=True, end_run=True, failure_limit=1,
+        )
+        assert tripped is True
+        task = kb.get_task(conn, t)
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+
+
+def test_block_task_prefer_triage_first_occurrence(kanban_home):
+    """prefer_triage routes a TECHNICAL first-occurrence block straight to
+    triage (automation first); a card with a prior decompose falls back to
+    blocked (cascade guard)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="guard escalation", assignee="a")
+        assert kb.block_task(
+            conn, t, reason="guard defer", kind="needs_input",
+            prefer_triage=True,
+        )
+        assert kb.get_task(conn, t).status == "triage"
+
+        t2 = kb.create_task(conn, title="guard escalation decomposed", assignee="a")
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) "
+            "VALUES (?, 'decomposed', ?)",
+            (t2, int(time.time())),
+        )
+        assert kb.block_task(
+            conn, t2, reason="guard defer", kind="needs_input",
+            prefer_triage=True,
+        )
+        assert kb.get_task(conn, t2).status == "blocked"
 
 
 def test_recompute_ready_recovers_below_limit(kanban_home):
@@ -2717,7 +2772,8 @@ def test_dispatch_active_pr_guard_escalates_to_block_after_window(
 
     assert (t, "active_pr") in res.respawn_guarded
     assert t in res.auto_blocked
-    assert task.status == "blocked"
+    # Automation-first (2026-07-16): guard escalation routes to triage.
+    assert task.status == "triage"
     assert task.block_kind == "needs_input"
 
 
@@ -7438,7 +7494,8 @@ def test_wedged_reclaim_trips_circuit_breaker(kanban_home, monkeypatch):
             assert claimed is not None
             assert _wedge_and_reclaim(conn, monkeypatch, t) == 1
         task = kb.get_task(conn, t)
-        assert task.status == "blocked"
+        # Automation-first (2026-07-16): first trip routes to triage.
+        assert task.status == "triage"
         kinds = [
             r["kind"] for r in conn.execute(
                 "SELECT kind FROM task_events WHERE task_id = ?", (t,),

@@ -10142,6 +10142,19 @@ def _block_cause_after_task_update_hook() -> None:
     """Private fault-injection seam; runs inside the block transaction."""
 
 
+def _has_decomposed_event(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the triage automat already decomposed this card once.
+
+    Cascade guard for automation-first routing (2026-07-16): decompose is
+    tried at most once per card; afterwards technical stalls page a human.
+    """
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' "
+        "LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10157,6 +10170,7 @@ def block_task(
     attention_type: Optional[str] = None,
     reason_code: Optional[str] = None,
     cause_scope: Optional[dict[str, str]] = None,
+    prefer_triage: bool = False,
     _governance_target_ref: Optional[str] = None,
     _governance_mutation_class: Optional[str] = None,
 ) -> bool:
@@ -10365,7 +10379,21 @@ def block_task(
             kind == "needs_input"
             and get_pending_action(conn, task_id, now=now) is not None
         )
-        if recurrences >= BLOCK_RECURRENCE_LIMIT and not pending_terminal_action:
+        # Automation-first (operator decision 2026-07-16): a caller flagging a
+        # TECHNICAL stall (``prefer_triage=True`` — e.g. the respawn-guard
+        # escalation) routes to triage on the FIRST occurrence so the triage
+        # automat (decompose) gets the card before a human is paged; the
+        # attention cron pings triage cards only after a grace window.
+        # Cascade guard: a card that was already decomposed once does NOT
+        # re-enter automation — it blocks for a human as before. Deliberate
+        # worker gates (pending exact actions) always stay human-first.
+        force_triage = (
+            prefer_triage
+            and not _has_decomposed_event(conn, task_id)
+        )
+        if (
+            recurrences >= BLOCK_RECURRENCE_LIMIT or force_triage
+        ) and not pending_terminal_action:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
             cur = conn.execute(
@@ -10411,6 +10439,9 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
+                    **({"automation_first": True}
+                       if force_triage and recurrences < BLOCK_RECURRENCE_LIMIT
+                       else {}),
                 }),
                 run_id=run_id,
             )
@@ -10594,7 +10625,11 @@ def transition_task_status_with_attention(
         task = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if task is None:
             return AttentionStatusTransitionResult("not_found", task_id)
-        if task["status"] != "blocked":
+        # ``triage`` is a valid source since automation-first routing
+        # (2026-07-16): breaker/guard trips park cards in triage with a typed
+        # attention; the operator resolve path must be able to free them when
+        # the triage automat does not take over.
+        if task["status"] not in ("blocked", "triage"):
             return AttentionStatusTransitionResult("conflict", task_id)
         projection = conn.execute(
             "SELECT x.id, x.action_id, x.type, x.version AS projection_version, a.state, a.version, a.expires_at "
@@ -10642,7 +10677,7 @@ def transition_task_status_with_attention(
         if run_id is not None:
             conn.execute("UPDATE task_runs SET status='reclaimed', outcome='reclaimed', ended_at=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=? AND task_id=? AND ended_at IS NULL", (now, int(run_id), task_id))
         if conn.execute(
-            "UPDATE tasks SET status=?, current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, consecutive_failures=0, last_failure_error=NULL WHERE id=? AND status='blocked'",
+            "UPDATE tasks SET status=?, current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, consecutive_failures=0, last_failure_error=NULL WHERE id=? AND status IN ('blocked','triage')",
             (target, task_id),
         ).rowcount != 1:
             return AttentionStatusTransitionResult("conflict", task_id)
@@ -13272,26 +13307,35 @@ def _record_task_failure(
             # what the card was waiting on. ``needs_input`` marks it as a human
             # decision gate (worker auto-complete is refused); the attention
             # gives the cockpit an actionable reason.
+            # Automation-first (operator decision 2026-07-16): a first breaker
+            # trip routes to 'triage' so the triage automat (decompose) gets
+            # the card before a human is paged — the attention cron pings
+            # triage cards only after a grace window. Cascade guard: a card
+            # that was already decomposed once blocks for a human as before
+            # (decompose is tried at most once per card).
+            routed_to = (
+                "blocked" if _has_decomposed_event(conn, task_id) else "triage"
+            )
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "block_kind = 'needs_input', block_reason_code = 'gave_up', "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    (routed_to, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
+                # with claim cleared; just flip to blocked/triage + update
                 # counter fields.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
+                    "UPDATE tasks SET status = ?, "
                     "block_kind = 'needs_input', block_reason_code = 'gave_up', "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    (routed_to, failures, error[:500], task_id),
                 )
             run_id = None
             if end_run:
@@ -13316,6 +13360,8 @@ def _record_task_failure(
                 # Self-describe the durable operator projection this trip creates.
                 "attention_type": "decision",
                 "reason_code": "gave_up",
+                "routed_to": routed_to,
+                **({"automation_first": True} if routed_to == "triage" else {}),
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
@@ -13334,10 +13380,20 @@ def _record_task_failure(
                     conn, task_id=task_id, attention_type="decision",
                     reason_code="gave_up",
                     summary=(
-                        f"Automation gave up after {failures} consecutive "
-                        f"failure(s) (limit {effective_limit}, trigger: "
-                        f"{outcome}). Needs an operator decision: retry, "
-                        "repair, or reject."
+                        (
+                            f"Automation gave up after {failures} consecutive "
+                            f"failure(s) (limit {effective_limit}, trigger: "
+                            f"{outcome}). Routed to triage — the triage "
+                            "automat (decompose) tries first; operator only "
+                            "if it does not take over."
+                        )
+                        if routed_to == "triage"
+                        else (
+                            f"Automation gave up after {failures} consecutive "
+                            f"failure(s) (limit {effective_limit}, trigger: "
+                            f"{outcome}). Needs an operator decision: retry, "
+                            "repair, or reject."
+                        )
                     ),
                     origin_run_id=run_id,
                 )
@@ -14212,6 +14268,10 @@ def _dispatch_once_locked(
                                 "requeue this card."
                             ),
                             kind="needs_input",
+                            # Technical stall: automation (triage/decompose)
+                            # first, human ping only if it does not take over
+                            # (operator decision 2026-07-16).
+                            prefer_triage=True,
                         ):
                             result.auto_blocked.append(row["id"])
             continue

@@ -113,7 +113,8 @@ def test_spawn_failure_auto_blocks_after_limit(kanban_home, all_assignees_spawna
         res2 = kb.dispatch_once(conn, spawn_fn=_bad_spawn)
         assert tid in res2.auto_blocked
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        # Automation-first (2026-07-16): first trip routes to triage.
+        assert task.status == "triage"
         assert task.consecutive_failures >= 2
         assert task.last_failure_error and "no PATH" in task.last_failure_error
     finally:
@@ -232,7 +233,7 @@ def test_per_task_max_retries_overrides_dispatcher_limit(kanban_home, all_assign
         )
         assert tripped is True, "should auto-block on first failure"
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "triage"
         assert task.consecutive_failures == 1
 
         # gave_up event should record where the threshold came from
@@ -281,7 +282,7 @@ def test_per_task_max_retries_allows_more_than_default(kanban_home, all_assignee
         )
         assert tripped is True
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "triage"
         assert task.consecutive_failures == 5
     finally:
         conn.close()
@@ -321,7 +322,7 @@ def test_max_retries_none_falls_through_to_dispatcher_limit(kanban_home, all_ass
         )
         assert tripped is True
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "triage"
 
         events = kb.list_events(conn, tid)
         gave_up = [e for e in events if e.kind == "gave_up"]
@@ -357,7 +358,7 @@ def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spa
         res = kb.dispatch_once(conn, failure_limit=3)
         assert tid in res.auto_blocked
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "triage"
     finally:
         conn.close()
 
@@ -1022,7 +1023,7 @@ def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
                 task = kb.get_task(conn, tid)
                 assert task.consecutive_failures == expected_failures
             task = kb.get_task(conn, tid)
-            assert task.status == "blocked"
+            assert task.status == "triage"
             events = kb.list_events(conn, tid)
             assert [e.kind for e in events].count("timed_out") == 2
             gave_up = [e for e in events if e.kind == "gave_up"]
@@ -4365,7 +4366,7 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
         final = kb.get_task(conn, tid)
         # After 3 consecutive timeouts with failure_limit=3, task should
         # be auto-blocked, not looping forever as ``ready``.
-        assert final.status == "blocked", \
+        assert final.status == "triage", \
             f"expected blocked after 3 timeouts, got {final.status}"
         assert final.consecutive_failures >= 3
         # ``gave_up`` event emitted (plus 3 ``timed_out`` events).
@@ -4507,7 +4508,7 @@ def test_detect_crashed_workers_protocol_violation_streak_trips_at_limit(kanban_
         _drive_protocol_violation(conn, tid, 990900)
 
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked", (
+        assert task.status == "triage", (
             f"violation streak at the bound must block, got {task.status}"
         )
         events = kb.list_events(conn, tid)
@@ -4565,7 +4566,7 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         # Third consecutive violation: streak hits the bound — blocked.
         _drive_protocol_violation(conn, tid, 991003)
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "triage"
         gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
         assert len(gave_up) == 1
         assert (gave_up[0].payload or {}).get("protocol_violations") == \
@@ -4603,7 +4604,7 @@ def test_protocol_violation_streak_resets_on_other_failure_kind(kanban_home):
 
         # Third consecutive violation since the crash: blocked.
         _drive_protocol_violation(conn, tid, 993005)
-        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.get_task(conn, tid).status == "triage"
     finally:
         conn.close()
 
@@ -4624,7 +4625,7 @@ def test_protocol_violation_respects_max_retries_precedence(kanban_home):
         )
         _drive_protocol_violation(conn, strict, 992000)
         task = kb.get_task(conn, strict)
-        assert task.status == "blocked", (
+        assert task.status == "triage", (
             f"max_retries=1 must block on the first violation, got {task.status}"
         )
         gave_up = [e for e in kb.list_events(conn, strict) if e.kind == "gave_up"]
@@ -4642,7 +4643,7 @@ def test_protocol_violation_respects_max_retries_precedence(kanban_home):
                 f"violation {i + 1}/5 should retry under max_retries=5"
             )
         _drive_protocol_violation(conn, lenient, 992104)
-        assert kb.get_task(conn, lenient).status == "blocked"
+        assert kb.get_task(conn, lenient).status == "triage"
     finally:
         conn.close()
 
