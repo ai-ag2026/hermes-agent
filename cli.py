@@ -16353,7 +16353,10 @@ def main(
                         import contextlib
                         from hermes_cli import kanban_db as _kdb
                         with contextlib.closing(_kdb.connect()) as _conn:
-                            _kdb.add_comment(
+                            # add_comment_once: a card stuck in a spawn loop
+                            # must not collect one identical degradation
+                            # comment per attempt (Selbst-Audit 2026-07-16).
+                            _kdb.add_comment_once(
                                 _conn,
                                 _kb_task,
                                 author=os.environ.get("HERMES_PROFILE", "worker"),

@@ -4579,6 +4579,29 @@ def test_dispatch_review_spawns_bare_when_no_skills_available(
     assert any("skill-degradation" in c.body for c in comments)
 
 
+def test_review_skill_degradation_comment_is_deduplicated(
+    kanban_home, all_assignees_spawnable,
+):
+    """Repeated degraded spawns of the SAME card must not spam identical
+    skill-degradation comments (self-audit finding 16.07.: a crash-looping
+    review card would otherwise add a comment per spawn)."""
+    _mk_profile_skill(kanban_home, "alice", "test-driven-development")
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="review me", assignee="alice",
+            skills=["test-driven-development"],
+        )
+        task = kb.get_task(conn, t)
+        first = kb._resolve_review_skills(conn, task)
+        second = kb._resolve_review_skills(conn, task)
+        comments = [
+            c for c in kb.list_comments(conn, t)
+            if "skill-degradation" in c.body
+        ]
+    assert first == second == ["test-driven-development"]
+    assert len(comments) == 1
+
+
 def test_dispatch_review_skips_unassigned(kanban_home):
     """Unassigned review tasks go to skipped_unassigned, not spawned."""
     with kb.connect() as conn:

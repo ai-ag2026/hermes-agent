@@ -4090,6 +4090,23 @@ def add_comment(
         return int(cur.lastrowid or 0)
 
 
+def add_comment_once(
+    conn: sqlite3.Connection, task_id: str, author: str, body: str
+) -> Optional[int]:
+    """``add_comment``, skipped when an identical body already exists on the
+    task. For recurring automated notices (skill-degradation etc.): a card
+    stuck in a spawn loop must not accumulate one copy per attempt
+    (Selbst-Audit 2026-07-16). Returns the new comment id, or None when
+    deduplicated."""
+    dup = conn.execute(
+        "SELECT 1 FROM task_comments WHERE task_id = ? AND body = ? LIMIT 1",
+        (task_id, body),
+    ).fetchone()
+    if dup:
+        return None
+    return add_comment(conn, task_id, author=author, body=body)
+
+
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     rows = conn.execute(
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
@@ -13917,7 +13934,7 @@ def _resolve_review_skills(conn: sqlite3.Connection, task: "Task") -> list[str]:
     dropped = [s for s in merged if s not in available]
     if dropped:
         try:
-            add_comment(
+            add_comment_once(
                 conn, task.id, author="dispatcher",
                 body=(
                     "skill-degradation: review spawn dropped skill(s) not "
