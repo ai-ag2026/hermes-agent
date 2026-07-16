@@ -127,13 +127,27 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        self_char_limit: int = 0,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
+        # SELF.md (Persona B2): TARS's own self-narrative, maintained by the
+        # nightly reflect cron and injected READ-ONLY. self_char_limit=0 keeps
+        # the slot off (upstream-neutral). The agent never writes it through the
+        # memory tool — cron writes on disk, agent reads at load. So there is no
+        # ``add``/``replace`` target="self" plumbing here on purpose.
+        self.self_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.self_char_limit = self_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
-        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self._system_prompt_snapshot: Dict[str, str] = {
+            "memory": "", "user": "", "self": "",
+        }
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
@@ -187,21 +201,29 @@ class MemoryStore:
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
+        # SELF.md only when the slot is enabled (self_char_limit > 0).
+        self.self_entries = (
+            self._read_file(mem_dir / "SELF.md")
+            if self.self_char_limit > 0 else []
+        )
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
+        self.self_entries = list(dict.fromkeys(self.self_entries))
 
         # Sanitize entries for the system-prompt snapshot only.  Live state
         # (memory_entries / user_entries) keeps the raw text so the user
         # can see + remove poisoned entries via the memory tool.
         sanitized_memory = self._sanitize_entries_for_snapshot(self.memory_entries, "MEMORY.md")
         sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
+        sanitized_self = self._sanitize_entries_for_snapshot(self.self_entries, "SELF.md")
 
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", sanitized_memory),
             "user": self._render_block("user", sanitized_user),
+            "self": self._render_block("self", sanitized_self),
         }
 
     @staticmethod
@@ -314,11 +336,15 @@ class MemoryStore:
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
             return self.user_entries
+        if target == "self":
+            return self.self_entries
         return self.memory_entries
 
     def _set_entries(self, target: str, entries: List[str]):
         if target == "user":
             self.user_entries = entries
+        elif target == "self":
+            self.self_entries = entries
         else:
             self.memory_entries = entries
 
@@ -331,6 +357,8 @@ class MemoryStore:
     def _char_limit(self, target: str) -> int:
         if target == "user":
             return self.user_char_limit
+        if target == "self":
+            return self.self_char_limit
         return self.memory_char_limit
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
@@ -673,6 +701,8 @@ class MemoryStore:
 
         if target == "user":
             header = f"USER PROFILE (who the user is) [{pct}% — {current:,}/{limit:,} chars]"
+        elif target == "self":
+            header = f"SELF (who you are, how you've changed) [{pct}% — {current:,}/{limit:,} chars]"
         else:
             header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
 

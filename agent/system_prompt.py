@@ -482,6 +482,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
+        # SELF.md (Persona B2): TARS's self-narrative, injected read-only when
+        # the slot is enabled. Absent file / disabled = no block.
+        if getattr(agent, "_self_profile_enabled", False):
+            self_block = agent._memory_store.format_for_system_prompt("self")
+            if self_block:
+                volatile_parts.append(self_block)
 
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:
