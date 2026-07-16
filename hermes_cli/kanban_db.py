@@ -13883,6 +13883,58 @@ def dispatch_frozen() -> bool:
     return _root_dispatch_frozen()
 
 
+_REVIEW_FORCED_SKILLS = ["sdlc-review"]
+
+
+def _resolve_review_skills(conn: sqlite3.Connection, task: "Task") -> list[str]:
+    """Skills for a review-lane spawn: forced review skills first, then the
+    card's own, filtered by what the assignee profile can actually load.
+
+    The CLI hard-fails (exit 1) when EVERY ``--skills`` entry is unknown —
+    correct for a fully-misconfigured worker, but the review lane used to
+    pass ONLY ``sdlc-review``: one missing profile skill turned every review
+    spawn into a crash-loop (K-3, Vollaudit 2026-07-16). Filtering here keeps
+    the spawn alive and leaves a durable card comment; partially-missing
+    lists additionally degrade CLI-side (cli.py) as before.
+
+    Fail-open: no assignee or no profile skills dir (hermetic tests, ad-hoc
+    lanes) → nothing to validate against, keep the merged list unchanged.
+    Mirrors the availability check in ``create_task``.
+    """
+    merged = list(_REVIEW_FORCED_SKILLS) + [
+        s for s in (task.skills or [])
+        if s and s not in _REVIEW_FORCED_SKILLS
+    ]
+    assignee = (task.assignee or "").strip()
+    if not assignee:
+        return merged
+    from hermes_constants import get_default_hermes_root
+    skills_root = get_default_hermes_root() / "profiles" / assignee / "skills"
+    if not skills_root.is_dir():
+        return merged
+    available = {p.parent.name for p in skills_root.rglob("SKILL.md")}
+    kept = [s for s in merged if s in available]
+    dropped = [s for s in merged if s not in available]
+    if dropped:
+        try:
+            add_comment(
+                conn, task.id, author="dispatcher",
+                body=(
+                    "skill-degradation: review spawn dropped skill(s) not "
+                    f"available in profile {assignee!r}: {', '.join(dropped)}. "
+                    f"Continuing with: {', '.join(kept) or '(none)'}. Restore "
+                    "via system/sync-profile-skills.sh after fixing the root "
+                    "skills."
+                ),
+            )
+        except Exception:
+            _log.warning(
+                "could not record review skill-degradation comment on %s",
+                task.id, exc_info=True,
+            )
+    return kept
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -14442,9 +14494,13 @@ def _dispatch_once_locked(
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
         # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        # prompt via KANBAN_GUIDANCE. Merged with the card's own skills and
+        # filtered by profile availability (K-3, Vollaudit 2026-07-16):
+        # replacing the list with ONLY sdlc-review meant a profile missing
+        # that one skill hit the CLI's all-missing hard-fail on every review
+        # spawn — a crash-loop that burned the failure budget and looked
+        # like reviewer instability.
+        claimed.skills = _resolve_review_skills(conn, claimed)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect

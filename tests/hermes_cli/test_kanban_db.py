@@ -4504,6 +4504,81 @@ def test_dispatch_review_spawns_with_correct_skills(
     assert spawned_tasks[0].skills == ["sdlc-review"]
 
 
+def _mk_profile_skill(home, assignee: str, skill: str) -> None:
+    d = home / "profiles" / assignee / "skills" / "devops" / skill
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(f"---\nname: {skill}\n---\nbody\n", encoding="utf-8")
+
+
+def test_dispatch_review_merges_card_skills_with_forced_skill(
+    kanban_home, all_assignees_spawnable,
+):
+    """Review spawn keeps the card's own skills alongside sdlc-review."""
+    _mk_profile_skill(kanban_home, "alice", "sdlc-review")
+    _mk_profile_skill(kanban_home, "alice", "test-driven-development")
+    spawned_tasks = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="review me", assignee="alice",
+            skills=["test-driven-development"],
+        )
+        _set_task_status(conn, t, "review")
+        kb.dispatch_once(conn, spawn_fn=capture_spawn)
+    assert spawned_tasks[0].skills == ["sdlc-review", "test-driven-development"]
+
+
+def test_dispatch_review_degrades_when_forced_skill_unavailable(
+    kanban_home, all_assignees_spawnable,
+):
+    """Profile without sdlc-review: spawn drops it, keeps the card's skills
+    and leaves a durable degradation comment — instead of passing an
+    all-missing ``--skills`` list that hard-crashes the worker at startup
+    (CLI raises on all-missing) and burns the failure budget (K-3)."""
+    _mk_profile_skill(kanban_home, "alice", "test-driven-development")
+    spawned_tasks = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="review me", assignee="alice",
+            skills=["test-driven-development"],
+        )
+        _set_task_status(conn, t, "review")
+        kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        comments = kb.list_comments(conn, t)
+    assert spawned_tasks[0].skills == ["test-driven-development"]
+    assert any("skill-degradation" in c.body for c in comments)
+
+
+def test_dispatch_review_spawns_bare_when_no_skills_available(
+    kanban_home, all_assignees_spawnable,
+):
+    """Even with nothing loadable the review spawn must not crash-loop:
+    spawn with no forced skills plus a degradation comment."""
+    (kanban_home / "profiles" / "alice" / "skills").mkdir(parents=True)
+    spawned_tasks = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="alice")
+        _set_task_status(conn, t, "review")
+        kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        comments = kb.list_comments(conn, t)
+    assert spawned_tasks[0].skills == []
+    assert any("skill-degradation" in c.body for c in comments)
+
+
 def test_dispatch_review_skips_unassigned(kanban_home):
     """Unassigned review tasks go to skipped_unassigned, not spawned."""
     with kb.connect() as conn:
