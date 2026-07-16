@@ -8962,7 +8962,7 @@ def record_pending_action_and_block(
     # NOTE: the workspace path is deliberately NOT included — the redaction
     # guard tests treat it as a secret surface (paths can carry user/project
     # names). Card views expose the workspace through their own ACL'd field.
-    _desc = " ".join((summary or "").split())[:300]
+    _desc = " ".join((summary or "").split())[:520]
     display_summary = (
         f"{PENDING_ACTION_OPERATOR_SUMMARY} Grund: {_desc} [{mutation_kind or 'terminal'}]"
         if _desc else PENDING_ACTION_OPERATOR_SUMMARY

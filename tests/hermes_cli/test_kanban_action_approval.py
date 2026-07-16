@@ -913,8 +913,13 @@ def test_atomic_guard_result_and_durable_payloads_are_redacted(
             },
             sort_keys=True,
         )
-        for secret in (raw_command, action.command_hash, action.fingerprint, profile_marker, str(workspace.resolve())):
+        # Policy change 2026-07-16 (operator decision, LAN threat model): a
+        # force-redacted, capped copy of the command IS persisted so the
+        # cockpit can show what awaits approval. Actual secrets, hashes,
+        # fingerprints, profile and workspace paths remain forbidden.
+        for secret in (action.command_hash, action.fingerprint, profile_marker, str(workspace.resolve())):
             assert secret not in durable_public
+        assert "RAW_COMMAND_MARKER" in durable_public  # operator can see WHAT
         pending = next(event for event in events if event.kind == "terminal_approval_pending")
         blocked = next(event for event in events if event.kind == "blocked")
         assert set(pending.payload) == {"action_id", "mutation_kind", "summary", "expires_at"}

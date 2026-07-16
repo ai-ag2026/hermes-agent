@@ -2716,6 +2716,20 @@ def _record_kanban_pending_action(
     workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
     if not task_id or not workspace:
         return
+    # Operator decision 2026-07-16 (Manfred): the cockpit MUST show which
+    # command is awaiting approval — "sonst taste ich im Dunkeln". His LAN
+    # threat model accepts persisting a *force-redacted*, capped copy of the
+    # command in the durable board (previously forbidden as a side channel;
+    # the guard tests were updated alongside this change). Secrets are
+    # scrubbed with force=True before anything leaves this function.
+    try:
+        from agent.redact import redact_sensitive_text
+        _cmd_disp = " ".join(redact_sensitive_text(command, force=True).split())
+        if len(_cmd_disp) > 220:
+            _cmd_disp = _cmd_disp[:220] + "…"
+        summary = f"{summary} | CMD: {_cmd_disp}" if summary else f"CMD: {_cmd_disp}"
+    except Exception:
+        pass  # display-only enrichment must never break the gate itself
     try:
         from hermes_cli import kanban_db
         run_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
