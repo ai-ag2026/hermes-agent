@@ -4678,6 +4678,62 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
 
+def _adoptable_orphan_run(
+    conn: sqlite3.Connection, task_id: str, expected_run_id: int,
+) -> bool:
+    """True when ``expected_run_id`` may land finished work on an orphaned card.
+
+    Targets exactly the worker-containment wedge (2026-07-16, card
+    ``t_bb8742af``): a worker hits a lifecycle gate — exact-action /
+    self-modify / ``needs_input`` block — that ENDS its run with
+    ``outcome='blocked'`` and parks the card. The operator approves and
+    unblocks the card back to ``ready``. The original worker PROCESS is still
+    alive, finishes the work (commit landed, tests green), and its terminal
+    ``kanban_complete`` / ``kanban_request_review`` carries the now-ended run
+    as ``expected_run_id``. Without adoption that call can never match
+    ``current_run_id`` (NULL) and the finished work deadlocks behind the
+    ``active_pr`` respawn guard (auto-block after 30 min → operator flood → the
+    next worker re-enters the same trap).
+
+    Deliberately narrow so it does NOT weaken worker containment:
+
+    * ``status`` must be ``ready``. A card still parked at ``blocked`` with
+      ``needs_input`` keeps its human gate — adoption never reopens it.
+    * ``current_run_id`` must be NULL. If a newer worker already claimed the
+      card, that worker owns it: refuse (no double-deliver / no clobber of the
+      run a fresher worker now holds).
+    * ``expected_run_id`` must be the card's NEWEST run, so a superseded
+      earlier attempt cannot land against a fresher one.
+    * that run must be closed (``ended_at`` set) with ``outcome='blocked'``. A
+      run ended by RECLAIM / CRASH / TIMEOUT / GAVE_UP is intentionally NOT
+      adoptable: those are containment actions (see the ``run_identity`` gate
+      in :func:`_enforce_worker_complete_gates` — "a reclaimed worker must not
+      complete a run it no longer owns"), so an aborted or zombie worker can
+      never sneak its work back in through this path.
+
+    The caller must still perform the terminal transition under an atomic CAS
+    keyed on ``status`` + ``current_run_id IS NULL`` inside its own
+    ``write_txn`` — this predicate is advisory pre-screening, and a concurrent
+    respawn/claim between here and the commit is caught by that CAS.
+    """
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["current_run_id"] is not None or row["status"] != "ready":
+        return False
+    latest = conn.execute(
+        "SELECT id, outcome, ended_at FROM task_runs WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return (
+        latest is not None
+        and latest["ended_at"] is not None
+        and latest["outcome"] == "blocked"
+        and int(latest["id"]) == int(expected_run_id)
+    )
+
+
 def _synthesize_ended_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5301,23 +5357,51 @@ def request_task_review(
             return False
         if pending is not None:
             return row["status"] in {"review", "running"}
-        if row["status"] != "running":
-            return False
+        # Orphaned-run recovery (worker-containment 2026-07-16): mirror
+        # complete_task — a still-alive worker whose gate-blocked run was
+        # cleared back to 'ready' hands off to review with its now-ended run as
+        # expected_run_id. Adopt it only under the narrow, containment-
+        # preserving conditions in _adoptable_orphan_run.
+        adopt_orphan_run = False
         run_id = row["current_run_id"]
-        if expected_run_id is not None and run_id != int(expected_run_id):
+        if row["status"] != "running":
+            if (
+                expected_run_id is not None
+                and run_id is None
+                and _adoptable_orphan_run(conn, task_id, int(expected_run_id))
+            ):
+                adopt_orphan_run = True
+            else:
+                return False
+        elif expected_run_id is not None and run_id != int(expected_run_id):
             return False
         implementation_assignee = row["assignee"]
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status = 'review', assignee = ?,
-                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-             WHERE id = ? AND status = 'running'
-            """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-            (reviewer, task_id)
-            if expected_run_id is None
-            else (reviewer, task_id, int(expected_run_id)),
-        )
+        if adopt_orphan_run:
+            # Atomic re-verification of the orphan window (see complete_task):
+            # a respawn that claimed the card between the read above and here
+            # sets current_run_id, so this CAS refuses and the stale worker
+            # loses the race to the new owner.
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'review', assignee = ?,
+                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+                 WHERE id = ? AND status = 'ready' AND current_run_id IS NULL
+                """,
+                (reviewer, task_id),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'review', assignee = ?,
+                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+                 WHERE id = ? AND status = 'running'
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                (reviewer, task_id)
+                if expected_run_id is None
+                else (reviewer, task_id, int(expected_run_id)),
+            )
         if cur.rowcount != 1:
             return False
         closed_run_id = _end_run(
@@ -5328,6 +5412,11 @@ def request_task_review(
             summary=summary,
             metadata=metadata,
         )
+        # The adopted run is already closed (that's what orphaned it), so
+        # _end_run is a no-op returning None; carry the adopted run id onto the
+        # event/hook so the review is attributed to the run that did the work.
+        if adopt_orphan_run and closed_run_id is None:
+            closed_run_id = int(expected_run_id)
         _append_event(
             conn,
             task_id,
@@ -6931,8 +7020,20 @@ def _complete_task_locked(
     task = get_task(conn, task_id)
     if task is None or task.status not in {"running", "ready", "blocked"}:
         return False
+    # Orphaned-run recovery (worker-containment 2026-07-16): a still-alive
+    # worker whose gate-blocked run was cleared back to 'ready' by an operator
+    # unblock carries its now-ended run as expected_run_id, which no longer
+    # matches current_run_id (NULL). Allow it to land its finished work only
+    # under the narrow, containment-preserving conditions in
+    # _adoptable_orphan_run; every other mismatch stays a hard refusal.
+    adopt_orphan_run = False
     if expected_run_id is not None and task.current_run_id != int(expected_run_id):
-        return False
+        if task.current_run_id is None and _adoptable_orphan_run(
+            conn, task_id, int(expected_run_id)
+        ):
+            adopt_orphan_run = True
+        else:
+            return False
     # A1 (2026-07-14 full audit): a card with a LIVE exact-action awaiting approval
     # (the "short list": upstream/prod/credentials/publish) must NOT be completed
     # except through the approval path. unblock_task/promote_task already refuse this;
@@ -7004,7 +7105,30 @@ def _complete_task_locked(
         # before) the 'done' CAS below, so a rejection never touches state
         # and a valid token is consumed atomically with the transition.
         _assert_human_gate_open(conn, task_id, token=token, action="complete")
-        if expected_run_id is None:
+        if adopt_orphan_run:
+            # Atomic re-verification of the orphan window: only land if the
+            # card is STILL 'ready' with no active run. A respawn/claim that
+            # committed between the pre-check and here sets current_run_id and
+            # flips status to 'running', so this CAS refuses (rowcount 0) and
+            # the stale worker loses the race — the new owner keeps the card.
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status = 'ready'
+                   AND current_run_id IS NULL
+                """,
+                (result, now, task_id),
+            )
+        elif expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks

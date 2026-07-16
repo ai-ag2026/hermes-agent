@@ -1454,6 +1454,167 @@ def test_complete_records_result(kanban_home):
     assert task.completed_at is not None
 
 
+# ---------------------------------------------------------------------------
+# Orphaned-run recovery (worker-containment 2026-07-16)
+#
+# Reproduces the wedge on card t_bb8742af: a worker's run is ended out from
+# under the still-alive process (exact-action / self-modify gate blocks the
+# card, operator approves + unblocks it back to 'ready'), leaving the card at
+# status='ready' with current_run_id=NULL while the original worker process
+# keeps working and finishes. Its terminal kanban_complete / kanban_request_review
+# carry expected_run_id == the just-ended run, which no longer matches
+# current_run_id (NULL) -> the finished work has no way back and the card
+# deadlocks behind the active_pr respawn guard.
+# ---------------------------------------------------------------------------
+
+def _orphan_ready_after_ended_run(conn, *, assignee="backend-eng"):
+    """Return (task_id, ended_run_id) for a card that is 'ready' with
+    current_run_id=NULL and whose newest run was ended out from under a
+    still-alive worker. Mirrors: claim -> gate-block(needs_input) -> operator
+    approve+unblock -> ready.
+    """
+    t = kb.create_task(conn, title="orphan repro", assignee=assignee)
+    claimed = kb.claim_task(conn, t, claimer="host:worker")
+    assert claimed is not None and claimed.current_run_id is not None
+    run_id = int(claimed.current_run_id)
+    # Gate ends the run and parks the card for a human (needs_input).
+    assert kb.block_task(
+        conn, t, reason="terminal approval required",
+        kind="needs_input", trusted_internal=True,
+    )
+    blocked = kb.get_task(conn, t)
+    assert blocked.status == "blocked" and blocked.current_run_id is None
+    # Operator approves and unblocks -> card is 'ready' again, still no run.
+    assert kb.unblock_task(conn, t)
+    ready = kb.get_task(conn, t)
+    assert ready.status == "ready" and ready.current_run_id is None
+    return t, run_id
+
+
+def test_orphaned_run_completion_is_adopted(kanban_home):
+    """A still-alive worker whose run was ended (card requeued to 'ready',
+    current_run_id=NULL) must be able to land its finished work by passing its
+    own (now-ended) run as expected_run_id. Before the fix this returns False
+    and the card deadlocks."""
+    with kb.connect() as conn:
+        t, run_id = _orphan_ready_after_ended_run(conn)
+        ok = kb.complete_task(
+            conn, t, result="finished after gate", expected_run_id=run_id,
+        )
+        assert ok is True
+        task = kb.get_task(conn, t)
+    assert task.status == "done"
+    assert task.result == "finished after gate"
+
+
+def test_orphaned_run_review_request_is_adopted(kanban_home):
+    """Same recovery for the review workflow: request_task_review from an
+    orphaned 'ready' card owned by the just-ended run must succeed."""
+    with kb.connect() as conn:
+        t, run_id = _orphan_ready_after_ended_run(conn)
+        ok = kb.request_task_review(
+            conn, t, reviewer="reviewer", summary="please review",
+            expected_run_id=run_id,
+        )
+        assert ok is True
+        task = kb.get_task(conn, t)
+    assert task.status == "review"
+    assert task.assignee == "reviewer"
+
+
+def test_orphaned_completion_refused_after_respawn(kanban_home):
+    """SAFETY: once a NEW run has claimed the orphaned card, the stale worker's
+    expected_run_id must NOT complete it (no double-deliver / no clobber of the
+    run a newer worker now owns)."""
+    with kb.connect() as conn:
+        t, stale_run = _orphan_ready_after_ended_run(conn)
+        reclaimed = kb.claim_task(conn, t, claimer="host:worker2")
+        assert reclaimed is not None
+        new_run = int(reclaimed.current_run_id)
+        assert new_run != stale_run
+        # Stale worker (old run) tries to land work -> refused.
+        assert kb.complete_task(
+            conn, t, result="stale", expected_run_id=stale_run,
+        ) is False
+        task = kb.get_task(conn, t)
+    assert task.status == "running"
+    assert int(task.current_run_id) == new_run
+
+
+def test_orphaned_completion_refused_when_newer_orphan_run_exists(kanban_home):
+    """SAFETY: only the *latest* ended run of an orphaned card is adoptable. An
+    older run id must be refused even when current_run_id is NULL, so a worker
+    from a superseded attempt cannot land against a fresher one."""
+    with kb.connect() as conn:
+        t, first_run = _orphan_ready_after_ended_run(conn)
+        # A second attempt runs and is itself gate-blocked then unblocked,
+        # producing a newer orphaned run. A different block kind avoids the
+        # same-cause recurrence loop-breaker (BLOCK_RECURRENCE_LIMIT), so the
+        # card lands back at 'ready' rather than 'triage'.
+        second = kb.claim_task(conn, t, claimer="host:worker2")
+        assert second is not None
+        second_run = int(second.current_run_id)
+        assert kb.block_task(
+            conn, t, reason="gate again", kind="capability",
+            trusted_internal=True,
+        )
+        assert kb.unblock_task(conn, t)
+        # Old (superseded) run refused; latest orphan run adopted.
+        assert kb.complete_task(
+            conn, t, result="from first", expected_run_id=first_run,
+        ) is False
+        assert kb.complete_task(
+            conn, t, result="from second", expected_run_id=second_run,
+        ) is True
+        task = kb.get_task(conn, t)
+    assert task.status == "done"
+    assert task.result == "from second"
+
+
+def test_reclaimed_orphan_run_is_not_adoptable(kanban_home):
+    """SAFETY / containment: a run ended by RECLAIM (operator abort or stale
+    claim) leaves the card 'ready' + orphaned too, but the reclaimed worker
+    must NOT be able to land its work — that is the run_identity containment
+    the fix must preserve. Only outcome='blocked' orphans are adoptable."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reclaimed", assignee="backend-eng")
+        claimed = kb.claim_task(conn, t, claimer="host:worker")
+        run_id = int(claimed.current_run_id)
+        assert kb.reclaim_task(conn, t, reason="operator abort")
+        reclaimed = kb.get_task(conn, t)
+        assert reclaimed.status == "ready" and reclaimed.current_run_id is None
+        # Reclaimed (aborted) worker tries to sneak its work back in -> refused.
+        assert kb.complete_task(
+            conn, t, result="aborted work", expected_run_id=run_id,
+        ) is False
+        task = kb.get_task(conn, t)
+    assert task.status == "ready"
+    assert task.result != "aborted work"
+
+
+def test_orphaned_needs_input_block_not_bypassed(kanban_home):
+    """SAFETY: adoption only applies to a 'ready' orphan. A card still parked at
+    blocked+needs_input (human gate not yet cleared) must NOT be completable via
+    a stale expected_run_id."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="still gated", assignee="backend-eng")
+        claimed = kb.claim_task(conn, t, claimer="host:worker")
+        run_id = int(claimed.current_run_id)
+        assert kb.block_task(
+            conn, t, reason="terminal approval required",
+            kind="needs_input", trusted_internal=True,
+        )
+        blocked = kb.get_task(conn, t)
+        assert blocked.status == "blocked" and blocked.current_run_id is None
+        # No operator unblock yet -> gate still holds -> refuse.
+        assert kb.complete_task(
+            conn, t, result="sneaky", expected_run_id=run_id,
+        ) is False
+        task = kb.get_task(conn, t)
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+
+
 def test_block_then_unblock(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
