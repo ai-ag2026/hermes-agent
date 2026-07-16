@@ -16340,6 +16340,35 @@ def main(
                     missing_display,
                     ", ".join(loaded_skills),
                 )
+                # Visibility without interruption (operator decision
+                # 2026-07-16): a silent drop meant cards went "done" while
+                # the skills they demanded never loaded, and nobody could
+                # see it afterwards. Leave a durable comment on the card so
+                # the board shows the degradation — but never block or fail
+                # the worker over it (create_task now rejects most of these
+                # at the source; this catches cards created past that gate).
+                _kb_task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+                if _kb_task:
+                    try:
+                        import contextlib
+                        from hermes_cli import kanban_db as _kdb
+                        with contextlib.closing(_kdb.connect()) as _conn:
+                            _kdb.add_comment(
+                                _conn,
+                                _kb_task,
+                                author=os.environ.get("HERMES_PROFILE", "worker"),
+                                body=(
+                                    f"skill-degradation: requested skill(s) not "
+                                    f"available in this profile and skipped: "
+                                    f"{missing_display}. Run continued with: "
+                                    f"{', '.join(loaded_skills)}."
+                                ),
+                            )
+                    except Exception:
+                        logger.warning(
+                            "could not record skill-degradation comment on %s",
+                            _kb_task, exc_info=True,
+                        )
             else:
                 raise ValueError(f"Unknown skill(s): {missing_display}")
         if skills_prompt:
