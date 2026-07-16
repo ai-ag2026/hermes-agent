@@ -41,18 +41,19 @@ def _mock_client_returning(content: str):
 
 
 def _patch_aux_client(content: str, *, model: str = "test-model"):
-    client = _mock_client_returning(content)
+    # decompose_task now routes through call_llm (see #35566) — mock it at
+    # the source module so task config, extra_body, and retries stay out of
+    # unit-test scope.
     return patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, model),
+        "agent.auxiliary_client.call_llm",
+        return_value=_fake_aux_response(content),
     )
 
 
 def _patch_extra_body():
-    return patch(
-        "agent.auxiliary_client.get_auxiliary_extra_body",
-        return_value={},
-    )
+    # No-op shim retained for call-site compatibility: extra_body plumbing
+    # now lives inside call_llm, which _patch_aux_client already mocks.
+    return patch("agent.auxiliary_client.get_auxiliary_extra_body", return_value={})
 
 
 def _patch_list_profiles(names: list[str]):
@@ -334,9 +335,11 @@ def test_decompose_no_aux_client_configured(kanban_home):
     for p in patches:
         p.start()
     try:
+        # call_llm raises RuntimeError when no provider is configured; the
+        # decomposer must convert that into a failed outcome, not a crash.
         with patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(None, ""),
+            "agent.auxiliary_client.call_llm",
+            side_effect=RuntimeError("No LLM provider configured"),
         ):
             outcome = decomp.decompose_task(tid, author="me")
     finally:
@@ -344,14 +347,24 @@ def test_decompose_no_aux_client_configured(kanban_home):
             p.stop()
 
     assert outcome.ok is False
-    assert "no auxiliary client" in outcome.reason
+    # call_llm's no-provider RuntimeError surfaces via the LLM-error branch.
+    assert "LLM error" in outcome.reason
+
+
+def _mock_call_llm_response(payload: str):
+    """Minimal call_llm-shaped response (resp.choices[0].message.content)."""
+    from unittest.mock import MagicMock
+    resp = MagicMock()
+    resp.choices = [MagicMock()]
+    resp.choices[0].message.content = payload
+    return resp
 
 
 def test_decompose_class_role_falls_back_to_default(kanban_home):
-    """When the class-specific planner role can't be resolved at runtime
-    (e.g. its provider's quota is exhausted), the decomposer falls back to the
-    default role instead of failing outright — a class=hard task must not be
-    MORE fragile than an unclassified one."""
+    """local(tars) Quality-Class-Routing über den call_llm-Refactor: scheitert
+    der klassen-spezifische Planner zur Laufzeit (Quota weg), fällt der
+    Decomposer auf die Default-Rolle zurück statt komplett zu scheitern —
+    eine class=hard-Karte darf nicht FRAGILER sein als eine unklassifizierte."""
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="hard epic", triage=True)
         kb.set_task_class(conn, tid, "hard")
@@ -360,14 +373,13 @@ def test_decompose_class_role_falls_back_to_default(kanban_home):
         "fanout": True, "rationale": "split",
         "tasks": [{"title": "a", "body": "b", "assignee": "engineer", "parents": []}],
     })
-    default_client = _mock_client_returning(llm_payload)
+    seen_tasks = []
 
-    def _aux(role):
-        # The class-specific role is "configured" but unavailable at runtime;
-        # the default role works.
-        if role == "kanban_decomposer_hard":
-            return (None, None)
-        return (default_client, "default-model")
+    def _call_llm(*, task, **kwargs):
+        seen_tasks.append(task)
+        if task == "kanban_decomposer_hard":
+            raise RuntimeError("quota exhausted")
+        return _mock_call_llm_response(llm_payload)
 
     cfg = {"auxiliary": {"kanban_decomposer_hard": {"model": "fable", "provider": "x"}}}
 
@@ -375,7 +387,7 @@ def test_decompose_class_role_falls_back_to_default(kanban_home):
     for p in patches:
         p.start()
     try:
-        with patch("agent.auxiliary_client.get_text_auxiliary_client", side_effect=_aux), \
+        with patch("agent.auxiliary_client.call_llm", side_effect=_call_llm), \
              patch("hermes_cli.kanban_decompose._load_config", return_value=cfg), \
              _patch_extra_body():
             outcome = decomp.decompose_task(tid, author="me")
@@ -385,8 +397,7 @@ def test_decompose_class_role_falls_back_to_default(kanban_home):
 
     assert outcome.ok, outcome.reason
     assert outcome.fanout is True
-    # The default client (not the class role) produced the plan.
-    assert default_client.chat.completions.create.called
+    assert seen_tasks == ["kanban_decomposer_hard", "kanban_decomposer"]
 
 
 def test_decompose_class_role_used_when_available(kanban_home):
@@ -399,12 +410,11 @@ def test_decompose_class_role_used_when_available(kanban_home):
         "fanout": True, "rationale": "split",
         "tasks": [{"title": "a", "body": "b", "assignee": "engineer", "parents": []}],
     })
-    hard_client = _mock_client_returning(llm_payload)
-    calls = {}
+    seen_tasks = []
 
-    def _aux(role):
-        calls["role"] = role
-        return (hard_client, "fable-model")
+    def _call_llm(*, task, **kwargs):
+        seen_tasks.append(task)
+        return _mock_call_llm_response(llm_payload)
 
     cfg = {"auxiliary": {"kanban_decomposer_hard": {"model": "fable", "provider": "x"}}}
 
@@ -412,7 +422,7 @@ def test_decompose_class_role_used_when_available(kanban_home):
     for p in patches:
         p.start()
     try:
-        with patch("agent.auxiliary_client.get_text_auxiliary_client", side_effect=_aux), \
+        with patch("agent.auxiliary_client.call_llm", side_effect=_call_llm), \
              patch("hermes_cli.kanban_decompose._load_config", return_value=cfg), \
              _patch_extra_body():
             outcome = decomp.decompose_task(tid, author="me")
@@ -421,4 +431,4 @@ def test_decompose_class_role_used_when_available(kanban_home):
             p.stop()
 
     assert outcome.ok, outcome.reason
-    assert calls["role"] == "kanban_decomposer_hard"
+    assert seen_tasks == ["kanban_decomposer_hard"]

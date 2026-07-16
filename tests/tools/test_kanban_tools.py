@@ -59,16 +59,10 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
         "kanban_show", "kanban_complete", "kanban_request_review",
         "kanban_review_decide", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
+        # upstream attachment toolset (merge 2026-07-17)
+        "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
-
-
-def test_kanban_block_schema_exposes_human_guidance():
-    from tools.kanban_tools import KANBAN_BLOCK_SCHEMA
-
-    props = KANBAN_BLOCK_SCHEMA["parameters"]["properties"]
-    assert "human_summary" in props
-    assert "human_action" in props
 
 
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
@@ -149,6 +143,8 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_review_decide", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
+        # upstream attachment toolset (merge 2026-07-17)
+        "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
@@ -309,49 +305,6 @@ def test_list_rejects_bad_include_archived(monkeypatch, worker_env):
     assert "include_archived must be" in json.loads(out).get("error", "")
 
 
-def test_complete_refusal_names_open_review_handshake(worker_env):
-    """A silent complete_task refusal must tell the worker WHY (K-3b,
-    Vollaudit 2026-07-16): an unmatched review_requested event left only the
-    catch-all "unknown id or already terminal" although the card was alive
-    and running — the worker had no way to see the open handshake and
-    block-looped for hours (live case t_5a43abe1, runs 664–671)."""
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        with kb.write_txn(conn):
-            kb._append_event(
-                conn, worker_env, "review_requested",
-                {"reviewer": "reviewer", "summary": "handshake left open"},
-            )
-    finally:
-        conn.close()
-    from tools import kanban_tools as kt
-    out = kt._handle_complete({"summary": "work is done"})
-    d = json.loads(out)
-    err = d.get("error", "")
-    assert "review" in err.lower(), err
-    assert "unknown id or already terminal" not in err, err
-
-
-def test_complete_refusal_names_terminal_status(worker_env):
-    """Completing an actually-terminal card must say so specifically."""
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        assert kb.complete_task(
-            conn, worker_env,
-            expected_run_id=kb.get_task(conn, worker_env).current_run_id,
-        )
-    finally:
-        conn.close()
-    from tools import kanban_tools as kt
-    out = kt._handle_complete({"summary": "again"})
-    d = json.loads(out)
-    err = d.get("error", "")
-    assert "terminal" in err.lower(), err
-    assert "status=done" in err, err
-
-
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({
@@ -371,65 +324,6 @@ def test_complete_happy_path(worker_env):
         assert run.metadata == {"files": 2}
     finally:
         conn.close()
-
-
-def test_request_review_and_accept_handlers(monkeypatch, worker_env):
-    from hermes_cli import kanban_db as kb
-    from tools import kanban_tools as kt
-
-    requested = json.loads(kt._handle_request_review({
-        "reviewer": "reviewer",
-        "summary": "implementation with tests",
-        "metadata": {"tests": ["pytest -q"]},
-    }))
-    assert requested["ok"] is True
-    assert requested["status"] == "review"
-
-    with kb.connect() as conn:
-        review = kb.claim_review_task(conn, worker_env)
-        assert review is not None
-        review_run_id = review.current_run_id
-    assert review_run_id is not None
-    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review_run_id))
-
-    decided = json.loads(kt._handle_review_decide({
-        "decision": "ACCEPT",
-        "summary": "ACCEPT: diff and tests verified",
-        "metadata": {"checks": ["git diff --check"]},
-    }))
-    assert decided["ok"] is True
-    assert decided["decision"] == "ACCEPT"
-    assert decided["status"] == "done"
-
-    with kb.connect() as conn:
-        task = kb.get_task(conn, worker_env)
-        assert task is not None
-        assert task.status == "done"
-        assert task.assignee == "test-worker"
-        assert kb.latest_run(conn, worker_env).outcome == "accept"
-
-
-def test_review_decide_handler_rejects_stale_run(monkeypatch, worker_env):
-    from hermes_cli import kanban_db as kb
-    from tools import kanban_tools as kt
-
-    assert json.loads(kt._handle_request_review({
-        "reviewer": "reviewer",
-        "summary": "implementation handoff",
-    }))["ok"] is True
-    with kb.connect() as conn:
-        review = kb.claim_review_task(conn, worker_env)
-        assert review is not None and review.current_run_id is not None
-        run_id = review.current_run_id
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(int(run_id) + 1))
-    out = json.loads(kt._handle_review_decide({
-        "decision": "ACCEPT",
-        "summary": "stale review",
-    }))
-    assert "stale run" in out["error"]
-    with kb.connect() as conn:
-        assert kb.get_task(conn, worker_env).status == "running"
 
 
 def test_complete_metadata_round_trips_through_show(worker_env):
@@ -637,6 +531,35 @@ def test_complete_rejects_non_list_artifacts(worker_env):
     err = json.loads(out).get("error", "")
     assert "artifacts must be a list" in err
 
+
+def test_complete_missing_scratch_artifact_stays_in_flight(worker_env):
+    """A false deliverable claim must return retry guidance, not mark Done."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, worker_env, workspace)
+
+    output = kt._handle_complete({
+        "summary": "report complete",
+        "artifacts": [str(workspace / "missing-report.md")],
+    })
+    result = json.loads(output)
+
+    # Choice A (2026-07-14 merge): our completion-artifact EVIDENCE validation runs
+    # BEFORE the write txn and fails closed on a non-existent deliverable — it
+    # pre-empts upstream's ArtifactPreservationError for the missing case. Either
+    # way the task stays in-flight (no state change) and the worker may retry.
+    assert result.get("success") is False
+    assert result.get("state_changed") is False
+    assert result.get("retryable") is True
+    assert "does not exist" in result.get("error", "")
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+    assert workspace.exists()
 
 
 def test_complete_rejects_no_handoff(worker_env):
@@ -884,40 +807,6 @@ def test_block_happy_path(worker_env):
         payload = json.loads(ev[0])
         assert payload["human_summary"].startswith("Mir fehlt")
         assert payload["human_action"].startswith("Bitte kurz")
-    finally:
-        conn.close()
-
-
-def test_block_requires_human_fields_for_human_facing_kinds(worker_env):
-    """Blocks that surface to a human must carry the layman summary+action;
-    without them the tool errors and the task stays untouched (2026-07-11
-    layman-notification contract)."""
-    from tools import kanban_tools as kt
-    from hermes_cli import kanban_db as kb
-    for args in (
-        {"reason": "stuck"},
-        {"reason": "stuck", "kind": "needs_input"},
-        {"reason": "stuck", "kind": "needs_input", "human_summary": "Nur Summary."},
-        {"reason": "stuck", "kind": "needs_input", "human_action": "Nur Action."},
-    ):
-        d = json.loads(kt._handle_block(args))
-        assert "human_summary" in d.get("error", ""), args
-    conn = kb.connect()
-    try:
-        assert kb.get_task(conn, worker_env).status == "running"
-    finally:
-        conn.close()
-
-
-def test_block_dependency_kind_exempt_from_human_fields(worker_env):
-    """kind='dependency' never reaches a human — no layman fields needed."""
-    from tools import kanban_tools as kt
-    from hermes_cli import kanban_db as kb
-    out = kt._handle_block({"reason": "waiting on t_x", "kind": "dependency"})
-    assert json.loads(out).get("ok") is True
-    conn = kb.connect()
-    try:
-        assert kb.get_task(conn, worker_env).status == "todo"
     finally:
         conn.close()
 
@@ -1849,187 +1738,6 @@ def test_worker_complete_own_task_still_works(worker_env):
     assert d.get("ok") is True and d.get("task_id") == worker_env
 
 
-# ---------------------------------------------------------------------------
-# Delegated-subagent scoping (t_591dd454)
-#
-# A ``delegate_task`` subagent runs as a fresh AIAgent thread inside the SAME
-# OS process as the board worker that spawned it, so it previously shared
-# HERMES_KANBAN_TASK/_RUN_ID/_CLAIM_LOCK with the parent via os.environ. That
-# let a "read-only analysis" subagent mark the parent's own card complete
-# (S3, 2026-07-10) while the real worker was still running and writing to a
-# shared worktree, causing S4 to be promoted with a second writer active.
-#
-# tools.delegate_tool._run_single_child now calls
-# ``mark_delegated_subagent_context()`` on the child's dedicated run thread
-# before its conversation starts. These tests pin the resulting behavior
-# directly against the tool handlers, independent of the threading plumbing
-# (which is covered separately in tests/tools/test_delegate.py).
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def delegated_subagent_ctx():
-    """Mark the current test like a delegate_task subagent's run thread.
-
-    Mirrors what ``tools.delegate_tool._run_single_child`` does inside
-    ``_run_with_thread_capture`` right before ``child.run_conversation``.
-    Reset in a finally block so the contextvars.ContextVar doesn't leak into
-    unrelated tests sharing this worker's default Context.
-    """
-    from tools import kanban_tools as kt
-
-    kt.mark_delegated_subagent_context()
-    try:
-        yield
-    finally:
-        kt._delegated_subagent_ctx.set(False)
-
-
-def test_delegated_subagent_context_defaults_false():
-    """A normal call site (no marking) must never look like a subagent."""
-    from tools import kanban_tools as kt
-    assert kt._is_delegated_subagent() is False
-
-
-def test_delegated_subagent_cannot_complete_parent_task(worker_env, delegated_subagent_ctx):
-    """A subagent that echoes the parent's own task_id must still be refused
-    — the guard is unconditional, not an ownership *mismatch* check."""
-    from tools import kanban_tools as kt
-    out = kt._handle_complete({"task_id": worker_env, "summary": "sneaky completion"})
-    d = json.loads(out)
-    assert d.get("ok") is not True
-    assert "delegated subagent" in d.get("error", "")
-
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        assert kb.get_task(conn, worker_env).status == "running"
-    finally:
-        conn.close()
-
-
-def test_delegated_subagent_cannot_complete_without_task_id(worker_env, delegated_subagent_ctx):
-    """Even relying on the HERMES_KANBAN_TASK env default must not work —
-    the subagent's own env view is stripped, so no task_id resolves."""
-    from tools import kanban_tools as kt
-    out = kt._handle_complete({"summary": "implicit sneaky completion"})
-    d = json.loads(out)
-    assert d.get("ok") is not True
-    assert "delegated subagent" in d.get("error", "")
-
-
-def test_delegated_subagent_cannot_block_parent_task(worker_env, delegated_subagent_ctx):
-    from tools import kanban_tools as kt
-    out = kt._handle_block({"task_id": worker_env, "reason": "sneaky block"})
-    d = json.loads(out)
-    assert "delegated subagent" in d.get("error", "")
-
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        assert kb.get_task(conn, worker_env).status == "running"
-    finally:
-        conn.close()
-
-
-def test_delegated_subagent_cannot_heartbeat_parent_task(worker_env, delegated_subagent_ctx):
-    from tools import kanban_tools as kt
-    out = kt._handle_heartbeat({"task_id": worker_env})
-    d = json.loads(out)
-    assert "delegated subagent" in d.get("error", "")
-
-
-def test_delegated_subagent_cannot_comment_on_parent_task(worker_env, delegated_subagent_ctx):
-    """kanban_comment has no ownership check by policy (#19713 — see
-    test_worker_can_comment_on_foreign_task), so this guard is the ONLY
-    thing stopping a delegated subagent from writing into the board's
-    comment thread as if it were the worker."""
-    from tools import kanban_tools as kt
-    out = kt._handle_comment({"task_id": worker_env, "body": "sneaky comment"})
-    d = json.loads(out)
-    assert d.get("ok") is not True
-    assert "delegated subagent" in d.get("error", "")
-
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        assert kb.list_comments(conn, worker_env) == []
-    finally:
-        conn.close()
-
-
-def test_delegated_subagent_cannot_request_review_or_decide(worker_env, delegated_subagent_ctx):
-    from tools import kanban_tools as kt
-    out = kt._handle_request_review(
-        {"task_id": worker_env, "reviewer": "peer", "summary": "sneaky handoff"}
-    )
-    assert "delegated subagent" in json.loads(out).get("error", "")
-
-    out = kt._handle_review_decide(
-        {"task_id": worker_env, "decision": "APPROVE", "summary": "sneaky decision"}
-    )
-    assert "delegated subagent" in json.loads(out).get("error", "")
-
-
-def test_delegated_subagent_cannot_unblock(monkeypatch, delegated_subagent_ctx):
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        other = kb.create_task(conn, title="blocked task", assignee="peer")
-        kb.block_task(conn, other, reason="waiting")
-    finally:
-        conn.close()
-
-    from tools import kanban_tools as kt
-    out = kt._handle_unblock({"task_id": other})
-    d = json.loads(out)
-    assert "delegated subagent" in d.get("error", "")
-
-    conn = kb.connect()
-    try:
-        assert kb.get_task(conn, other).status == "blocked"
-    finally:
-        conn.close()
-
-
-def test_delegated_subagent_default_task_id_hidden(worker_env, delegated_subagent_ctx):
-    """``_default_task_id`` must not silently resolve to the parent's real
-    task id for a delegated subagent, even outside a specific handler."""
-    from tools import kanban_tools as kt
-    assert kt._default_task_id(None) is None
-    # Explicit task_id argument still passes through untouched — the strip
-    # only affects the *env fallback*, not caller-supplied ids.
-    assert kt._default_task_id("t_explicit") == "t_explicit"
-
-
-def test_delegated_subagent_auto_heartbeat_bridge_is_noop(worker_env, delegated_subagent_ctx):
-    """The AIAgent._touch_activity -> heartbeat bridge must not silently
-    extend the PARENT's claim just because the subagent thread is busy."""
-    from tools import kanban_tools as kt
-    from hermes_cli import kanban_db as kb
-
-    # Force past the module-level rate limiter so a False return is
-    # attributable to the delegated-subagent guard, not to an unrelated
-    # 60s cooldown from a previous test/call in this process.
-    kt._auto_heartbeat_last_attempt = 0.0
-
-    conn = kb.connect()
-    try:
-        before = kb.get_task(conn, worker_env)
-    finally:
-        conn.close()
-
-    assert kt.heartbeat_current_worker_from_env() is False
-
-    conn = kb.connect()
-    try:
-        after = kb.get_task(conn, worker_env)
-    finally:
-        conn.close()
-    assert after.status == before.status == "running"
-
-
 def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     """A retried worker cannot complete the task using an old run token."""
     from hermes_cli import kanban_db as kb
@@ -2420,7 +2128,7 @@ def test_board_param_rejects_invalid_slug(multi_board_env):
 
 
 def test_board_param_in_all_schemas():
-    """All nine kanban_* tool schemas must expose an optional ``board``
+    """Every kanban_* tool schema must expose an optional ``board``
     parameter. This pins the contract surfaced to the LLM — adding a
     new kanban tool without ``board`` will fail CI immediately."""
     from tools import kanban_tools as kt
@@ -2435,6 +2143,9 @@ def test_board_param_in_all_schemas():
         kt.KANBAN_CREATE_SCHEMA,
         kt.KANBAN_UNBLOCK_SCHEMA,
         kt.KANBAN_LINK_SCHEMA,
+        kt.KANBAN_ATTACH_SCHEMA,
+        kt.KANBAN_ATTACH_URL_SCHEMA,
+        kt.KANBAN_ATTACHMENTS_SCHEMA,
     ]
     for schema in schemas:
         props = schema["parameters"]["properties"]
@@ -2639,8 +2350,741 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 
 
 # ---------------------------------------------------------------------------
-# S4d: needs_input human-gate enforcement at the tool layer (Audit 2026-07-10)
+# Attachments — kanban_attach / kanban_attach_url / kanban_attachments
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def allow_private_urls(monkeypatch):
+    """Opt the SSRF guard into private/loopback targets for local fixtures.
+
+    Mirrors a user setting HERMES_ALLOW_PRIVATE_URLS on a private network.
+    Resets the url_safety process-lifetime cache on both sides so the
+    override neither leaks in nor out of the test.
+    """
+    from tools import url_safety
+
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+    url_safety._reset_allow_private_cache()
+    yield
+    url_safety._reset_allow_private_cache()
+
+
+def test_attach_roundtrips_bytes_to_row_and_disk(worker_env):
+    """kanban_attach decodes base64, writes the blob, and records the row."""
+    import base64
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    content = b"hello attachment from a tool"
+    out = kt._handle_attach({
+        "filename": "notes.txt",
+        "content_base64": base64.b64encode(content).decode(),
+        "content_type": "text/plain",
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+    assert d["size"] == len(content)
+    att_id = d["attachment_id"]
+
+    conn = kb.connect()
+    try:
+        atts = kb.list_attachments(conn, worker_env)
+        assert [a.filename for a in atts] == ["notes.txt"]
+        a = atts[0]
+        assert a.id == att_id
+        assert a.content_type == "text/plain"
+        assert a.uploaded_by == "agent"
+        # Blob is on disk under the task's attachments dir with the bytes.
+        assert Path(a.stored_path).read_bytes() == content
+        assert Path(a.stored_path).resolve().is_relative_to(
+            kb.task_attachments_dir(worker_env).resolve()
+        )
+    finally:
+        conn.close()
+
+
+def test_attach_rejects_oversize(worker_env, monkeypatch):
+    """A decoded payload over the cap returns a clean tool error, no row."""
+    import base64
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # Shrink the cap so we don't have to build a 25 MB payload.
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 8)
+    out = kt._handle_attach({
+        "filename": "big.bin",
+        "content_base64": base64.b64encode(b"0123456789").decode(),
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "MB limit" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_rejects_bad_base64(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_attach({"filename": "x.txt", "content_base64": "not base64!!!"})
+    d = json.loads(out)
+    assert "error" in d and "base64" in d["error"]
+
+
+def test_attach_requires_filename_and_content(worker_env):
+    from tools import kanban_tools as kt
+
+    assert "error" in json.loads(kt._handle_attach({"content_base64": "QQ=="}))
+    assert "error" in json.loads(kt._handle_attach({"filename": "x.txt"}))
+
+
+def test_attach_enforces_worker_task_ownership(worker_env):
+    """A worker scoped to its own task can't attach to a foreign task."""
+    import base64
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="someone else's task", assignee="peer")
+    finally:
+        conn.close()
+
+    out = kt._handle_attach({
+        "task_id": other,
+        "filename": "x.txt",
+        "content_base64": base64.b64encode(b"x").decode(),
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "scoped to task" in d["error"]
+
+
+def test_attachments_lists_uploaded_files(worker_env):
+    import base64
+
+    from tools import kanban_tools as kt
+
+    kt._handle_attach({
+        "filename": "a.txt",
+        "content_base64": base64.b64encode(b"aaa").decode(),
+    })
+    kt._handle_attach({
+        "filename": "b.txt",
+        "content_base64": base64.b64encode(b"bbbb").decode(),
+    })
+    out = kt._handle_attachments({})
+    d = json.loads(out)
+    assert d.get("ok") is True
+    names = sorted(a["filename"] for a in d["attachments"])
+    assert names == ["a.txt", "b.txt"]
+    sizes = {a["filename"]: a["size"] for a in d["attachments"]}
+    assert sizes == {"a.txt": 3, "b.txt": 4}
+
+
+def test_attachments_unknown_task_errors(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_attachments({"task_id": "t_nope"})
+    assert "error" in json.loads(out)
+
+
+def test_attach_url_fetches_local_fixture(worker_env, allow_private_urls):
+    """kanban_attach_url downloads from an http(s) URL and stores the bytes.
+
+    The fixture server lives on loopback, which the SSRF guard blocks by
+    default — opted in via the allow_private_urls fixture exactly like a
+    user on a private network would.
+    """
+    import http.server
+    import threading
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    payload = b"downloaded-by-url body"
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):  # silence
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        out = kt._handle_attach_url({
+            "url": f"http://127.0.0.1:{port}/files/report.bin",
+        })
+    finally:
+        srv.shutdown()
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+    assert d["size"] == len(payload)
+
+    conn = kb.connect()
+    try:
+        atts = kb.list_attachments(conn, worker_env)
+        # Filename derived from the URL path leaf.
+        assert atts[0].filename == "report.bin"
+        assert Path(atts[0].stored_path).read_bytes() == payload
+    finally:
+        conn.close()
+
+
+def test_attach_url_rejects_oversize_stream(worker_env, monkeypatch, allow_private_urls):
+    """An oversize response body is rejected during download, no row written."""
+    import http.server
+    import threading
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    big = b"x" * (64 * 1024)
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(big)))
+            self.end_headers()
+            self.wfile.write(big)
+
+        def log_message(self, *a):
+            pass
+
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1024)
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        port = srv.server_address[1]
+        out = kt._handle_attach_url({"url": f"http://127.0.0.1:{port}/big.bin"})
+    finally:
+        srv.shutdown()
+    d = json.loads(out)
+    assert "error" in d
+    assert "MB limit" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_url_rejects_non_http_scheme(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_attach_url({"url": "file:///etc/passwd"})
+    d = json.loads(out)
+    assert "error" in d
+    assert "scheme" in d["error"]
+
+
+# ---------------------------------------------------------------------------
+# kanban_attach_url — SSRF guard (tools/url_safety.is_safe_url per hop)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def default_url_guard(monkeypatch):
+    """Force the SSRF guard to its secure default for this test.
+
+    Clears HERMES_ALLOW_PRIVATE_URLS and resets url_safety's process-lifetime
+    cache on both sides so a prior test's opt-in can't leak in.
+    """
+    from tools import url_safety
+
+    monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
+    url_safety._reset_allow_private_cache()
+    yield
+    url_safety._reset_allow_private_cache()
+
+
+def _assert_attach_url_blocked(worker_env, url):
+    """Call kanban_attach_url with ``url`` and assert the SSRF guard fired
+    (clean tool error, no attachment row, no network fetch needed)."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_attach_url({"url": url})
+    d = json.loads(out)
+    assert "error" in d, out
+    assert "SSRF" in d["error"] or "blocked" in d["error"].lower(), out
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_url_blocks_loopback(worker_env, default_url_guard):
+    """http://127.0.0.1/ is rejected before any connection is made."""
+    _assert_attach_url_blocked(worker_env, "http://127.0.0.1/")
+
+
+def test_attach_url_blocks_cloud_metadata(worker_env, default_url_guard):
+    """The cloud metadata endpoint is rejected — the #1 SSRF target."""
+    _assert_attach_url_blocked(
+        worker_env, "http://169.254.169.254/latest/meta-data/"
+    )
+
+
+def test_attach_url_blocks_private_range(worker_env, default_url_guard):
+    """RFC1918 addresses (http://10.0.0.1/) are rejected."""
+    _assert_attach_url_blocked(worker_env, "http://10.0.0.1/")
+
+
+def _fake_public_dns(monkeypatch, mapping):
+    """Patch url_safety's getaddrinfo so hostnames in ``mapping`` resolve to
+    the given (public) IPs and literal IPs resolve to themselves — no real
+    DNS or network traffic."""
+    import ipaddress
+    import socket as _socket
+
+    real_af, real_sock = _socket.AF_INET, _socket.SOCK_STREAM
+
+    def fake_getaddrinfo(host, *args, **kwargs):
+        ip = mapping.get(host)
+        if ip is None:
+            # Literal IPs pass through; unknown hostnames fail like NXDOMAIN.
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                raise _socket.gaierror(f"fake DNS: unknown host {host!r}")
+            ip = host
+        return [(real_af, real_sock, 6, "", (ip, 0))]
+
+    from tools import url_safety
+    monkeypatch.setattr(url_safety.socket, "getaddrinfo", fake_getaddrinfo)
+
+
+class _FakeStreamResponse:
+    def __init__(self, *, status_code=200, headers=None, body=b""):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._body = body
+
+    @property
+    def is_redirect(self):
+        return 300 <= self.status_code < 400 and "location" in {
+            k.lower() for k in self.headers
+        }
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def iter_bytes(self, chunk_size):
+        for i in range(0, len(self._body), chunk_size):
+            yield self._body[i:i + chunk_size]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_attach_url_blocks_redirect_to_loopback(worker_env, default_url_guard, monkeypatch):
+    """A public host 302ing to loopback is caught on the redirect hop.
+
+    The pre-flight check passes (public IP), then the mocked response
+    redirects to http://127.0.0.1/ — the guard must re-validate the
+    Location target and refuse to follow it.
+    """
+    import httpx
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _fake_public_dns(monkeypatch, {"files.example.com": "93.184.216.34"})
+
+    requested = []
+
+    def fake_stream(method, url, **kwargs):
+        requested.append(url)
+        assert kwargs.get("follow_redirects") is False
+        return _FakeStreamResponse(
+            status_code=302,
+            headers={"location": "http://127.0.0.1/latest/secrets"},
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    out = kt._handle_attach_url({"url": "http://files.example.com/report.pdf"})
+    d = json.loads(out)
+    assert "error" in d, out
+    assert "127.0.0.1" in d["error"], out
+    # Only the public hop was ever fetched; the loopback target never was.
+    assert requested == ["http://files.example.com/report.pdf"]
+
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkeypatch):
+    """A public URL passes the guard and the bytes are stored (mocked fetch)."""
+    from pathlib import Path
+
+    import httpx
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    _fake_public_dns(monkeypatch, {"files.example.com": "93.184.216.34"})
+
+    payload = b"public fetch body"
+
+    def fake_stream(method, url, **kwargs):
+        assert url == "http://files.example.com/docs/spec.pdf"
+        return _FakeStreamResponse(
+            status_code=200,
+            headers={"content-type": "application/pdf; charset=binary"},
+            body=payload,
+        )
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+    out = kt._handle_attach_url({"url": "http://files.example.com/docs/spec.pdf"})
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+    assert d["size"] == len(payload)
+
+    conn = kb.connect()
+    try:
+        atts = kb.list_attachments(conn, worker_env)
+        assert [a.filename for a in atts] == ["spec.pdf"]
+        assert atts[0].content_type == "application/pdf"
+        assert Path(atts[0].stored_path).read_bytes() == payload
+    finally:
+        conn.close()
+
+
+def test_kanban_block_schema_exposes_human_guidance():
+    from tools.kanban_tools import KANBAN_BLOCK_SCHEMA
+
+    props = KANBAN_BLOCK_SCHEMA["parameters"]["properties"]
+    assert "human_summary" in props
+    assert "human_action" in props
+
+
+def test_complete_refusal_names_open_review_handshake(worker_env):
+    """A silent complete_task refusal must tell the worker WHY (K-3b,
+    Vollaudit 2026-07-16): an unmatched review_requested event left only the
+    catch-all "unknown id or already terminal" although the card was alive
+    and running — the worker had no way to see the open handshake and
+    block-looped for hours (live case t_5a43abe1, runs 664–671)."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, worker_env, "review_requested",
+                {"reviewer": "reviewer", "summary": "handshake left open"},
+            )
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "work is done"})
+    d = json.loads(out)
+    err = d.get("error", "")
+    assert "review" in err.lower(), err
+    assert "unknown id or already terminal" not in err, err
+
+
+def test_complete_refusal_names_terminal_status(worker_env):
+    """Completing an actually-terminal card must say so specifically."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(
+            conn, worker_env,
+            expected_run_id=kb.get_task(conn, worker_env).current_run_id,
+        )
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "again"})
+    d = json.loads(out)
+    err = d.get("error", "")
+    assert "terminal" in err.lower(), err
+    assert "status=done" in err, err
+
+
+def test_request_review_and_accept_handlers(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    requested = json.loads(kt._handle_request_review({
+        "reviewer": "reviewer",
+        "summary": "implementation with tests",
+        "metadata": {"tests": ["pytest -q"]},
+    }))
+    assert requested["ok"] is True
+    assert requested["status"] == "review"
+
+    with kb.connect() as conn:
+        review = kb.claim_review_task(conn, worker_env)
+        assert review is not None
+        review_run_id = review.current_run_id
+    assert review_run_id is not None
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review_run_id))
+
+    decided = json.loads(kt._handle_review_decide({
+        "decision": "ACCEPT",
+        "summary": "ACCEPT: diff and tests verified",
+        "metadata": {"checks": ["git diff --check"]},
+    }))
+    assert decided["ok"] is True
+    assert decided["decision"] == "ACCEPT"
+    assert decided["status"] == "done"
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "done"
+        assert task.assignee == "test-worker"
+        assert kb.latest_run(conn, worker_env).outcome == "accept"
+
+
+def test_review_decide_handler_rejects_stale_run(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    assert json.loads(kt._handle_request_review({
+        "reviewer": "reviewer",
+        "summary": "implementation handoff",
+    }))["ok"] is True
+    with kb.connect() as conn:
+        review = kb.claim_review_task(conn, worker_env)
+        assert review is not None and review.current_run_id is not None
+        run_id = review.current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(int(run_id) + 1))
+    out = json.loads(kt._handle_review_decide({
+        "decision": "ACCEPT",
+        "summary": "stale review",
+    }))
+    assert "stale run" in out["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_block_requires_human_fields_for_human_facing_kinds(worker_env):
+    """Blocks that surface to a human must carry the layman summary+action;
+    without them the tool errors and the task stays untouched (2026-07-11
+    layman-notification contract)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    for args in (
+        {"reason": "stuck"},
+        {"reason": "stuck", "kind": "needs_input"},
+        {"reason": "stuck", "kind": "needs_input", "human_summary": "Nur Summary."},
+        {"reason": "stuck", "kind": "needs_input", "human_action": "Nur Action."},
+    ):
+        d = json.loads(kt._handle_block(args))
+        assert "human_summary" in d.get("error", ""), args
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_dependency_kind_exempt_from_human_fields(worker_env):
+    """kind='dependency' never reaches a human — no layman fields needed."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_block({"reason": "waiting on t_x", "kind": "dependency"})
+    assert json.loads(out).get("ok") is True
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "todo"
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def delegated_subagent_ctx():
+    """Mark the current test like a delegate_task subagent's run thread.
+
+    Mirrors what ``tools.delegate_tool._run_single_child`` does inside
+    ``_run_with_thread_capture`` right before ``child.run_conversation``.
+    Reset in a finally block so the contextvars.ContextVar doesn't leak into
+    unrelated tests sharing this worker's default Context.
+    """
+    from tools import kanban_tools as kt
+
+    kt.mark_delegated_subagent_context()
+    try:
+        yield
+    finally:
+        kt._delegated_subagent_ctx.set(False)
+
+
+def test_delegated_subagent_context_defaults_false():
+    """A normal call site (no marking) must never look like a subagent."""
+    from tools import kanban_tools as kt
+    assert kt._is_delegated_subagent() is False
+
+
+def test_delegated_subagent_cannot_complete_parent_task(worker_env, delegated_subagent_ctx):
+    """A subagent that echoes the parent's own task_id must still be refused
+    — the guard is unconditional, not an ownership *mismatch* check."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"task_id": worker_env, "summary": "sneaky completion"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "delegated subagent" in d.get("error", "")
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_delegated_subagent_cannot_complete_without_task_id(worker_env, delegated_subagent_ctx):
+    """Even relying on the HERMES_KANBAN_TASK env default must not work —
+    the subagent's own env view is stripped, so no task_id resolves."""
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "implicit sneaky completion"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "delegated subagent" in d.get("error", "")
+
+
+def test_delegated_subagent_cannot_block_parent_task(worker_env, delegated_subagent_ctx):
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"task_id": worker_env, "reason": "sneaky block"})
+    d = json.loads(out)
+    assert "delegated subagent" in d.get("error", "")
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_delegated_subagent_cannot_heartbeat_parent_task(worker_env, delegated_subagent_ctx):
+    from tools import kanban_tools as kt
+    out = kt._handle_heartbeat({"task_id": worker_env})
+    d = json.loads(out)
+    assert "delegated subagent" in d.get("error", "")
+
+
+def test_delegated_subagent_cannot_comment_on_parent_task(worker_env, delegated_subagent_ctx):
+    """kanban_comment has no ownership check by policy (#19713 — see
+    test_worker_can_comment_on_foreign_task), so this guard is the ONLY
+    thing stopping a delegated subagent from writing into the board's
+    comment thread as if it were the worker."""
+    from tools import kanban_tools as kt
+    out = kt._handle_comment({"task_id": worker_env, "body": "sneaky comment"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "delegated subagent" in d.get("error", "")
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.list_comments(conn, worker_env) == []
+    finally:
+        conn.close()
+
+
+def test_delegated_subagent_cannot_request_review_or_decide(worker_env, delegated_subagent_ctx):
+    from tools import kanban_tools as kt
+    out = kt._handle_request_review(
+        {"task_id": worker_env, "reviewer": "peer", "summary": "sneaky handoff"}
+    )
+    assert "delegated subagent" in json.loads(out).get("error", "")
+
+    out = kt._handle_review_decide(
+        {"task_id": worker_env, "decision": "APPROVE", "summary": "sneaky decision"}
+    )
+    assert "delegated subagent" in json.loads(out).get("error", "")
+
+
+def test_delegated_subagent_cannot_unblock(monkeypatch, delegated_subagent_ctx):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="blocked task", assignee="peer")
+        kb.block_task(conn, other, reason="waiting")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_unblock({"task_id": other})
+    d = json.loads(out)
+    assert "delegated subagent" in d.get("error", "")
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_delegated_subagent_default_task_id_hidden(worker_env, delegated_subagent_ctx):
+    """``_default_task_id`` must not silently resolve to the parent's real
+    task id for a delegated subagent, even outside a specific handler."""
+    from tools import kanban_tools as kt
+    assert kt._default_task_id(None) is None
+    # Explicit task_id argument still passes through untouched — the strip
+    # only affects the *env fallback*, not caller-supplied ids.
+    assert kt._default_task_id("t_explicit") == "t_explicit"
+
+
+def test_delegated_subagent_auto_heartbeat_bridge_is_noop(worker_env, delegated_subagent_ctx):
+    """The AIAgent._touch_activity -> heartbeat bridge must not silently
+    extend the PARENT's claim just because the subagent thread is busy."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    # Force past the module-level rate limiter so a False return is
+    # attributable to the delegated-subagent guard, not to an unrelated
+    # 60s cooldown from a previous test/call in this process.
+    kt._auto_heartbeat_last_attempt = 0.0
+
+    conn = kb.connect()
+    try:
+        before = kb.get_task(conn, worker_env)
+    finally:
+        conn.close()
+
+    assert kt.heartbeat_current_worker_from_env() is False
+
+    conn = kb.connect()
+    try:
+        after = kb.get_task(conn, worker_env)
+    finally:
+        conn.close()
+    assert after.status == before.status == "running"
+
 
 def test_complete_tool_refuses_needs_input_blocked(worker_env):
     """An agent must not complete a needs_input-blocked card — that block is
@@ -2791,33 +3235,3 @@ def test_create_tool_passes_task_class_and_max_retries(monkeypatch, worker_env):
         assert int(row["max_retries"]) == 4
     finally:
         conn.close()
-
-
-def test_complete_missing_scratch_artifact_stays_in_flight(worker_env):
-    """A false deliverable claim must return retry guidance, not mark Done."""
-    from hermes_cli import kanban_db as kb
-    from tools import kanban_tools as kt
-
-    with kb.connect() as conn:
-        task = kb.get_task(conn, worker_env)
-        assert task is not None
-        workspace = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, worker_env, workspace)
-
-    output = kt._handle_complete({
-        "summary": "report complete",
-        "artifacts": [str(workspace / "missing-report.md")],
-    })
-    result = json.loads(output)
-
-    # Choice A (2026-07-14 merge): our completion-artifact EVIDENCE validation runs
-    # BEFORE the write txn and fails closed on a non-existent deliverable — it
-    # pre-empts upstream's ArtifactPreservationError for the missing case. Either
-    # way the task stays in-flight (no state change) and the worker may retry.
-    assert result.get("success") is False
-    assert result.get("state_changed") is False
-    assert result.get("retryable") is True
-    assert "does not exist" in result.get("error", "")
-    with kb.connect() as conn:
-        assert kb.get_task(conn, worker_env).status == "running"
-    assert workspace.exists()

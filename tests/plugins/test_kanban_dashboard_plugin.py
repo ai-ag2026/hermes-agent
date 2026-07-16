@@ -2591,13 +2591,10 @@ def _patch_specifier_response(monkeypatch, *, content, model="test-model"):
     resp = MagicMock()
     resp.choices = [MagicMock()]
     resp.choices[0].message.content = content
-    fake_client = MagicMock()
-    fake_client.chat.completions.create = MagicMock(return_value=resp)
-    monkeypatch.setattr(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        lambda *a, **kw: (fake_client, model),
-    )
-    return fake_client
+    # specify_task routes through call_llm now (#35566) — mock it directly.
+    fake_call = MagicMock(return_value=resp)
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call)
+    return fake_call
 
 
 def test_specify_happy_path(client, monkeypatch):
@@ -2659,11 +2656,11 @@ def test_specify_no_aux_client_surfaces_reason(client, monkeypatch):
         json={"title": "rough", "triage": True},
     ).json()["task"]
 
-    # Simulate "no auxiliary client configured".
-    monkeypatch.setattr(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        lambda *a, **kw: (None, ""),
-    )
+    # Simulate "no auxiliary client configured" — call_llm raises when
+    # no provider resolves (#35566 routing).
+    def _no_provider(**kwargs):
+        raise RuntimeError("No LLM provider configured")
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", _no_provider)
 
     r = client.post(
         f"/api/plugins/kanban/tasks/{t['id']}/specify",
@@ -2672,7 +2669,8 @@ def test_specify_no_aux_client_surfaces_reason(client, monkeypatch):
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is False
-    assert "auxiliary client" in body["reason"]
+    # call_llm's no-provider RuntimeError surfaces via the LLM-error branch.
+    assert "LLM error" in body["reason"]
 
     # Task must stay in triage — nothing was touched.
     detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["task"]

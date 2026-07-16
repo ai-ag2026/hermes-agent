@@ -316,22 +316,18 @@ def decompose_task(
     roster, valid_names = _build_roster()
 
     try:
-        from agent.auxiliary_client import (  # type: ignore
-            get_auxiliary_extra_body,
-            get_text_auxiliary_client,
-        )
+        from agent.auxiliary_client import call_llm  # type: ignore
     except Exception as exc:
         logger.debug("decompose: auxiliary client import failed: %s", exc)
         return DecomposeOutcome(task_id, False, "auxiliary client unavailable")
 
-    # Class-specific planner routing (convention-based, no new config schema):
+    # local(tars) Class-specific planner routing (Quality-Class-Routing,
+    # 2026-07-09), re-expressed over upstream's call_llm refactor (#35566):
     # a task tagged ``task_class=X`` uses the auxiliary role
-    # ``kanban_decomposer_<x>`` IFF that role is configured; otherwise it
-    # falls back to the default ``kanban_decomposer``. The existence check is
-    # essential — passing an unconfigured role name to the aux resolver would
-    # route to "auto" (main model), not to the default decomposer. This lets
-    # e.g. the hardest epics plan on Fable via ``auxiliary.kanban_decomposer_hard``
-    # while everything else keeps its current (cheaper) decomposer untouched.
+    # ``kanban_decomposer_<x>`` IFF that role is configured; otherwise the
+    # default ``kanban_decomposer``. The existence check is essential —
+    # passing an unconfigured role name to call_llm would route to "auto"
+    # (main model), not to the default decomposer.
     decomposer_role = "kanban_decomposer"
     if task.task_class:
         candidate = "kanban_decomposer_" + task.task_class.strip().lower()
@@ -343,32 +339,6 @@ def decompose_task(
                 task.id, task.task_class, decomposer_role,
             )
 
-    def _resolve_client(role: str):
-        try:
-            c, m = get_text_auxiliary_client(role)
-        except Exception as exc:
-            logger.debug("decompose: get_text_auxiliary_client(%r) failed: %s", role, exc)
-            return None, None
-        return c, m
-
-    client, model = _resolve_client(decomposer_role)
-    # Runtime fallback: if the class-specific planner role can't be resolved
-    # (e.g. its provider's quota is exhausted or the endpoint is down), fall
-    # back to the default decomposer before giving up. Without this a
-    # ``class=hard`` task is MORE fragile than an unclassified one — the exact
-    # opposite of the intent — because it depends on a single scarcer model.
-    if (client is None or not model) and decomposer_role != "kanban_decomposer":
-        logger.warning(
-            "decompose: class planner role %r unavailable for task %s; "
-            "falling back to default decomposer",
-            decomposer_role, task.id,
-        )
-        decomposer_role = "kanban_decomposer"
-        client, model = _resolve_client(decomposer_role)
-
-    if client is None or not model:
-        return DecomposeOutcome(task_id, False, "no auxiliary client configured")
-
     user_msg = _USER_TEMPLATE.format(
         task_id=task.id,
         title=_truncate(task.title or "", 400),
@@ -377,9 +347,13 @@ def decompose_task(
         default_assignee=default_assignee,
     )
 
-    try:
-        resp = client.chat.completions.create(
-            model=model,
+    def _call_decomposer(role: str):
+        # Route through call_llm so auxiliary.<role>.* config
+        # (provider/model/base_url, extra_body, reasoning_effort, retries)
+        # all apply — the previous direct client.chat.completions.create()
+        # path dropped auxiliary.<task>.extra_body entirely (#35566).
+        return call_llm(
+            task=role,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -387,13 +361,34 @@ def decompose_task(
             temperature=0.3,
             max_tokens=4000,
             timeout=timeout or 180,
-            extra_body=get_auxiliary_extra_body() or None,
         )
+
+    try:
+        resp = _call_decomposer(decomposer_role)
     except Exception as exc:
-        logger.info(
-            "decompose: API call failed for %s (%s)", task_id, exc,
-        )
-        return DecomposeOutcome(task_id, False, f"LLM error: {type(exc).__name__}")
+        # local(tars) runtime fallback: a failing class-specific planner
+        # (quota gone, endpoint down) must not make ``class=hard`` tasks MORE
+        # fragile than unclassified ones — retry once on the default role.
+        if decomposer_role != "kanban_decomposer":
+            logger.warning(
+                "decompose: class planner role %r failed for %s (%s); "
+                "falling back to default decomposer",
+                decomposer_role, task_id, exc,
+            )
+            try:
+                resp = _call_decomposer("kanban_decomposer")
+            except Exception as exc2:
+                logger.info(
+                    "decompose: API call failed for %s (%s)", task_id, exc2,
+                )
+                return DecomposeOutcome(
+                    task_id, False, f"LLM error: {type(exc2).__name__}"
+                )
+        else:
+            logger.info(
+                "decompose: API call failed for %s (%s)", task_id, exc,
+            )
+            return DecomposeOutcome(task_id, False, f"LLM error: {type(exc).__name__}")
 
     try:
         raw = resp.choices[0].message.content or ""

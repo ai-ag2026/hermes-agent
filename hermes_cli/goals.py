@@ -892,19 +892,10 @@ def judge_goal(
         return "continue", "empty response (nothing to evaluate)", False, None
 
     try:
-        from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
+        from agent.auxiliary_client import call_llm
     except Exception as exc:
         logger.debug("goal judge: auxiliary client import failed: %s", exc)
         return "continue", "auxiliary client unavailable", False, None
-
-    try:
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception as exc:
-        logger.debug("goal judge: get_text_auxiliary_client failed: %s", exc)
-        return "continue", "auxiliary client unavailable", False, None
-
-    if client is None or not model:
-        return "continue", "no auxiliary client configured", False, None
 
     # Build the prompt. Priority: contract > subgoals > plain. When both a
     # contract and subgoals exist, the subgoals are appended into the
@@ -949,8 +940,11 @@ def judge_goal(
         )
 
     try:
-        resp = client.chat.completions.create(
-            model=model,
+        # Route through call_llm so auxiliary.goal_judge.* config
+        # (provider/model/base_url, extra_body, reasoning_effort, retries)
+        # all apply — the direct-create path dropped extra_body (#35566).
+        resp = call_llm(
+            task="goal_judge",
             messages=[
                 {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
@@ -958,7 +952,6 @@ def judge_goal(
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
             timeout=timeout,
-            extra_body=get_auxiliary_extra_body() or None,
         )
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
@@ -1013,23 +1006,15 @@ def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) ->
         return None
 
     try:
-        from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
+        from agent.auxiliary_client import call_llm
     except Exception as exc:
         logger.debug("goal draft: auxiliary client import failed: %s", exc)
         return None
 
     try:
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception as exc:
-        logger.debug("goal draft: get_text_auxiliary_client failed: %s", exc)
-        return None
-
-    if client is None or not model:
-        return None
-
-    try:
-        resp = client.chat.completions.create(
-            model=model,
+        # Route through call_llm — same #35566 fix as the judge call above.
+        resp = call_llm(
+            task="goal_judge",
             messages=[
                 {"role": "system", "content": DRAFT_CONTRACT_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Objective:\n{_truncate(objective, 4000)}"},
@@ -1037,7 +1022,6 @@ def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) ->
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
             timeout=timeout,
-            extra_body=get_auxiliary_extra_body() or None,
         )
     except Exception as exc:
         logger.info("goal draft: API call failed (%s)", exc)
