@@ -503,6 +503,17 @@ def _get_max_spawn_depth() -> int:
     return floored
 
 
+def _get_child_identity() -> str:
+    """Operator-defined identity preamble for child agents (see the
+    ``delegation.child_identity`` note in ``_build_child_system_prompt``).
+    Non-string / unset → "" (feature off)."""
+    cfg = _load_config()
+    val = cfg.get("child_identity", "")
+    if not isinstance(val, str):
+        return ""
+    return val.strip()
+
+
 def _get_orchestrator_enabled() -> bool:
     """Global kill switch for the orchestrator role.
 
@@ -675,11 +686,23 @@ def _build_child_system_prompt(
     The depth note is literal truth (grounded in the passed config) so
     the LLM doesn't confabulate nesting capabilities that don't exist.
     """
-    parts = [
+    parts = []
+    # local(tars) Persona B1 (Vollaudit 2026-07-16): optional operator-defined
+    # identity preamble. Without it, children of a personalized install run
+    # under the vendor-default self-image (prompt_builder DEFAULT_AGENT_IDENTITY
+    # via skip_context_files) — the instance's values never reach the very
+    # agents doing most of its thinking. Config: ``delegation.child_identity``
+    # (string). Default ""/unset = byte-identical upstream behavior. Kept to a
+    # short preamble on purpose: children stay focused task workers, they do
+    # NOT inherit the full SOUL (cache stability, role focus).
+    _identity = _get_child_identity()
+    if _identity:
+        parts.extend([_identity, ""])
+    parts.extend([
         "You are a focused subagent working on a specific delegated task.",
         "",
         f"YOUR TASK:\n{goal}",
-    ]
+    ])
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
     if workspace_path and str(workspace_path).strip():

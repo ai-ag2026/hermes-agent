@@ -140,6 +140,34 @@ class TestDelegateRequirements(unittest.TestCase):
 
 
 class TestChildSystemPrompt(unittest.TestCase):
+    def test_child_identity_prepended_when_configured(self):
+        """delegation.child_identity leads the child prompt (Persona B1,
+        Vollaudit 2026-07-16): without it every subagent thinks of itself
+        as the vendor-default assistant even on a heavily personalized
+        install — the scaling path carried 0% of the instance identity."""
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"child_identity": "Du bist ein Denkprozess von TARS."},
+        ):
+            prompt = _build_child_system_prompt("Fix the tests")
+        self.assertTrue(prompt.startswith("Du bist ein Denkprozess von TARS."))
+        self.assertIn("You are a focused subagent", prompt)
+        self.assertIn("YOUR TASK", prompt)
+
+    def test_child_identity_absent_by_default(self):
+        """No config key = byte-identical upstream behavior."""
+        with patch("tools.delegate_tool._load_config", return_value={}):
+            prompt = _build_child_system_prompt("Fix the tests")
+        self.assertTrue(prompt.startswith("You are a focused subagent"))
+
+    def test_child_identity_non_string_ignored(self):
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"child_identity": ["kein", "string"]},
+        ):
+            prompt = _build_child_system_prompt("Fix the tests")
+        self.assertTrue(prompt.startswith("You are a focused subagent"))
+
     def test_goal_only(self):
         prompt = _build_child_system_prompt("Fix the tests")
         self.assertIn("Fix the tests", prompt)
