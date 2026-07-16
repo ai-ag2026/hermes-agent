@@ -8817,11 +8817,14 @@ def _attention_cleanup_hook() -> None:
 def _upsert_exact_action_attention(conn: sqlite3.Connection, action_id: int, task_id: str, fingerprint: str, now: int) -> None:
     """Create/recover the one live projection without reusing terminal IDs."""
     action = conn.execute(
-        "SELECT attention_id FROM task_pending_actions WHERE id=? AND task_id=?",
+        "SELECT attention_id, summary FROM task_pending_actions WHERE id=? AND task_id=?",
         (int(action_id), task_id),
     ).fetchone()
     if action is None:
         return
+    # Mirror the action's stored operator summary (pattern description, no raw
+    # command text) into the public projection so the cockpit can explain WHY.
+    attn_summary = (action["summary"] or "").strip() or PENDING_ACTION_OPERATOR_SUMMARY
     historical_id = action["attention_id"]
     if historical_id is not None:
         # A live recovery must either restore precisely the historical opaque ID
@@ -8838,7 +8841,7 @@ def _upsert_exact_action_attention(conn: sqlite3.Connection, action_id: int, tas
         conn.execute(
             "INSERT INTO task_attentions (id, task_id, action_id, type, cause_fingerprint, summary, created_at) "
             "VALUES (?, ?, ?, 'exact_action', ?, ?, ?)",
-            (int(historical_id), task_id, int(action_id), fingerprint, PENDING_ACTION_OPERATOR_SUMMARY, now),
+            (int(historical_id), task_id, int(action_id), fingerprint, attn_summary, now),
         )
         return
     # A terminal row cannot be a source of authority for a fresh request.
@@ -8846,7 +8849,7 @@ def _upsert_exact_action_attention(conn: sqlite3.Connection, action_id: int, tas
     cur = conn.execute(
         "INSERT INTO task_attentions (task_id, action_id, type, cause_fingerprint, summary, created_at) "
         "VALUES (?, ?, 'exact_action', ?, ?, ?)",
-        (task_id, int(action_id), fingerprint, PENDING_ACTION_OPERATOR_SUMMARY, now),
+        (task_id, int(action_id), fingerprint, attn_summary, now),
     )
     if conn.execute(
         "UPDATE task_pending_actions SET attention_id=? WHERE id=? AND task_id=? AND attention_id IS NULL",
@@ -8950,6 +8953,20 @@ def record_pending_action_and_block(
         raise ValueError("pending action expiry must be in the future")
     command_hash = _pending_action_hash(command)
     mutation_kind = _pending_action_mutation_kind(command, mutation_kind)
+    # Operator-facing summary: keep the caller's *pattern description* (a static,
+    # already-redacted category string such as "recursive delete of home
+    # directory" from the approval layer) so the cockpit can say WHY the card is
+    # blocked. The raw command text itself is still never persisted — that
+    # invariant (no command/credential side channel in the durable DB) stands;
+    # only our own classifier wording is stored, whitespace-collapsed + capped.
+    # NOTE: the workspace path is deliberately NOT included — the redaction
+    # guard tests treat it as a secret surface (paths can carry user/project
+    # names). Card views expose the workspace through their own ACL'd field.
+    _desc = " ".join((summary or "").split())[:300]
+    display_summary = (
+        f"{PENDING_ACTION_OPERATOR_SUMMARY} Grund: {_desc} [{mutation_kind or 'terminal'}]"
+        if _desc else PENDING_ACTION_OPERATOR_SUMMARY
+    )
     fingerprint = _pending_action_fingerprint(
         board_identity=_pending_action_board_identity(conn), task_id=task_id, run_id=run_id,
         command_hash=command_hash, mutation_kind=mutation_kind, profile=profile, workspace=workspace,
@@ -8995,10 +9012,10 @@ def record_pending_action_and_block(
             else:
                 cur = conn.execute(
                     "INSERT INTO task_pending_actions (task_id, run_id, command_hash, fingerprint, mutation_kind, summary, profile, workspace, created_at, expires_at, state, version, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?)",
-                    (task_id, int(run_id), command_hash, fingerprint, mutation_kind, PENDING_ACTION_OPERATOR_SUMMARY, profile, workspace, now, int(expires_at), now),
+                    (task_id, int(run_id), command_hash, fingerprint, mutation_kind, display_summary, profile, workspace, now, int(expires_at), now),
                 )
                 action = _pending_action_from_row(conn.execute("SELECT * FROM task_pending_actions WHERE id=?", (int(cur.lastrowid),)).fetchone())
-                _append_event(conn, task_id, "terminal_approval_pending", {"action_id": action.id, "mutation_kind": mutation_kind, "summary": PENDING_ACTION_OPERATOR_SUMMARY, "expires_at": int(expires_at)}, run_id=int(run_id))
+                _append_event(conn, task_id, "terminal_approval_pending", {"action_id": action.id, "mutation_kind": mutation_kind, "summary": display_summary, "expires_at": int(expires_at)}, run_id=int(run_id))
             _upsert_exact_action_attention(conn, action.id, task_id, fingerprint, now)
             _pending_action_after_persist_hook()
             if conn.execute(
@@ -9929,10 +9946,11 @@ def resume_approved_action_retry(
         # task.  The worker will see the same public ID as an approved exact
         # action until it consumes the one-time grant.
         if conn.execute(
-            "UPDATE task_attentions SET type='exact_action', origin_run_id=NULL, summary=? "
+            "UPDATE task_attentions SET type='exact_action', origin_run_id=NULL, "
+            "summary=COALESCE(NULLIF((SELECT summary FROM task_pending_actions WHERE id=?),''), ?) "
             "WHERE id=? AND task_id=? AND action_id=? AND type IN ('capability','transient') "
             "AND version=? AND origin_run_id=?",
-            (PENDING_ACTION_OPERATOR_SUMMARY, int(attention["id"]), task_id, int(action["id"]),
+            (int(action["id"]), PENDING_ACTION_OPERATOR_SUMMARY, int(attention["id"]), task_id, int(action["id"]),
              int(expected_attention_version), int(expected_origin_run_id)),
         ).rowcount != 1:
             return ResumeApprovedActionRetryResult("conflict", task_id, attention_id=int(attention["id"]), attention_version=int(attention["version"]))

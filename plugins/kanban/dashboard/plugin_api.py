@@ -221,7 +221,15 @@ def _attention_dict(attention: Optional[kanban_db.Attention]) -> Optional[dict[s
         state = "approved-awaiting-worker" if approved else "pending"
         requires_human_action = False if approved else attention.requires_human_action
         approvable = False if approved else attention.approvable
-        summary = "Approved exact action is waiting for a worker." if approved else kanban_db.PENDING_ACTION_OPERATOR_SUMMARY
+        # Prefer the projection's stored operator summary (pattern description,
+        # never raw command text — see record_pending_action_and_block) so the
+        # cockpit can say WHY the card is blocked, not just that it is.
+        _stored = (getattr(attention, "summary", None) or "").strip()
+        summary = (
+            "Approved exact action is waiting for a worker."
+            if approved
+            else (_stored or kanban_db.PENDING_ACTION_OPERATOR_SUMMARY)
+        )
     else:
         # Typed technical/decision attention comes from Core's current projection.
         mutation_kind = None
