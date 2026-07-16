@@ -210,6 +210,69 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
     return env_tid or None
 
 
+def _completion_refusal_message(
+    kb, conn, task_id: str, *, expected_run_id: Optional[int]
+) -> str:
+    """Explain a bare-``False`` refusal from ``complete_task``.
+
+    The kernel refuses completion silently on several DISTINCT guards; the
+    old catch-all message ("unknown id or already terminal") sent workers
+    chasing the wrong cause. Live case (K-3b, Vollaudit 2026-07-16,
+    t_5a43abe1): an unmatched review_requested — the reviewer crash-looped
+    and never decided — blocked completion forever while the readback showed
+    a healthy running card; the worker block-looped for hours. Diagnosis
+    mirrors the guard ORDER in ``_complete_task_locked``; purely
+    read-only, best effort (falls back to a generic line)."""
+    try:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            return f"could not complete {task_id}: unknown task id"
+        if task.status not in {"running", "ready", "blocked"}:
+            return (
+                f"could not complete {task_id}: already terminal "
+                f"(status={task.status}); no further completion is needed"
+            )
+        if kb._pending_review_request(conn, task_id) is not None:
+            return (
+                f"could not complete {task_id}: an open review handshake "
+                "exists (review_requested without a review_decided). A card "
+                "with a pending first-class review can only reach done via "
+                "an explicit reviewer ACCEPT. Do NOT retry kanban_complete — "
+                "either hand back to review (kanban_request_review) so the "
+                "reviewer can decide, or ask the operator to resolve the "
+                "stale handshake."
+            )
+        if (
+            expected_run_id is not None
+            and task.current_run_id != int(expected_run_id)
+        ):
+            return (
+                f"could not complete {task_id}: run identity mismatch — this "
+                f"worker owns run {expected_run_id}, the card's current run "
+                f"is {task.current_run_id}. Another run superseded yours; "
+                "stop and let the current owner finish."
+            )
+        if conn.execute(
+            "SELECT 1 FROM task_pending_actions WHERE task_id = ? "
+            "AND state = 'pending' LIMIT 1",
+            (task_id,),
+        ).fetchone() is not None:
+            return (
+                f"could not complete {task_id}: a pending exact action awaits "
+                "operator approval; completion is only possible through the "
+                "approval path."
+            )
+    except Exception:
+        logger.warning(
+            "completion refusal diagnosis failed for %s", task_id,
+            exc_info=True,
+        )
+    return (
+        f"could not complete {task_id}: refused by a completion guard "
+        "(see the card's board events for the authoritative state)"
+    )
+
+
 def _worker_run_id(task_id: str) -> Optional[int]:
     """Return this worker's dispatcher run id when it is scoped to task_id."""
     if _board_env("HERMES_KANBAN_TASK") != task_id:
@@ -840,7 +903,9 @@ def _handle_complete(args: dict, **kw) -> str:
                 )
             if not ok:
                 return tool_error(
-                    f"could not complete {tid} (unknown id or already terminal)"
+                    _completion_refusal_message(
+                        kb, conn, tid, expected_run_id=_worker_run_id(tid)
+                    )
                 )
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)

@@ -309,6 +309,49 @@ def test_list_rejects_bad_include_archived(monkeypatch, worker_env):
     assert "include_archived must be" in json.loads(out).get("error", "")
 
 
+def test_complete_refusal_names_open_review_handshake(worker_env):
+    """A silent complete_task refusal must tell the worker WHY (K-3b,
+    Vollaudit 2026-07-16): an unmatched review_requested event left only the
+    catch-all "unknown id or already terminal" although the card was alive
+    and running — the worker had no way to see the open handshake and
+    block-looped for hours (live case t_5a43abe1, runs 664–671)."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, worker_env, "review_requested",
+                {"reviewer": "reviewer", "summary": "handshake left open"},
+            )
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "work is done"})
+    d = json.loads(out)
+    err = d.get("error", "")
+    assert "review" in err.lower(), err
+    assert "unknown id or already terminal" not in err, err
+
+
+def test_complete_refusal_names_terminal_status(worker_env):
+    """Completing an actually-terminal card must say so specifically."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(
+            conn, worker_env,
+            expected_run_id=kb.get_task(conn, worker_env).current_run_id,
+        )
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "again"})
+    d = json.loads(out)
+    err = d.get("error", "")
+    assert "terminal" in err.lower(), err
+    assert "status=done" in err, err
+
+
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({
