@@ -73,6 +73,12 @@ def _memory_blocks(agent: Any) -> Tuple[str, str]:
             memory_block = store.format_for_system_prompt("memory") or ""
         if getattr(agent, "_user_profile_enabled", True):
             user_block = store.format_for_system_prompt("user") or ""
+        # SELF.md (Persona B2) is real prompt weight — fold it into the memory
+        # total so /context accounting isn't short by the self-narrative block.
+        if getattr(agent, "_self_profile_enabled", False):
+            _self = store.format_for_system_prompt("self") or ""
+            if _self:
+                memory_block = (memory_block + "\n\n" + _self) if memory_block else _self
     except Exception:
         pass
     return memory_block, user_block

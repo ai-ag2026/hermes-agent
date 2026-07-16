@@ -92,6 +92,12 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
                 memory_block = store.format_for_system_prompt("memory") or ""
             if getattr(agent, "_user_profile_enabled", True):
                 user_block = store.format_for_system_prompt("user") or ""
+            # SELF.md (Persona B2): fold into memory total so the estimate
+            # isn't short by the self-narrative block.
+            if getattr(agent, "_self_profile_enabled", False):
+                _self = store.format_for_system_prompt("self") or ""
+                if _self:
+                    memory_block = (memory_block + "\n\n" + _self) if memory_block else _self
         except Exception:
             pass
 
