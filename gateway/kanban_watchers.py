@@ -189,6 +189,90 @@ def _log_shadow_warning(decision: BackpressureShadowDecision) -> None:
     )
 
 
+_DECOMPOSE_FAILED_EVENT = "decompose_attempt_failed"
+_DECOMPOSE_GAVE_UP_EVENT = "decompose_gave_up"
+
+
+def _resolve_decompose_max_attempts(load_config: Callable[[], Any]) -> int:
+    """Live-resolve ``kanban.decompose_max_attempts`` (0 = unbegrenzt).
+
+    K-10 (Vollaudit 2026-07-16): der Key stand in der Config, hatte aber
+    keinen Consumer — gescheiterte Triage-Karten wurden jeden Tick erneut
+    decomposed (Aux-LLM-Spend ohne Ende, keine Eskalation). Wie die anderen
+    auto-decompose-Flags pro Tick frisch gelesen; fail-safe auf 0
+    (verhaltensneutral), negative/kaputte Werte → 0.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return 0
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    try:
+        value = int(kcfg.get("decompose_max_attempts", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
+def _count_failed_decompose_attempts(kb_module: Any, task_id: str) -> int:
+    """Durable Zählung fehlgeschlagener Auto-Decompose-Versuche."""
+    conn = kb_module.connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?",
+            (task_id, _DECOMPOSE_FAILED_EVENT),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def _record_failed_decompose_attempt(
+    kb_module: Any, task_id: str, reason: str,
+) -> int:
+    """Fehlversuch als Event festhalten; liefert die neue Gesamtzahl."""
+    conn = kb_module.connect()
+    try:
+        with kb_module.write_txn(conn):
+            kb_module._append_event(
+                conn, task_id, _DECOMPOSE_FAILED_EVENT,
+                {"reason": (reason or "")[:300]},
+            )
+        row = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?",
+            (task_id, _DECOMPOSE_FAILED_EVENT),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def _record_decompose_gave_up_once(
+    kb_module: Any, task_id: str, *, attempts: int, limit: int,
+) -> bool:
+    """Einmaliges ``decompose_gave_up``-Event (idempotent). True = neu.
+
+    Die Karte bleibt in triage; den Human-Ping übernimmt der
+    Attention-Cron nach dem Grace-Fenster (Automation-first 2026-07-16).
+    """
+    conn = kb_module.connect()
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+            (task_id, _DECOMPOSE_GAVE_UP_EVENT),
+        ).fetchone()
+        if exists:
+            return False
+        with kb_module.write_txn(conn):
+            kb_module._append_event(
+                conn, task_id, _DECOMPOSE_GAVE_UP_EVENT,
+                {"attempts": attempts, "limit": limit},
+            )
+        return True
+    finally:
+        conn.close()
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -1633,6 +1717,8 @@ class GatewayKanbanWatchersMixin:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             attempted = 0
             successes = 0
+            # K-10: Versuchslimit pro Karte, live aus der Config (0 = aus).
+            max_attempts = _resolve_decompose_max_attempts(_load_config)
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
@@ -1663,6 +1749,22 @@ class GatewayKanbanWatchersMixin:
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break
+                        if max_attempts:
+                            prior = _count_failed_decompose_attempts(_kb, tid)
+                            if prior >= max_attempts:
+                                # Ausgeschöpft: nicht mehr retryen (kein
+                                # Aux-Spend, kein per-tick-Budget) — Karte
+                                # bleibt sichtbar in triage, Ping macht der
+                                # Attention-Cron nach dem Grace-Fenster.
+                                if _record_decompose_gave_up_once(
+                                    _kb, tid, attempts=prior, limit=max_attempts,
+                                ):
+                                    logger.warning(
+                                        "kanban auto-decompose [%s]: %s gave up "
+                                        "after %d failed attempts (limit %d)",
+                                        slug, tid, prior, max_attempts,
+                                    )
+                                continue
                         attempted += 1
                         try:
                             outcome = _decomp.decompose_task(
@@ -1673,6 +1775,10 @@ class GatewayKanbanWatchersMixin:
                                 "kanban auto-decompose: decompose_task crashed on %s",
                                 tid,
                             )
+                            if max_attempts:
+                                _record_failed_decompose_attempt(
+                                    _kb, tid, "decompose_task crashed",
+                                )
                             continue
                         if outcome.ok:
                             successes += 1
@@ -1693,6 +1799,10 @@ class GatewayKanbanWatchersMixin:
                                 "kanban auto-decompose [%s]: %s skipped: %s",
                                 slug, tid, outcome.reason,
                             )
+                            if max_attempts:
+                                _record_failed_decompose_attempt(
+                                    _kb, tid, outcome.reason or "not ok",
+                                )
                 finally:
                     if prev_env is None:
                         os.environ.pop("HERMES_KANBAN_BOARD", None)
