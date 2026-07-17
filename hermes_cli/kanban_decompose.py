@@ -273,8 +273,16 @@ def _resolve_default_assignee(cfg: dict) -> str:
 
     # Prefer the configured orchestrator (a real worker like 'pm') over the
     # active profile, which in the gateway/dispatcher runs under the 'default'
-    # (human-driven) home and would otherwise leak here.
+    # (human-driven) home and would otherwise leak here. Canonicalize before the
+    # HD-check (mirroring `explicit` above): a raw casing like 'Work' would
+    # otherwise slip past `_non_hd` and be returned, violating the NEVER-returns-
+    # human-driven guarantee.
     orchestrator = (kanban_cfg.get("orchestrator_profile") or "").strip()
+    if orchestrator:
+        try:
+            orchestrator = profiles_mod.normalize_profile_name(orchestrator)
+        except Exception:
+            orchestrator = orchestrator.lower()
     if _non_hd(orchestrator):
         try:
             if profiles_mod.profile_exists(orchestrator):

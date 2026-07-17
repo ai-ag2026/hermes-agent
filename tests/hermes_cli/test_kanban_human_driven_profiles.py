@@ -259,6 +259,35 @@ def test_resolve_default_assignee_never_human_driven(isolated_kanban_home, monke
     assert kd._resolve_default_assignee({"kanban": {"default_assignee": "work"}}) == "backend-eng"
 
 
+def test_mixed_case_orchestrator_profile_never_human_driven(isolated_kanban_home, monkeypatch):
+    """TARS re-review MEDIUM: a mixed-case ``orchestrator_profile`` like 'Work'
+    must be canonicalized before the HD-check in _resolve_default_assignee — a
+    raw 'Work' would otherwise slip past _non_hd and be returned, violating the
+    NEVER-returns-human-driven guarantee and stranding the child route."""
+    kb, _ = isolated_kanban_home
+    from hermes_cli import kanban_decompose as kd
+
+    class _P:
+        def __init__(self, name):
+            self.name = name
+            self.description = ""
+
+    monkeypatch.setattr(_LC, lambda: {"kanban": {"human_driven_profiles": ["default", "work"]}})
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        "hermes_cli.profiles.list_profiles",
+        lambda: [_P("default"), _P("work"), _P("backend-eng")],
+    )
+    # 'Work' / '  WORK  ' must NOT be returned; falls through to a non-hd worker.
+    assert kd._resolve_default_assignee({"kanban": {"orchestrator_profile": "Work"}}) == "backend-eng"
+    assert kd._resolve_default_assignee({"kanban": {"orchestrator_profile": "  WORK  "}}) == "backend-eng"
+    # A non-hd mixed-case orchestrator is still honored (canonicalized).
+    assert (
+        kd._resolve_default_assignee({"kanban": {"orchestrator_profile": "Backend-Eng"}}) == "backend-eng"
+    )
+
+
 def test_mixed_case_default_assignee_is_caught(isolated_kanban_home, monkeypatch):
     """A mixed-case default_assignee ('Work') is canonicalized and caught by
     the HD guard — must NOT slip past as raw 'Work' and auto-spawn (adversarial
