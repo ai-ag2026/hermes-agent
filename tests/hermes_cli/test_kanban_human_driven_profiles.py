@@ -292,6 +292,38 @@ def test_mixed_case_stored_assignee_is_skipped(isolated_kanban_home, monkeypatch
     assert wid not in [s[0] for s in res.spawned]
 
 
+def test_whitespace_caps_default_assignee_caught(isolated_kanban_home, monkeypatch):
+    """'  DEFAULT  ' (whitespace + caps) is normalized to 'default' and caught
+    by the HD guard (TARS explicitly asked for ' DEFAULT ' coverage)."""
+    kb, _ = isolated_kanban_home
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+    monkeypatch.setattr(_LC, lambda: {"kanban": {"human_driven_profiles": ["default", "work"]}})
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        tid = kb.create_task(conn, title="t1", assignee=None)
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False, default_assignee="  DEFAULT  ")
+    assert tid in res.skipped_unassigned
+    assert not res.auto_assigned_default and not res.spawned
+
+
+def test_non_hd_mixed_case_default_assignee_stored_canonical(isolated_kanban_home, monkeypatch):
+    """'nur kanonisch persistieren' (TARS): a NON-human-driven mixed-case
+    default_assignee is canonicalized before storage — the auto-assigned row
+    gets 'backend-eng', never the raw 'Backend-Eng'."""
+    kb, _ = isolated_kanban_home
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        tid = kb.create_task(conn, title="t1", assignee=None)
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False, default_assignee="Backend-Eng")
+    assert tid in res.auto_assigned_default
+    with kb.connect_closing() as conn:
+        row = conn.execute("SELECT assignee FROM tasks WHERE id=?", (tid,)).fetchone()
+    assert row["assignee"] == "backend-eng"
+
+
 def test_config_names_are_case_normalized(isolated_kanban_home, monkeypatch):
     """Config entries are normalized the same way stored assignees are
     (lowercase named profiles; 'default' case-insensitive) so a list authored
