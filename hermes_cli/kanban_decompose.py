@@ -201,8 +201,21 @@ def _resolve_orchestrator_profile(cfg: dict) -> str:
 def _resolve_default_assignee(cfg: dict) -> str:
     """Resolve which profile catches child tasks the orchestrator can't route."""
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    try:
+        hd = kb.human_driven_profiles()
+    except Exception:
+        hd = frozenset()
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
-    if explicit:
+    if explicit and explicit in hd:
+        # A human-driven default_assignee would funnel every LLM miss
+        # (empty/invalid/excluded choice) straight to a human-driven profile,
+        # defeating the roster exclusion. Ignore it and fall through.
+        logger.warning(
+            "decompose: default_assignee=%r is human-driven; ignoring "
+            "(unrouted children will not fall back to a human-driven profile)",
+            explicit,
+        )
+    elif explicit:
         try:
             if profiles_mod.profile_exists(explicit):
                 return explicit
@@ -228,7 +241,17 @@ def _build_roster() -> tuple[list[dict], set[str]]:
     except Exception as exc:
         logger.warning("decompose: failed to list profiles: %s", exc)
         return roster, valid
+    # Human-driven profiles (default/work class) are operator-driven and must
+    # never receive autonomously-routed work. Exclude them from BOTH the
+    # roster the LLM sees AND the valid set, so if the model names one anyway
+    # `_normalize_assignee_choice` rewrites it to the default fallback.
+    try:
+        hd = kb.human_driven_profiles()
+    except Exception:
+        hd = frozenset()
     for p in all_profiles:
+        if p.name in hd:
+            continue
         desc = (p.description or "").strip()
         roster.append({
             "name": p.name,

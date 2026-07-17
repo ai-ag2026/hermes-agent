@@ -14316,15 +14316,59 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     return None
 
 
+_HUMAN_DRIVEN_PROFILES_DEFAULT = ("work",)
+
+
+def human_driven_profiles() -> "frozenset[str]":
+    """Profiles that are operator-driven, NOT autonomous kanban workers.
+
+    The dispatcher never auto-spawns a card assigned to one of these, and the
+    decomposer never routes work to them. ``work`` is the professional
+    counterpart of the private ``default`` profile — both are human-driven in
+    this install.
+
+    IMPORTANT — ``default`` is NOT auto-excluded. Contrary to intuition,
+    ``list_profiles()`` DOES include ``default`` and
+    ``profile_exists("default")`` returns True, so a card assigned ``default``
+    (manually, by the decomposer, or via a ``default_assignee`` fallback) would
+    otherwise auto-spawn just like a worker. Installs that treat ``default`` as
+    human-driven MUST list it in ``kanban.human_driven_profiles`` — this
+    install does: ``[default, work]``. (The built-in code default stays
+    ``("work",)`` so generic installs, where ``default`` may legitimately be a
+    spawnable orchestrator fallback, keep backward-compatible behavior.)
+
+    Operator-configurable via ``kanban.human_driven_profiles`` (list of
+    profile names): an explicit list REPLACES the built-in default, and an
+    explicit empty list disables the guard entirely (kill switch). Malformed
+    or absent config falls back to the built-in default (fail-safe: the guard
+    stays on). Read via ``load_config_readonly()`` — this is a hot path
+    (dispatcher tick + per-board health probes). See reference-profile-taxonomy.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        configured = (load_config_readonly().get("kanban") or {}).get("human_driven_profiles")
+    except Exception:
+        configured = None
+    if not isinstance(configured, (list, tuple)):
+        # None (unset) or malformed → fail-safe built-in default.
+        return frozenset(_HUMAN_DRIVEN_PROFILES_DEFAULT)
+    names: set[str] = set()
+    for item in configured:
+        if isinstance(item, str) and item.strip():
+            names.add(item.strip())
+    return frozenset(names)
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    whose assignee maps to a real, autonomously-spawnable Hermes profile.
 
     Used by the gateway- and CLI-embedded dispatchers' health telemetry to
     decide whether ``0 spawned`` is a "stuck" condition (real spawnable
     work waiting) or a "correctly idle" condition (only control-plane
     lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
-    that pull tasks via ``claim_task`` directly).
+    that pull tasks via ``claim_task`` directly, or human-driven profiles
+    like ``work`` that never auto-spawn).
 
     Falls back to "any ready+assigned" if ``profile_exists`` is not
     importable (e.g. partial install) — preserves the old behavior so
@@ -14337,12 +14381,15 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
+    _hd = human_driven_profiles()
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
+        if row["assignee"] in _hd:
+            continue
         if profile_exists(row["assignee"]):
             return True
     return False
@@ -14363,11 +14410,14 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
+    _hd = human_driven_profiles()
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
         return True
     for row in rows:
+        if row["assignee"] in _hd:
+            continue
         if profile_exists(row["assignee"]):
             return True
     return False
@@ -14707,6 +14757,22 @@ def _dispatch_once_locked(
     # on large ready queues).
     _sm_gate_on = (not dry_run) and _self_modify_gate_enabled()
     _sm_patterns = _self_modify_patterns() if _sm_gate_on else None
+    # Human-driven profiles (default/work class) are operator-driven and must
+    # never auto-spawn — resolved once per tick, re-read live from config so an
+    # operator can add/remove one without a gateway restart.
+    _hd_profiles = human_driven_profiles()
+    # A human-driven default_assignee would silently strand every unassigned
+    # ready task: the auto-assign block below mutates the row + emits an
+    # 'assigned' event, then the HD spawn-guard skips it → parked in 'ready'
+    # with no escalation. Refuse it here so such tasks stay skipped_unassigned
+    # (the operator-actionable "needs routing" signal) instead.
+    if _default_assignee and _default_assignee in _hd_profiles:
+        _log.warning(
+            "kanban dispatch: default_assignee=%r is human-driven; ignoring it "
+            "(unassigned ready tasks will not auto-assign to a human-driven profile)",
+            _default_assignee,
+        )
+        _default_assignee = None
     _default_assignee_resolved = False
     if _default_assignee:
         try:
@@ -14787,6 +14853,14 @@ def _dispatch_once_locked(
             # this distinction to suppress spurious "stuck" warnings on
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Human-driven profiles (default/work class) are operator-driven and
+        # must NEVER auto-spawn, even when a card is (manually or by a
+        # misrouted default_assignee) assigned to them. Bucket as
+        # nonspawnable so the same "correctly idle, not stuck" telemetry
+        # applies. See human_driven_profiles() / reference-profile-taxonomy.
+        if row_assignee in _hd_profiles:
             result.skipped_nonspawnable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
@@ -15041,6 +15115,10 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Human-driven profiles never auto-spawn (mirror of the ready loop).
+        if row["assignee"] in _hd_profiles:
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
