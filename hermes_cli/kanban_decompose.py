@@ -194,6 +194,11 @@ def _resolve_orchestrator_profile(cfg: dict) -> str:
     except Exception:
         hd = frozenset()
     explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
+    if explicit:
+        try:
+            explicit = profiles_mod.normalize_profile_name(explicit)
+        except Exception:
+            explicit = explicit.lower()
     if explicit and explicit in hd:
         logger.warning(
             "decompose: orchestrator_profile=%r is human-driven; ignoring "
@@ -248,6 +253,11 @@ def _resolve_default_assignee(cfg: dict) -> str:
         return bool(name) and name not in hd
 
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
+    if explicit:
+        try:
+            explicit = profiles_mod.normalize_profile_name(explicit)
+        except Exception:
+            explicit = explicit.lower()
     if explicit and explicit in hd:
         logger.warning(
             "decompose: default_assignee=%r is human-driven; ignoring "

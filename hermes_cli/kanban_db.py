@@ -14404,7 +14404,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if row["assignee"] in _hd:
+        if _canonical_assignee(row["assignee"]) in _hd:
             continue
         if profile_exists(row["assignee"]):
             return True
@@ -14432,7 +14432,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     except Exception:
         return True
     for row in rows:
-        if row["assignee"] in _hd:
+        if _canonical_assignee(row["assignee"]) in _hd:
             continue
         if profile_exists(row["assignee"]):
             return True
@@ -14768,6 +14768,13 @@ def _dispatch_once_locked(
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
     _default_assignee = (default_assignee or "").strip() or None
+    # Canonicalize (lowercase; 'default' alias) so a mixed-case config value
+    # like ``default_assignee: Work`` is both correctly caught by the
+    # human-driven guard below AND stored canonically on auto-assign — the raw
+    # value would slip past the (canonical) HD set and spawn a human-driven
+    # profile (adversarial review 2026-07-17).
+    if _default_assignee:
+        _default_assignee = _canonical_assignee(_default_assignee)
     # Self-modify gate: resolve config + compile patterns ONCE per tick, not
     # per ready card (load_config + re.compile in the hot loop was measurable
     # on large ready queues).
@@ -14876,7 +14883,9 @@ def _dispatch_once_locked(
         # misrouted default_assignee) assigned to them. Bucket as
         # nonspawnable so the same "correctly idle, not stuck" telemetry
         # applies. See human_driven_profiles() / reference-profile-taxonomy.
-        if row_assignee in _hd_profiles:
+        # Canonicalize the stored assignee: the dashboard can persist a
+        # mixed-case name that would otherwise slip past the canonical HD set.
+        if _canonical_assignee(row_assignee) in _hd_profiles:
             result.skipped_nonspawnable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
@@ -15133,8 +15142,9 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
-        # Human-driven profiles never auto-spawn (mirror of the ready loop).
-        if row["assignee"] in _hd_profiles:
+        # Human-driven profiles never auto-spawn (mirror of the ready loop;
+        # canonicalize against mixed-case stored assignees).
+        if _canonical_assignee(row["assignee"]) in _hd_profiles:
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:

@@ -259,6 +259,39 @@ def test_resolve_default_assignee_never_human_driven(isolated_kanban_home, monke
     assert kd._resolve_default_assignee({"kanban": {"default_assignee": "work"}}) == "backend-eng"
 
 
+def test_mixed_case_default_assignee_is_caught(isolated_kanban_home, monkeypatch):
+    """A mixed-case default_assignee ('Work') is canonicalized and caught by
+    the HD guard — must NOT slip past as raw 'Work' and auto-spawn (adversarial
+    review 2026-07-17)."""
+    kb, _ = isolated_kanban_home
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        task_id = kb.create_task(conn, title="t1", assignee=None)
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False, default_assignee="Work")
+    assert task_id in res.skipped_unassigned
+    assert not res.auto_assigned_default
+    assert not res.spawned
+
+
+def test_mixed_case_stored_assignee_is_skipped(isolated_kanban_home, monkeypatch):
+    """A ready card whose stored assignee is a mixed-case human-driven name
+    ('Work', e.g. persisted by the dashboard) is still skipped by the guard."""
+    kb, _ = isolated_kanban_home
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        wid = kb.create_task(conn, title="human", assignee="backend-eng")
+        # Force a raw mixed-case assignee, bypassing create_task canonicalization.
+        conn.execute("UPDATE tasks SET assignee='Work' WHERE id=?", (wid,))
+        conn.commit()
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False)
+    assert wid in res.skipped_nonspawnable
+    assert wid not in [s[0] for s in res.spawned]
+
+
 def test_config_names_are_case_normalized(isolated_kanban_home, monkeypatch):
     """Config entries are normalized the same way stored assignees are
     (lowercase named profiles; 'default' case-insensitive) so a list authored
