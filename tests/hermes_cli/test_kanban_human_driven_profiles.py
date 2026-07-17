@@ -18,16 +18,33 @@ import pytest
 _LC = "hermes_cli.config.load_config_readonly"  # what human_driven_profiles() reads
 
 
+def _is_hermes_mod(name: str) -> bool:
+    return name.startswith("hermes_cli") or name.startswith("hermes_state") or name == "hermes_constants"
+
+
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
-    """Fresh HERMES_HOME + clean kanban DB (mirrors test_kanban_default_assignee)."""
+    """Fresh HERMES_HOME + clean kanban DB.
+
+    Snapshots and RESTORES the hermes_cli/* module state on teardown so this
+    file's re-import + module-function monkeypatches (list_profiles,
+    get_active_profile_name, ...) cannot leak into co-located tests on the same
+    xdist worker — the plain del-sys.modules pattern (test_kanban_default_assignee)
+    is contaminating once those functions are patched.
+    """
+    saved = {k: v for k, v in sys.modules.items() if _is_hermes_mod(k)}
     test_home = tempfile.mkdtemp(prefix="kanban_human_driven_test_")
     monkeypatch.setenv("HERMES_HOME", test_home)
     for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+        if _is_hermes_mod(mod):
             del sys.modules[mod]
     from hermes_cli import kanban_db
-    yield kanban_db, test_home
+    try:
+        yield kanban_db, test_home
+    finally:
+        for k in [k for k in sys.modules if _is_hermes_mod(k)]:
+            del sys.modules[k]
+        sys.modules.update(saved)
 
 
 def _fake_spawn(*args, **kwargs):
@@ -213,3 +230,30 @@ def test_roster_excludes_human_driven(isolated_kanban_home, monkeypatch):
     assert "work" not in names and "work" not in valid
     assert "default" not in names and "default" not in valid
     assert "backend-eng" in names and "backend-eng" in valid
+
+
+def test_resolve_default_assignee_never_human_driven(isolated_kanban_home, monkeypatch):
+    """_resolve_default_assignee must never return a human-driven profile, even
+    when default_assignee is unset and the active profile is 'default' (the
+    dispatcher's own home). It falls to orchestrator_profile, then a worker."""
+    kb, _ = isolated_kanban_home
+    from hermes_cli import kanban_decompose as kd
+
+    class _P:
+        def __init__(self, name):
+            self.name = name
+            self.description = ""
+
+    monkeypatch.setattr(_LC, lambda: {"kanban": {"human_driven_profiles": ["default", "work"]}})
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        "hermes_cli.profiles.list_profiles",
+        lambda: [_P("default"), _P("work"), _P("backend-eng")],
+    )
+    # orchestrator_profile (pm, non-hd) wins when no explicit default_assignee.
+    assert kd._resolve_default_assignee({"kanban": {"orchestrator_profile": "pm"}}) == "pm"
+    # No orchestrator, active='default' (human-driven) → first non-hd worker.
+    assert kd._resolve_default_assignee({"kanban": {}}) == "backend-eng"
+    # An explicitly human-driven default_assignee is ignored, not returned.
+    assert kd._resolve_default_assignee({"kanban": {"default_assignee": "work"}}) == "backend-eng"

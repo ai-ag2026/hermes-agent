@@ -199,17 +199,30 @@ def _resolve_orchestrator_profile(cfg: dict) -> str:
 
 
 def _resolve_default_assignee(cfg: dict) -> str:
-    """Resolve which profile catches child tasks the orchestrator can't route."""
+    """Resolve which profile catches child tasks the orchestrator can't route.
+
+    NEVER returns a human-driven profile: it is the rewrite target for every
+    LLM miss (empty/invalid/excluded choice), so a human-driven value would
+    funnel unrouted children to an operator-driven profile the dispatcher then
+    refuses to spawn — stranding them. Preference order, each candidate must be
+    non-human-driven (explicit must also exist): explicit ``default_assignee``
+    → ``orchestrator_profile`` → active profile → first non-human-driven
+    installed profile. Children never end up unassigned, so in the degenerate
+    case where EVERY candidate is human-driven the active/"default" name is
+    kept with a warning (the dispatcher's HD-guard keeps such a child visible
+    rather than silently spawning it).
+    """
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     try:
         hd = kb.human_driven_profiles()
     except Exception:
         hd = frozenset()
+
+    def _non_hd(name: str) -> bool:
+        return bool(name) and name not in hd
+
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
     if explicit and explicit in hd:
-        # A human-driven default_assignee would funnel every LLM miss
-        # (empty/invalid/excluded choice) straight to a human-driven profile,
-        # defeating the roster exclusion. Ignore it and fall through.
         logger.warning(
             "decompose: default_assignee=%r is human-driven; ignoring "
             "(unrouted children will not fall back to a human-driven profile)",
@@ -221,10 +234,39 @@ def _resolve_default_assignee(cfg: dict) -> str:
                 return explicit
         except Exception:
             pass
+
+    # Prefer the configured orchestrator (a real worker like 'pm') over the
+    # active profile, which in the gateway/dispatcher runs under the 'default'
+    # (human-driven) home and would otherwise leak here.
+    orchestrator = (kanban_cfg.get("orchestrator_profile") or "").strip()
+    if _non_hd(orchestrator):
+        try:
+            if profiles_mod.profile_exists(orchestrator):
+                return orchestrator
+        except Exception:
+            pass
+
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        active = profiles_mod.get_active_profile_name() or "default"
     except Exception:
-        return "default"
+        active = "default"
+    if _non_hd(active):
+        return active
+
+    # active is human-driven (e.g. dispatcher under the 'default' home): take
+    # the first non-human-driven installed profile as a safe catch-all.
+    try:
+        for p in profiles_mod.list_profiles():
+            if _non_hd(p.name):
+                return p.name
+    except Exception:
+        pass
+
+    logger.warning(
+        "decompose: no non-human-driven default_assignee available; falling "
+        "back to %r (dispatcher HD-guard keeps such children visible)", active,
+    )
+    return active
 
 
 def _build_roster() -> tuple[list[dict], set[str]]:
