@@ -257,3 +257,37 @@ def test_resolve_default_assignee_never_human_driven(isolated_kanban_home, monke
     assert kd._resolve_default_assignee({"kanban": {}}) == "backend-eng"
     # An explicitly human-driven default_assignee is ignored, not returned.
     assert kd._resolve_default_assignee({"kanban": {"default_assignee": "work"}}) == "backend-eng"
+
+
+def test_config_names_are_case_normalized(isolated_kanban_home, monkeypatch):
+    """Config entries are normalized the same way stored assignees are
+    (lowercase named profiles; 'default' case-insensitive) so a list authored
+    as [Default, Work] can't silently defeat the guard."""
+    kb, _ = isolated_kanban_home
+    monkeypatch.setattr(
+        _LC, lambda: {"kanban": {"human_driven_profiles": ["Default", "Work", "  ANALYST  "]}}
+    )
+    assert kb.human_driven_profiles() == frozenset({"default", "work", "analyst"})
+
+
+def test_resolve_orchestrator_never_human_driven(isolated_kanban_home, monkeypatch):
+    """_resolve_orchestrator_profile must never return a human-driven profile,
+    else the root task never reactivates after fan-out (dispatcher won't spawn)."""
+    kb, _ = isolated_kanban_home
+    from hermes_cli import kanban_decompose as kd
+
+    class _P:
+        def __init__(self, name):
+            self.name = name
+            self.description = ""
+
+    monkeypatch.setattr(_LC, lambda: {"kanban": {"human_driven_profiles": ["default", "work"]}})
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: True)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        "hermes_cli.profiles.list_profiles",
+        lambda: [_P("default"), _P("work"), _P("backend-eng")],
+    )
+    assert kd._resolve_orchestrator_profile({"kanban": {"orchestrator_profile": "pm"}}) == "pm"
+    assert kd._resolve_orchestrator_profile({"kanban": {"orchestrator_profile": "work"}}) == "backend-eng"
+    assert kd._resolve_orchestrator_profile({"kanban": {}}) == "backend-eng"

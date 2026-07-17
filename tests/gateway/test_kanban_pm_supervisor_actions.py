@@ -242,6 +242,23 @@ def test_reassign_without_assignee_fails_safe_no_mutation(kanban_home):
     assert task.status == "blocked"
 
 
+def test_reassign_to_human_driven_profile_refused(kanban_home):
+    """The trusted boundary must never route a card to a human-driven profile
+    (default/work): the dispatcher would refuse to spawn it, silently parking
+    the card in 'ready' with no attention signal -- worse than the block."""
+    from hermes_cli import kanban_db as kb
+
+    tid = _blocked_card(kb)
+    # 'work' is human-driven by the built-in default set.
+    decision = PmSupervisorDecision(action="reassign", comment="hand to work", assignee="work")
+    ok, outcome = _execute_pm_decision(kb, tid, decision, board_slug="default")
+    assert ok is False
+    assert outcome == "reassign_to_human_driven"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "blocked"  # untouched, not stranded in ready
+
+
 # ---------------------------------------------------------------------------
 # _execute_pm_decision -- decompose
 # ---------------------------------------------------------------------------

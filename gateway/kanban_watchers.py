@@ -858,6 +858,15 @@ def _execute_pm_decision(
             if action == "reassign":
                 if not decision.assignee:
                     return False, "reassign_missing_assignee"
+                # Defense in depth (on top of the filtered roster): never let the
+                # supervisor route a card to a human-driven profile — the
+                # dispatcher would refuse to spawn it and it would park silently.
+                try:
+                    _hd = kb_module.human_driven_profiles()
+                except Exception:
+                    _hd = frozenset()
+                if decision.assignee.strip().lower() in _hd:
+                    return False, "reassign_to_human_driven"
                 if not kb_module.assign_task(conn, task_id, decision.assignee):
                     return False, "reassign_failed"
             attn = kb_module.get_current_attention(conn, task_id)
@@ -930,9 +939,19 @@ def _pm_supervisor_handle_candidate(
 
     try:
         from hermes_cli import profiles as _profiles_mod
+        # Exclude human-driven profiles (default/work) from the reassign roster
+        # the aux-LLM sees — mirrors kanban_decompose._build_roster. Otherwise
+        # the supervisor could reassign a stuck card to a human-driven profile,
+        # which the dispatcher then refuses to spawn, silently parking it in
+        # 'ready' with no attention signal (worse than the original block).
+        try:
+            _hd = kb_module.human_driven_profiles()
+        except Exception:
+            _hd = frozenset()
         roster = [
             {"name": p.name, "description": (p.description or "").strip()}
             for p in _profiles_mod.list_profiles()
+            if p.name not in _hd
         ]
     except Exception:
         roster = []

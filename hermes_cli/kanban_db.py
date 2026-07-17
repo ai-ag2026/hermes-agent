@@ -14352,10 +14352,26 @@ def human_driven_profiles() -> "frozenset[str]":
     if not isinstance(configured, (list, tuple)):
         # None (unset) or malformed → fail-safe built-in default.
         return frozenset(_HUMAN_DRIVEN_PROFILES_DEFAULT)
+    # Normalize each entry the SAME way assignees are canonicalized on the
+    # tasks table (lowercase named profiles; case-insensitive 'default'), so a
+    # config authored as [Default, Work] can't silently defeat the guard (which
+    # compares against the lowercased stored assignee). Wide blast radius: this
+    # set backs every dispatch/roster/telemetry check.
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+    except Exception:
+        normalize_profile_name = None
     names: set[str] = set()
     for item in configured:
-        if isinstance(item, str) and item.strip():
-            names.add(item.strip())
+        if not (isinstance(item, str) and item.strip()):
+            continue
+        if normalize_profile_name is not None:
+            try:
+                names.add(normalize_profile_name(item))
+                continue
+            except Exception:
+                pass
+        names.add(item.strip().lower())
     return frozenset(names)
 
 

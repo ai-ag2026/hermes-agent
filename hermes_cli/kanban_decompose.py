@@ -180,22 +180,48 @@ def _load_config() -> dict:
 def _resolve_orchestrator_profile(cfg: dict) -> str:
     """Resolve which profile owns the root/orchestration task after fan-out.
 
-    Falls back to the active default profile when ``kanban.orchestrator_profile``
-    is unset, so a task is never stranded for lack of an orchestrator.
+    NEVER returns a human-driven profile (default/work): the root task
+    reactivates to 'ready' once its children finish, and the dispatcher refuses
+    to auto-spawn a human-driven assignee — an HD orchestrator would strand the
+    whole decomposition with no completion. Order (each non-hd): explicit
+    orchestrator_profile → active profile → first non-hd installed profile;
+    the degenerate all-hd case keeps the active/"default" (dispatcher HD-guard
+    keeps it visible) so a task is never stranded for lack of an orchestrator.
     """
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    try:
+        hd = kb.human_driven_profiles()
+    except Exception:
+        hd = frozenset()
     explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
-    if explicit:
+    if explicit and explicit in hd:
+        logger.warning(
+            "decompose: orchestrator_profile=%r is human-driven; ignoring "
+            "(root task would never reactivate after fan-out)", explicit,
+        )
+    elif explicit:
         try:
             if profiles_mod.profile_exists(explicit):
                 return explicit
         except Exception:
             pass
-    # Fall back to the active default profile.
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        active = profiles_mod.get_active_profile_name() or "default"
     except Exception:
-        return "default"
+        active = "default"
+    if active and active not in hd:
+        return active
+    try:
+        for p in profiles_mod.list_profiles():
+            if p.name and p.name not in hd:
+                return p.name
+    except Exception:
+        pass
+    logger.warning(
+        "decompose: no non-human-driven orchestrator available; falling back "
+        "to %r (dispatcher HD-guard keeps the root task visible)", active,
+    )
+    return active
 
 
 def _resolve_default_assignee(cfg: dict) -> str:
