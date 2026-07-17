@@ -695,6 +695,10 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Recall controls
         self._auto_recall = True
+        # Surface the bank's pinned mental models (curated syntheses) in
+        # auto-recall context. Self-limiting: a bank with no pinned models
+        # produces no output and pays only one cheap list call.
+        self._include_mental_models = True
         self._recall_max_tokens = 4096
         # Default to observation-only recall. Observations are Hindsight's
         # consolidated knowledge layer — deduplicated, evidence-grounded
@@ -997,6 +1001,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
+            {"key": "include_mental_models", "description": "Surface the bank's pinned mental models (curated syntheses) in auto-recall context. Self-limiting: no effect when the bank has no pinned models.", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
@@ -1337,6 +1342,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Recall controls
         self._auto_recall = self._config.get("auto_recall", True)
+        self._include_mental_models = bool(self._config.get("include_mental_models", True))
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
         # Default narrows recall to observation-only; pass an explicit
         # `recall_types` list in config.json to broaden (e.g. include
@@ -1517,6 +1523,29 @@ class HindsightMemoryProvider(MemoryProvider):
                     num_results = len(resp.results) if resp.results else 0
                     logger.debug("Prefetch: recall returned %d results", num_results)
                     text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+                # Prepend the bank's pinned mental models (curated syntheses).
+                # Hindsight treats these as the highest-quality layer, so they
+                # lead the context ahead of the recalled facts. Failure here must
+                # never break the recall prefetch.
+                if self._include_mental_models:
+                    try:
+                        mms = self._run_hindsight_operation(
+                            lambda client: client.mental_models.list_mental_models(
+                                bank_id=self._bank_id, detail="content"
+                            )
+                        )
+                        mm_parts = [
+                            f"### {mm.name}\n{mm.content.strip()}"
+                            for mm in (mms or [])
+                            if getattr(mm, "content", None)
+                            and not mm.content.startswith("Generating content")
+                        ]
+                        if mm_parts:
+                            mm_block = "## Mental Models (curated syntheses)\n" + "\n\n".join(mm_parts)
+                            text = f"{mm_block}\n\n{text}" if text else mm_block
+                            logger.debug("Prefetch: prepended %d mental model(s)", len(mm_parts))
+                    except Exception as e:
+                        logger.debug("Hindsight mental-model prefetch failed: %s", e, exc_info=True)
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text
