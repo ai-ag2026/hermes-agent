@@ -5499,14 +5499,100 @@ def claim_review_task(
 
 VALID_REVIEW_DECISIONS = frozenset({"ACCEPT", "NEEDS_REPAIR", "BLOCK"})
 
+# Stale-review-handshake recovery (2026-07-17, card t_5a43abe1): a reviewer's
+# ``claim_review_task`` claim that ends in one of these outcomes -- and is
+# NOT followed by a ``review_decided`` event -- leaves nobody able to ever
+# decide the review. Without detecting this, ``_pending_review_request`` kept
+# reporting the original handshake as pending forever, wedging
+# ``complete_task`` and making ``request_task_review`` refuse (or silently
+# no-op) a retry. ``blocked`` is deliberately excluded: a reviewer that
+# gate-blocks itself (needs_input/exact-action) may still come back once the
+# gate clears, so that stays a live, pending handshake.
+_STALE_REVIEW_HANDSHAKE_OUTCOMES = frozenset(
+    {"crashed", "timed_out", "gave_up", "spawn_failed", "reclaimed"}
+)
+
+
+def _stale_review_claim_run(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[int]:
+    """Return the run id of a dead, undecided reviewer claim, if any.
+
+    Finds the latest ``review_requested`` event for ``task_id`` with no
+    ``review_decided`` after it (same condition ``_pending_review_request``
+    tests), then looks for the reviewer's ``claim_review_task`` claim --
+    identified by the ``claimed`` event's ``source_status: "review"`` marker
+    (see ``claim_review_task``) -- that happened after it.
+
+    Returns that claim's run id only when the run has TERMINATED
+    (``ended_at`` set) with an outcome in
+    :data:`_STALE_REVIEW_HANDSHAKE_OUTCOMES` and no ``review_decided``
+    followed -- i.e. the reviewer crashed / timed out / gave up / never
+    spawned / was reclaimed, and nobody is coming back to decide. Returns
+    ``None`` when the handshake is genuinely still open (no claim yet, or
+    the claim is still running / merely gate-blocked) or was already
+    resolved.
+    """
+    req = conn.execute(
+        "SELECT id FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if req is None:
+        return None
+    req_id = int(req["id"])
+    decided = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_decided' AND id > ? LIMIT 1",
+        (task_id, req_id),
+    ).fetchone()
+    if decided is not None:
+        return None
+    claim = conn.execute(
+        "SELECT run_id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'claimed' AND id > ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, req_id),
+    ).fetchone()
+    if claim is None or claim["run_id"] is None:
+        return None
+    try:
+        claim_payload = json.loads(claim["payload"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        claim_payload = {}
+    if (
+        not isinstance(claim_payload, dict)
+        or claim_payload.get("source_status") != "review"
+    ):
+        return None
+    run_id = int(claim["run_id"])
+    run = conn.execute(
+        "SELECT outcome, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    if (
+        run is None
+        or run["ended_at"] is None
+        or run["outcome"] not in _STALE_REVIEW_HANDSHAKE_OUTCOMES
+    ):
+        return None
+    return run_id
+
 
 def _pending_review_request(
     conn: sqlite3.Connection, task_id: str
 ) -> Optional[dict]:
-    """Return the latest unmatched ``review_requested`` payload, if any."""
+    """Return the latest unmatched ``review_requested`` payload, if any.
+
+    A handshake whose reviewer claim died without a decision (see
+    :func:`_stale_review_claim_run`) is treated as resolved -- ``None`` --
+    so it stops wedging ``complete_task`` and stops making
+    ``request_task_review`` refuse a fresh handshake.
+    """
     row = conn.execute(
         """
-        SELECT kind, payload
+        SELECT id, kind, payload
           FROM task_events
          WHERE task_id = ?
            AND kind IN ('review_requested', 'review_decided')
@@ -5516,6 +5602,8 @@ def _pending_review_request(
         (task_id,),
     ).fetchone()
     if row is None or row["kind"] != "review_requested":
+        return None
+    if _stale_review_claim_run(conn, task_id) is not None:
         return None
     try:
         payload = json.loads(row["payload"] or "{}")
@@ -5565,6 +5653,18 @@ def request_task_review(
                 expected_run_id is not None
                 and run_id is None
                 and _adoptable_orphan_run(conn, task_id, int(expected_run_id))
+            ):
+                adopt_orphan_run = True
+            elif (
+                # Stale-review-handshake recovery (2026-07-17): the card was
+                # already reset to 'ready' by the crash/timeout/gave_up path
+                # that killed the reviewer's claim. Citing that exact dead
+                # claim as expected_run_id re-opens a FRESH handshake (status
+                # -> 'review') instead of refusing forever or silently
+                # no-op'ing — see _stale_review_claim_run.
+                expected_run_id is not None
+                and run_id is None
+                and _stale_review_claim_run(conn, task_id) == int(expected_run_id)
             ):
                 adopt_orphan_run = True
             else:
@@ -12080,6 +12180,22 @@ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 # 24h window while the board shows nothing wrong.
 _RESPAWN_GUARD_PR_ESCALATE_SECONDS = 1800  # 30 minutes
 
+# Respawn-guard event storm cap (2026-07-17): a persistent guard (typically
+# active_pr) re-fires every dispatcher tick for as long as it holds — the
+# GUARD DECISION itself must, since it's what defers the spawn each tick —
+# but logging a fresh ``respawn_guarded`` task_event on every one of those
+# ticks turned one incident into 605 events across a board (406 on a single
+# card, t_614c91e9). After this many events since the last reset (spawn/
+# claim/promote/unblock — the same boundary the active_pr escalation below
+# already uses), stop appending duplicates and emit exactly one
+# ``respawn_guard_storm_capped`` marker instead of continuing to spam every
+# tick. The active_pr escalation depends only on the EARLIEST guarded event
+# since the reset (``MIN(created_at)``), which is always within the first
+# _RESPAWN_GUARD_EVENT_CAP events — capping later duplicates never affects
+# it. Deliberately generous: the normal case (1-2 guarded ticks before the
+# task clears or is claimed) never reaches the cap at all.
+_RESPAWN_GUARD_EVENT_CAP = 5
+
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
@@ -13495,10 +13611,37 @@ def _record_task_failure(
                 )
             run_id = None
             if end_run:
-                # Only the spawn path has an open run to close.
+                # Only release_claim=True callers reach here with a
+                # genuinely OPEN run — crash/timeout/reclaim always pass
+                # end_run=False because THEY already pre-closed the run with
+                # their own terminal outcome before calling in (untouched
+                # below). Two such callers exist:
+                #   * the spawn-failure path (outcome="spawn_failed") — the
+                #     subprocess never started, so there is no live worker
+                #     that could ever return with finished work.
+                #   * agent/turn_finalizer.py's goal-loop iteration-budget-
+                #     exhaustion self-report (outcome="timed_out") — a REAL
+                #     worker ran for real turns and may still be alive past
+                #     this report, returning with finished work once the
+                #     card is requeued to 'ready'.
+                #
+                # External-parker run-identity fix (2026-07-17): for the
+                # latter, close with outcome='blocked' (not 'gave_up') so
+                # the run stays ADOPTABLE (_adoptable_orphan_run only
+                # accepts outcome='blocked'). spawn_failed keeps its
+                # original 'gave_up' outcome — nothing ever ran, so nothing
+                # is adoptable, and this preserves the documented spawn-
+                # failure run-history contract (test_run_on_spawn_failure_
+                # records_failed_runs). The ORIGINAL trigger outcome is
+                # preserved in metadata either way for diagnostics; only the
+                # run's own outcome/status columns (what gates adoption)
+                # change. The task-level ``gave_up`` event + ``block_reason_
+                # code='gave_up'`` above are untouched, so operator/
+                # dashboard visibility is unaffected in both cases.
+                run_outcome = "gave_up" if outcome == "spawn_failed" else "blocked"
                 run_id = _end_run(
                     conn, task_id,
-                    outcome="gave_up", status="gave_up",
+                    outcome=run_outcome, status=run_outcome,
                     error=error[:500],
                     metadata={
                         "failures": failures,
@@ -14434,12 +14577,51 @@ def _dispatch_once_locked(
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
+            # Storm cap (2026-07-17): once this many events have already
+            # fired since the last reset, stop appending a duplicate every
+            # tick and emit a single storm-capped marker instead — see
+            # _RESPAWN_GUARD_EVENT_CAP's docstring. The guard decision
+            # itself (the ``continue`` below) is completely unaffected.
             if not dry_run:
                 with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
+                    reset_boundary = conn.execute(
+                        "SELECT MAX(created_at) FROM task_events "
+                        "WHERE task_id = ? AND kind IN "
+                        "('unblocked', 'promoted', 'spawned', 'claimed')",
+                        (row["id"],),
+                    ).fetchone()[0] or 0
+                    guarded_since_reset = conn.execute(
+                        "SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+                        "AND kind = 'respawn_guarded' AND created_at > ?",
+                        (row["id"], int(reset_boundary)),
+                    ).fetchone()[0]
+                    if guarded_since_reset < _RESPAWN_GUARD_EVENT_CAP:
+                        _append_event(
+                            conn, row["id"], "respawn_guarded",
+                            {"reason": guard_reason},
+                        )
+                    else:
+                        # At/past the cap: announce it exactly ONCE per
+                        # reset window, not every tick — the guarded count
+                        # itself stops advancing once respawn_guarded stops
+                        # being appended, so this must check for an
+                        # existing marker rather than re-derive the count.
+                        already_capped = conn.execute(
+                            "SELECT 1 FROM task_events WHERE task_id = ? "
+                            "AND kind = 'respawn_guard_storm_capped' "
+                            "AND created_at > ? LIMIT 1",
+                            (row["id"], int(reset_boundary)),
+                        ).fetchone()
+                        if already_capped is None:
+                            _append_event(
+                                conn, row["id"], "respawn_guard_storm_capped",
+                                {
+                                    "reason": guard_reason,
+                                    "cap": _RESPAWN_GUARD_EVENT_CAP,
+                                },
+                            )
+                        # else: already announced the cap this window —
+                        # stay silent until a reset event clears it.
                 # Escalation: an ``active_pr`` guard cannot clear on its own
                 # while the triggering comment stays within the 24h window, so
                 # a ready task it defers would livelock invisibly (one guarded

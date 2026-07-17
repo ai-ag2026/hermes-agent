@@ -1784,6 +1784,119 @@ def test_circuit_breaker_trip_after_decompose_blocks_for_human(kanban_home):
         assert task.block_kind == "needs_input"
 
 
+# ---------------------------------------------------------------------------
+# Circuit-breaker trip on a still-OPEN run closes it as adoptable 'blocked'
+# (2026-07-17, external-parker run-identity fix)
+#
+# _record_task_failure has two calling modes: release_claim=False/end_run=
+# False (crash/timeout/reclaim paths) where the CALLER already pre-closed
+# the run with its own terminal outcome before calling in -- those stay
+# untouched and non-adoptable, by design. release_claim=True/end_run=True
+# (spawn-failure, and agent/turn_finalizer.py's goal-loop iteration-budget-
+# exhaustion self-report) hands _record_task_failure a genuinely OPEN run.
+# When that mode trips the breaker, closing the run as outcome='gave_up'
+# made it permanently non-adoptable (_adoptable_orphan_run only treats
+# outcome='blocked' as adoptable) even though nothing crashed/timed out —
+# the worker may still be alive and returning with finished work.
+# ---------------------------------------------------------------------------
+
+def test_circuit_breaker_trip_closes_open_run_as_adoptable_blocked(kanban_home):
+    """A still-open run (release_claim=True/end_run=True — e.g. the goal-loop
+    budget-exhaustion self-report) that trips the breaker must close with
+    outcome='blocked' so a worker returning after the card is requeued to
+    'ready' can still land its finished work via orphan adoption."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="goal card", assignee="a", max_retries=1)
+        claimed = kb.claim_task(conn, t)
+        run_id = int(claimed.current_run_id)
+
+        tripped = kb._record_task_failure(
+            conn, t, error="Iteration budget exhausted (90/90)",
+            outcome="timed_out", release_claim=True, end_run=True,
+        )
+        assert tripped is True
+
+        run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        assert run["ended_at"] is not None
+        assert run["outcome"] == "blocked"
+        assert run["status"] == "blocked"
+
+        task = kb.get_task(conn, t)
+        assert task.status in ("blocked", "triage")
+        assert task.current_run_id is None
+
+        # Operator/automation resolves the attention and requeues the card.
+        att = kb.get_current_attention(conn, t)
+        assert att is not None
+        assert kb.transition_task_status_with_attention(
+            conn, task_id=t, status="ready",
+            expected_attention_id=att.id,
+            expected_attention_version=att.version,
+        )
+
+        # A worker that is still alive past its own budget-exhaustion report
+        # can now land its finished work citing the closed-but-open-at-trip-
+        # time run as expected_run_id.
+        assert kb.complete_task(
+            conn, t, result="delivered after budget trip",
+            expected_run_id=run_id,
+        ) is True
+        assert kb.get_task(conn, t).status == "done"
+
+
+def test_circuit_breaker_preclosed_run_outcome_unaffected(kanban_home, monkeypatch):
+    """SAFETY: crash/timeout/reclaim pre-close their own run with their own
+    terminal outcome BEFORE calling _record_task_failure (release_claim=
+    False, end_run=False) -- the trip must never touch that outcome. Those
+    stay NOT adoptable (see test_reclaimed_orphan_run_is_not_adoptable) —
+    this fix only concerns the release_claim=True/end_run=True (still-open-
+    run) path."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="crashy", assignee="a", max_retries=1)
+        host = _kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_task(conn, t, claimer=f"{host}:w")
+        run_id = int(claimed.current_run_id)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (777777, t),
+        )
+        conn.commit()
+
+        crashed = _kb.detect_crashed_workers(conn)
+        assert t in crashed
+
+        run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        # The crash path already closed this run with outcome='crashed'
+        # before _record_task_failure's trip ever ran; it must stay that
+        # way, not be relabeled 'blocked'.
+        assert run["outcome"] == "crashed"
+        assert run["ended_at"] is not None
+
+        task = kb.get_task(conn, t)
+        assert task.status in ("blocked", "triage")
+
+        # And it must stay refused for adoption (mirrors
+        # test_reclaimed_orphan_run_is_not_adoptable's invariant).
+        conn.execute(
+            "UPDATE tasks SET status='ready', block_kind=NULL, "
+            "current_run_id=NULL WHERE id=?", (t,),
+        )
+        conn.commit()
+        assert kb.complete_task(
+            conn, t, result="sneaking in a crash", expected_run_id=run_id,
+        ) is False
+
+
 def test_block_task_prefer_triage_first_occurrence(kanban_home):
     """prefer_triage routes a TECHNICAL first-occurrence block straight to
     triage (automation first); a card with a prior decompose falls back to
@@ -2817,6 +2930,107 @@ def test_dispatch_active_pr_guard_escalate_clock_resets_on_promote(
     assert (t, "active_pr") in res.respawn_guarded
     assert t not in res.auto_blocked
     assert task.status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# Respawn-guard event storm cap (2026-07-17)
+#
+# A persistent guard (active_pr) re-fires every dispatcher tick for as long
+# as it holds, which used to append a fresh 'respawn_guarded' task_event
+# EVERY tick -- 605 events in one incident window, 406 on a single card
+# (t_614c91e9). The guard itself must keep deferring the spawn every tick
+# (unchanged); only the event-log spam is capped.
+# ---------------------------------------------------------------------------
+
+def test_dispatch_respawn_guard_storm_is_capped(kanban_home, all_assignees_spawnable):
+    """Repeated ticks of the same guard append at most _RESPAWN_GUARD_EVENT_CAP
+    respawn_guarded events plus one storm-capped marker -- never one per tick."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="storm", assignee="alice")
+        kb.add_comment(
+            conn, t, "reviewer",
+            "verdict PENDING — https://github.com/totemx-AI/subsidysmart/pull/77",
+        )
+        for _ in range(20):
+            res = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+            # The guard must keep firing (deferring the spawn) every single
+            # tick -- capping the EVENT LOG must never weaken the guard.
+            assert (t, "active_pr") in res.respawn_guarded
+            assert kb.get_task(conn, t).status == "ready"
+
+        events = kb.list_events(conn, t)
+
+    guarded = [e for e in events if e.kind == "respawn_guarded"]
+    capped = [e for e in events if e.kind == "respawn_guard_storm_capped"]
+    assert len(guarded) == kb._RESPAWN_GUARD_EVENT_CAP, (
+        f"expected exactly {kb._RESPAWN_GUARD_EVENT_CAP} respawn_guarded "
+        f"events across 20 ticks, got {len(guarded)}"
+    )
+    assert len(capped) == 1
+    assert capped[0].payload.get("reason") == "active_pr"
+
+
+def test_dispatch_respawn_guard_storm_cap_resets_on_progress(
+    kanban_home, all_assignees_spawnable
+):
+    """A reset event (promote/spawn/claim/unblock) clears the storm-cap
+    window exactly like it clears the active_pr escalation window -- a
+    fresh guard streak after progress is not silently swallowed forever."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="storm-reset", assignee="alice")
+        kb.add_comment(
+            conn, t, "reviewer",
+            "verdict PENDING — https://github.com/totemx-AI/subsidysmart/pull/78",
+        )
+        now = int(time.time())
+        for i in range(kb._RESPAWN_GUARD_EVENT_CAP):
+            _insert_guard_event(conn, t, now - 1000 + i)
+        _insert_guard_event(conn, t, now - 500, kind="promoted")
+        conn.commit()
+
+        res = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events = kb.list_events(conn, t)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    guarded_after_reset = [
+        e for e in events
+        if e.kind == "respawn_guarded" and e.created_at > now - 500
+    ]
+    assert len(guarded_after_reset) == 1, (
+        "a reset event must clear the storm-cap window, not carry the "
+        "pre-reset count forward"
+    )
+
+
+def test_dispatch_active_pr_guard_escalates_after_storm_cap(
+    kanban_home, all_assignees_spawnable
+):
+    """SAFETY: the active_pr auto-block escalation depends only on the
+    EARLIEST respawn_guarded event since the last reset (MIN(created_at)).
+    Capping later duplicates must never remove that earliest event or
+    otherwise weaken the 30-minute escalation."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="storm-then-escalate", assignee="alice")
+        kb.add_comment(
+            conn, t, "reviewer",
+            "verdict ACCEPT — https://github.com/totemx-AI/subsidysmart/pull/79",
+        )
+        now = int(time.time())
+        # Simulate a storm that already hit the cap, starting well before
+        # the escalation window.
+        start = now - kb._RESPAWN_GUARD_PR_ESCALATE_SECONDS - 600
+        for i in range(kb._RESPAWN_GUARD_EVENT_CAP):
+            _insert_guard_event(conn, t, start + i * 5)
+        _insert_guard_event(conn, t, start + 60, kind="respawn_guard_storm_capped")
+        conn.commit()
+
+        res = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        task = kb.get_task(conn, t)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t in res.auto_blocked
+    assert task.status == "triage"
+    assert task.block_kind == "needs_input"
 
 
 # ---------------------------------------------------------------------------
@@ -6116,6 +6330,149 @@ def test_pending_review_cannot_bypass_accept_with_complete(kanban_home):
             expected_run_id=review.current_run_id,
         ) is False
         assert kb.get_task(conn, tid).status == "running"
+
+
+# ---------------------------------------------------------------------------
+# Stale review handshake recovery (2026-07-17, card t_5a43abe1)
+#
+# Repro: an implementation run hands off to review (`review_requested`); the
+# reviewer claims it (`claim_review_task`) but its process CRASHES before
+# calling `decide_task_review`. `_pending_review_request` used to keep
+# returning the original `review_requested` payload forever (the crashed
+# claim never produced a `review_decided`), permanently wedging
+# `complete_task` and making `request_task_review` either refuse outright or
+# no-op without dispatching a fresh reviewer. This produced hours of
+# `block_loop_detected` noise (18:41-22:59 on the incident date) before an
+# operator manually intervened.
+# ---------------------------------------------------------------------------
+
+def _crash_reviewer_claim(conn, tid, review):
+    """Kill the reviewer's claimed run via the real crash-detection path.
+
+    Mirrors ``test_detect_crashed_workers_*``: stamp a worker_pid, force
+    ``_pid_alive`` False, and run the real ``detect_crashed_workers`` so the
+    run ends exactly the way a genuine crash would (outcome='crashed',
+    task reset to 'ready', current_run_id cleared).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    host = _kb._claimer_id().split(":", 1)[0]
+    conn.execute(
+        "UPDATE tasks SET worker_pid=?, claim_lock=? WHERE id=?",
+        (555555, f"{host}:reviewer-proc", tid),
+    )
+    conn.execute(
+        "UPDATE task_runs SET claim_lock=? WHERE id=?",
+        (f"{host}:reviewer-proc", review.current_run_id),
+    )
+    conn.commit()
+    crashed = _kb.detect_crashed_workers(conn)
+    assert tid in crashed, "test setup: expected the review claim to crash"
+
+
+def test_stale_review_handshake_does_not_wedge_complete(kanban_home, monkeypatch):
+    """Repro (a): a crashed, undecided review handshake must not block
+    complete_task forever — nobody is ever coming back to decide it."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implement", assignee="backend-eng")
+        kb.claim_task(conn, tid)
+        assert _request_review(conn, tid) is True
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        _crash_reviewer_claim(conn, tid, review)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.current_run_id is None
+
+        # The crashed claim carries no decision -- the handshake must now
+        # read as resolved/stale, not eternally pending.
+        assert _kb._pending_review_request(conn, tid) is None
+
+        assert kb.complete_task(
+            conn, tid, result="landed despite dead reviewer",
+        ) is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_healthy_review_claim_still_pending_after_crash_helper_added(kanban_home):
+    """Regression guard: a reviewer claim that is still genuinely RUNNING
+    (never crashed) must keep blocking complete_task -- the review-bypass
+    protection (2026-07-13) must not regress."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implement", assignee="backend-eng")
+        kb.claim_task(conn, tid)
+        assert _request_review(conn, tid) is True
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+
+        assert kb._pending_review_request(conn, tid) is not None
+        assert kb.complete_task(
+            conn, tid, summary="bypass", expected_run_id=review.current_run_id,
+        ) is False
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_unclaimed_review_request_still_pending(kanban_home):
+    """Regression guard: a review_requested handshake that nobody has
+    claimed yet (no reviewer run at all) is genuinely pending, not stale --
+    must keep blocking complete_task and stay idempotent on re-request."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implement", assignee="backend-eng")
+        kb.claim_task(conn, tid)
+        assert _request_review(conn, tid) is True
+
+        assert kb._pending_review_request(conn, tid) is not None
+        assert kb.complete_task(conn, tid, summary="bypass") is False
+        # Idempotent re-request: still exactly one review_requested event.
+        assert _request_review(conn, tid) is True
+        requested = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"]
+        assert len(requested) == 1
+
+
+def test_stale_review_handshake_allows_fresh_review_request(kanban_home, monkeypatch):
+    """Repro (b): after a crashed/undecided review claim, request_task_review
+    (citing the dead reviewer's run) must be able to open a FRESH handshake
+    -- flipping the card back to 'review' so the review-lane dispatcher picks
+    up a new reviewer -- instead of refusing or silently no-op'ing."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implement", assignee="backend-eng")
+        kb.claim_task(conn, tid)
+        assert _request_review(conn, tid) is True
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        stale_run_id = int(review.current_run_id)
+        _crash_reviewer_claim(conn, tid, review)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.current_run_id is None
+
+        ok = kb.request_task_review(
+            conn, tid, reviewer="reviewer", summary="retry after crash",
+            expected_run_id=stale_run_id,
+        )
+        assert ok is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "review"
+        assert task.assignee == "reviewer"
+        requested = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"]
+        assert len(requested) == 2
+
+        # And the fresh handshake is claimable exactly like a normal one.
+        fresh = kb.claim_review_task(conn, tid)
+        assert fresh is not None
+        assert fresh.status == "running"
 
 
 @pytest.mark.parametrize(
