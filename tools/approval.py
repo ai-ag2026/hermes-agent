@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from pathlib import Path
 from typing import Literal, Optional, TypedDict
 from hermes_cli.config import cfg_get
 
@@ -2024,6 +2025,265 @@ def _get_cron_approval_mode() -> str:
         return "deny"
 
 
+# ---------------------------------------------------------------------------
+# Freigabe-Stufenmodell / approval tiers (Autonomie-Umbau A/WS1, 2026-07-17)
+# ---------------------------------------------------------------------------
+# A Kanban worker that is either read-only or writing strictly inside its own
+# task workspace does not need an operator ping. Entirely additive and behind
+# approvals.tiers.enabled (default False == today's byte-identical behavior).
+# Only ever consulted from the terminal-command durable-block fallback in
+# _check_all_command_guards_legacy, immediately before it would otherwise
+# call _record_kanban_pending_action -- i.e. only when Phase 1/2 already found
+# something that would durably block the worker on a human. execute_code is
+# NEVER tier-classified (it is arbitrary code by definition); it gets its own
+# separate, narrower "pattern grant" mechanism seeded only by a real prior
+# exact human approval (see _consume_kanban_pattern_grant below).
+
+
+def _tiers_enabled() -> bool:
+    """Whether the Kanban approval-tier auto-approve model is active.
+
+    ``approvals.tiers.enabled`` in config, default False. Fails closed
+    (tiers off, i.e. today's ping-everything behavior) when config can't be
+    read.
+    """
+    try:
+        return bool((_get_approval_config().get("tiers") or {}).get("enabled", False))
+    except Exception:
+        return False
+
+
+# Any of these disqualifies both Tier 0 (read-only) and Tier 1 (workspace-
+# contained write) classification: without a real shell parse, containment
+# and "this is really just one read-only command" cannot be proven across
+# pipes, chains, substitutions, or redirection. Falling back to Tier 3 (ping)
+# is always safe; auto-approving a compound command on a partial parse is not.
+_TIER_SHELL_METACHAR_RE = re.compile(r"[;&|`]|\$\(|<\(|>\(|>|<")
+
+_TIER0_LEADING_VERB_RE = re.compile(
+    r"^(?:"
+    r"git\s+(?:show|diff|status|log|ls-remote)\b"
+    r"|(?:python3?\s+-m\s+)?pytest\b"
+    r"|(?:python3?\s+-m\s+)?py_compile\b"
+    r"|grep\b"
+    r"|find\b"
+    r"|ls\b"
+    r"|cat\b"
+    r"|head\b"
+    r"|tail\b"
+    r")"
+)
+# grep/find can mutate the filesystem via these flags; the leading-verb match
+# above is not enough to call either one "read-only".
+_TIER0_DISQUALIFYING_SUBSTRINGS = ("-delete", "-exec")
+
+_TIER1_WRITE_VERBS = frozenset({"rm", "mkdir", "mv", "cp", "touch", "rmdir"})
+
+# Gitea remote deletions: always Tier 3, regardless of workspace containment
+# (deleting a branch/ref on the shared remote is not a local, reversible act).
+_GITEA_PUSH_DELETE_RE = re.compile(r"\bgit\s+push\b.*--delete\b", re.IGNORECASE)
+_GITEA_API_DELETE_RE = re.compile(
+    r"-X\s*DELETE\b.*git\.stardock\.cloud|git\.stardock\.cloud.*-X\s*DELETE\b",
+    re.IGNORECASE,
+)
+
+# Destructive commands aimed at another host/VM (ssh/scp/rsync combined with
+# rm/dd/mkfs). Broad by design: distinguishing "this remote rm is somehow
+# fine" from the 2026-07 incident pattern is not something a regex should
+# attempt -- Tier 3 fail-closed is always the safe answer here.
+_FOREIGN_HOST_DESTRUCTIVE_RE = re.compile(
+    r"\b(?:ssh|scp|rsync)\b.*\b(?:rm|dd|mkfs)\b|\b(?:rm|dd|mkfs)\b.*\b(?:ssh|scp|rsync)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_tier0_readonly(command: str) -> bool:
+    """Curated read-only allowlist. No workspace requirement: reading cannot
+    mutate anything, wherever it points."""
+    stripped = command.strip()
+    if not stripped or _TIER_SHELL_METACHAR_RE.search(stripped):
+        return False
+    if not _TIER0_LEADING_VERB_RE.match(stripped):
+        return False
+    lowered = stripped.lower()
+    return not any(flag in lowered for flag in _TIER0_DISQUALIFYING_SUBSTRINGS)
+
+
+def _tokenize_for_containment(command: str) -> Optional[list[str]]:
+    if _TIER_SHELL_METACHAR_RE.search(command):
+        return None
+    try:
+        tokens = shlex.split(command.strip(), comments=False)
+    except ValueError:
+        return None
+    return tokens or None
+
+
+def _path_within_workspace(candidate: str, workspace: Path) -> bool:
+    try:
+        resolved = (
+            Path(candidate).resolve() if os.path.isabs(candidate)
+            else (workspace / candidate).resolve()
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+    try:
+        resolved.relative_to(workspace)
+    except ValueError:
+        return False
+    return True
+
+
+def _looks_like_tier1_workspace_write(command: str, workspace: str) -> bool:
+    """rm/mkdir/mv/cp/touch/rmdir where EVERY non-flag argument resolves
+    inside the task workspace. Conservative by construction: an argument that
+    cannot be proven workspace-internal (unparseable command, no path
+    arguments at all, any argument resolving outside) means "not Tier 1",
+    never a best-effort guess."""
+    if not workspace:
+        return False
+    tokens = _tokenize_for_containment(command)
+    if not tokens:
+        return False
+    if tokens[0] not in _TIER1_WRITE_VERBS:
+        return False
+    try:
+        ws = Path(workspace).resolve()
+    except (OSError, RuntimeError):
+        return False
+    path_args = [t for t in tokens[1:] if not t.startswith("-")]
+    if not path_args:
+        return False
+    return all(_path_within_workspace(t, ws) for t in path_args)
+
+
+def _matches_self_modify_scope(command: str) -> bool:
+    """Reuse the self-modification governance patterns (kanban_db) at the
+    per-command level. Fails CLOSED: if the classifier itself cannot be
+    imported/run, treat the command as self-modifying rather than silently
+    skipping the check."""
+    try:
+        from hermes_cli.kanban_db import _self_modify_patterns
+        return any(rx.search(command) for rx, _label in _self_modify_patterns())
+    except Exception:
+        return True
+
+
+def _matches_gitea_deletion(command: str) -> bool:
+    return bool(_GITEA_PUSH_DELETE_RE.search(command) or _GITEA_API_DELETE_RE.search(command))
+
+
+def _matches_foreign_host_destructive(command: str) -> bool:
+    return bool(_FOREIGN_HOST_DESTRUCTIVE_RE.search(command))
+
+
+def _tirith_has_critical_finding(tirith_result: Optional[dict]) -> bool:
+    if not tirith_result:
+        return False
+    for finding in tirith_result.get("findings") or []:
+        if str(finding.get("severity", "")).strip().upper() == "CRITICAL":
+            return True
+    return False
+
+
+def _classify_kanban_action(
+    command: str, *, mutation_kind: str, workspace: str,
+    tirith_result: Optional[dict] = None,
+) -> str:
+    """Tier-classify a Kanban worker's terminal action for auto-approval.
+
+    Returns "tier0" (read-only), "tier1" (workspace-contained write), or
+    "tier3" (Manfred's always-ping list / fail-closed default). Only ever
+    invoked for terminal-command mutation kinds -- execute-code-arbitrary
+    always classifies tier3 here (it has its own pattern-grant path instead;
+    see the module docstring above).
+    """
+    if mutation_kind == "execute-code-arbitrary":
+        return "tier3"
+    if _tirith_has_critical_finding(tirith_result):
+        return "tier3"
+    if _matches_self_modify_scope(command):
+        return "tier3"
+    if _matches_gitea_deletion(command):
+        return "tier3"
+    if _matches_foreign_host_destructive(command):
+        return "tier3"
+    if _looks_like_tier0_readonly(command):
+        return "tier0"
+    if _looks_like_tier1_workspace_write(command, workspace):
+        return "tier1"
+    return "tier3"
+
+
+def _record_kanban_auto_approval(
+    command: str, *, tier: str, mutation_kind: str, reason: str,
+) -> bool:
+    """Best-effort durable audit event for a Tier 0/1 auto-approval.
+
+    Returns whether the audit event was durably persisted. Callers MUST fail
+    closed on False (fall through to the normal pending-action ping) rather
+    than auto-approving without a forensic trail -- unlike
+    _record_kanban_pending_action, there is no other lifecycle record of a
+    tier auto-approval, so a failed write here must not silently vanish.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+    if not task_id or not workspace:
+        return False
+    try:
+        from hermes_cli import kanban_db
+        run_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+        run_id = int(run_raw) if run_raw else None
+        with contextlib.closing(kanban_db.connect()) as conn:
+            kanban_db.record_auto_approved_action(
+                conn, task_id=task_id, run_id=run_id, command=command,
+                mutation_kind=mutation_kind, tier=tier,
+                profile=os.environ.get("HERMES_PROFILE", "default"),
+                workspace=workspace, reason=reason,
+            )
+        return True
+    except Exception as exc:
+        logger.warning("Could not persist Kanban tier auto-approval audit event: %s", exc)
+        return False
+
+
+def _consume_kanban_pattern_grant(command: str, *, mutation_kind: str) -> bool:
+    """Consume (non-destructively -- reusable until TTL) a pattern grant.
+
+    Only ever called for execute-code-arbitrary, and only when
+    approvals.tiers.enabled. A pattern grant exists only because a real
+    operator already approved the exact byte sequence that seeded it (see
+    consume_approved_action(create_pattern_grant=True)); this function never
+    creates authorization, only looks one up and records the audit trail.
+    Fails closed (returns False) on any lookup error.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+    run_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if not task_id or not workspace or not run_raw:
+        return False
+    try:
+        run_id = int(run_raw)
+        profile = os.environ.get("HERMES_PROFILE", "default")
+        from hermes_cli import kanban_db
+        with contextlib.closing(kanban_db.connect()) as conn:
+            grant_id = kanban_db.find_active_pattern_grant(
+                conn, task_id=task_id, mutation_kind=mutation_kind, command=command,
+                profile=profile, workspace=workspace,
+            )
+            if grant_id is None:
+                return False
+            kanban_db.record_pattern_grant_auto_approval(
+                conn, task_id=task_id, run_id=run_id, grant_id=grant_id,
+                mutation_kind=mutation_kind, command=command,
+                profile=profile, workspace=workspace,
+            )
+        return True
+    except Exception as exc:
+        logger.warning("Kanban pattern grant lookup failed closed: %s", exc)
+        return False
+
+
 def _strip_shell_comments(command: str) -> str:
     """Strip shell-style comments from a command before LLM assessment.
 
@@ -2683,8 +2943,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
-def _consume_kanban_action_grant(command: str, *, mutation_kind: str | None = None) -> bool:
-    """Consume a durable exact-action grant when running as a Kanban worker."""
+def _consume_kanban_action_grant(
+    command: str, *, mutation_kind: str | None = None,
+    create_pattern_grant: bool = False,
+) -> bool:
+    """Consume a durable exact-action grant when running as a Kanban worker.
+
+    ``create_pattern_grant`` (Autonomie-Umbau A/WS1): pass True only from the
+    execute_code gate, and only when approvals.tiers.enabled -- see
+    kanban_db.consume_approved_action for what this seeds.
+    """
     task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
     run_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
@@ -2702,6 +2970,7 @@ def _consume_kanban_action_grant(command: str, *, mutation_kind: str | None = No
                 profile=os.environ.get("HERMES_PROFILE", "default"),
                 workspace=workspace,
                 mutation_kind=mutation_kind,
+                create_pattern_grant=create_pattern_grant,
             )
     except Exception as exc:
         logger.warning("Kanban action grant lookup failed closed: %s", exc)
@@ -3143,6 +3412,38 @@ def _check_all_command_guards_legacy(command: str, env_type: str,
         from agent.redact import redact_sensitive_text
         _disp_command = redact_sensitive_text(command)
         _disp_combined_desc = redact_sensitive_text(combined_desc)
+
+        # Freigabe-Stufenmodell (Autonomie-Umbau A/WS1, 2026-07-17): before
+        # durably blocking this Kanban worker on an operator ping, check
+        # whether the action is read-only (Tier 0) or a write strictly
+        # contained to its own task workspace (Tier 1). Gated behind
+        # approvals.tiers.enabled; with it off this branch is inert and
+        # falls straight through to the pre-existing pending-action call
+        # below, unchanged.
+        _tier_task_env = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+        _tier_ws_env = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+        if _tier_task_env and _tier_ws_env and _tiers_enabled():
+            try:
+                from hermes_cli.kanban_db import _pending_action_mutation_kind as _classify_mk
+                _tier_mutation_kind = _classify_mk(command)
+            except Exception:
+                _tier_mutation_kind = None
+            if _tier_mutation_kind is not None:
+                _tier = _classify_kanban_action(
+                    command, mutation_kind=_tier_mutation_kind,
+                    workspace=_tier_ws_env, tirith_result=tirith_result,
+                )
+                if _tier in ("tier0", "tier1"):
+                    if _record_kanban_auto_approval(
+                        command, tier=_tier, mutation_kind=_tier_mutation_kind,
+                        reason=combined_desc,
+                    ):
+                        return {"approved": True, "message": None,
+                                "user_approved": True, "kanban_tier": _tier}
+                    # Audit persistence failed: fail closed to the normal
+                    # durable-pending-action ping below rather than
+                    # auto-approving with no forensic trail.
+
         _kanban_pending = _record_kanban_pending_action(command, _disp_combined_desc)
         if os.environ.get("HERMES_KANBAN_TASK", "").strip() and _kanban_pending is None:
             return {"approved": False, "status": "blocked", "message": "BLOCKED: exact approval could not be durably recorded."}
@@ -3297,7 +3598,24 @@ def _check_execute_code_guard_legacy(code: str, env_type: str,
             GUARD_DENY_HARD,
         )
     if _kanban_exact_context:
-        if _consume_kanban_action_grant(code, mutation_kind="execute-code-arbitrary"):
+        # Freigabe-Stufenmodell (Autonomie-Umbau A/WS1, 2026-07-17): execute_code
+        # is arbitrary code and is NEVER tier-classified (no read-only/
+        # workspace-containment shortcut). The only auto-approval surface here
+        # is a "pattern grant" -- and a pattern grant can only exist because a
+        # real operator already gave an exact single-use approval for the byte
+        # sequence that seeded it (see the create_pattern_grant=True call
+        # below). Checked first so a live grant skips the DB write entirely;
+        # inert when approvals.tiers.enabled is False.
+        if _tiers_enabled() and _consume_kanban_pattern_grant(
+            code, mutation_kind="execute-code-arbitrary",
+        ):
+            return _guard_outcome({"approved": True, "message": None,
+                                   "user_approved": True,
+                                   "kanban_pattern_grant": True}, GUARD_ALLOW)
+        if _consume_kanban_action_grant(
+            code, mutation_kind="execute-code-arbitrary",
+            create_pattern_grant=_tiers_enabled(),
+        ):
             # 2026-07-13 (Claude review TG4): mark user_approved for parity with
             # the terminal grant branch; code_execution_tool gates its stale-
             # interrupt clear on user_approved, so without this an approved

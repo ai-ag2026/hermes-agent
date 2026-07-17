@@ -1638,6 +1638,32 @@ CREATE TABLE IF NOT EXISTS task_pending_actions (
 CREATE INDEX IF NOT EXISTS idx_pending_actions_task
     ON task_pending_actions(task_id, consumed_at, expires_at);
 
+-- Autonomie-Umbau A/WS1 (2026-07-17): a reusable "pattern grant" created the
+-- moment an operator gives a REAL exact-action approval for an
+-- execute-code-arbitrary action. Unlike task_pending_actions rows (single-use,
+-- byte-exact), this is deliberately multi-use within its TTL: follow-up
+-- execute_code calls whose normalized command-hash prefix matches auto-approve
+-- without a durable pending action or an operator ping, scoped to the origin
+-- card and its children at grant-creation time (scope_task_ids_json is a
+-- static snapshot, not re-resolved). Entirely additive; behind
+-- approvals.tiers.enabled (default off).
+CREATE TABLE IF NOT EXISTS task_pattern_grants (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin_task_id       TEXT NOT NULL,
+    origin_action_id     INTEGER NOT NULL,
+    mutation_kind        TEXT NOT NULL,
+    command_hash_prefix  TEXT NOT NULL,
+    profile              TEXT NOT NULL,
+    workspace            TEXT NOT NULL,
+    scope_task_ids_json  TEXT NOT NULL,
+    created_at           INTEGER NOT NULL,
+    expires_at           INTEGER NOT NULL,
+    revoked_at           INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_grants_lookup
+    ON task_pattern_grants(mutation_kind, command_hash_prefix, profile, workspace, expires_at);
+
 CREATE TABLE IF NOT EXISTS task_attentions (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id           TEXT NOT NULL,
@@ -8951,6 +8977,203 @@ def _pending_action_hash(command: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _workspace_hash(workspace: str) -> str:
+    """Hash a workspace path for audit payloads.
+
+    The raw workspace path is a proven secret surface (paths can carry
+    user/project names; see the redaction-guard tests for
+    record_pending_action_and_block). Any durable event that wants to
+    reference "which workspace" without persisting the raw path uses this.
+    """
+    if not workspace:
+        return ""
+    resolved = str(Path(workspace).resolve())
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()
+
+
+def record_auto_approved_action(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    command: str,
+    mutation_kind: str,
+    tier: str,
+    profile: str,
+    workspace: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Append-only audit trail for a Tier 0/1 auto-approved Kanban action.
+
+    Autonomie-Umbau A/WS1 (2026-07-17). The whole point of a tier
+    auto-approval is that the worker never blocks: no task_pending_actions
+    row, no task_attentions projection, no operator ping. It is still
+    forensically complete -- every auto-approval becomes a durable
+    task_events row. Mirrors the no-secret-side-channel invariant of
+    record_pending_action_and_block: the raw command and raw workspace path
+    are never persisted, only their hashes.
+    """
+    if tier not in ("tier0", "tier1"):
+        raise ValueError("only tier0/tier1 actions are auto-approved this way")
+    now = int(time.time())
+    payload = {
+        "tier": tier,
+        "mutation_kind": mutation_kind,
+        "command_hash": _pending_action_hash(command),
+        "profile": profile,
+        "workspace_hash": _workspace_hash(workspace),
+        "reason": " ".join((reason or "").split())[:200],
+    }
+    with write_txn(conn):
+        _append_event(conn, task_id, "auto_approved", payload, run_id=run_id)
+    return payload
+
+
+_PATTERN_GRANT_PREFIX_LEN = 200
+_PATTERN_GRANT_TTL_SECONDS = 86400
+
+
+def _pattern_grant_prefix_hash(command: str) -> str:
+    """Hash the leading slice of a normalized command/script.
+
+    Deliberately a PREFIX, not the full byte-exact hash used by the single-use
+    exact grant: a pattern grant exists precisely to cover near-identical
+    retries (e.g. a script whose only variation is a trailing generated
+    filename). This is a narrower net than a full wildcard, not a proof of
+    semantic equivalence -- see the design-decision note in the WS1 handover
+    about scoping this to execute-code-arbitrary only, behind
+    approvals.tiers.enabled, and always originating from a real prior human
+    approval of the exact byte sequence that produced the prefix.
+    """
+    canonical = _normalise_pending_action_command(command)
+    return hashlib.sha256(canonical[:_PATTERN_GRANT_PREFIX_LEN].encode("utf-8")).hexdigest()
+
+
+def _create_pattern_grant_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    origin_task_id: str,
+    origin_action_id: int,
+    mutation_kind: str,
+    command: str,
+    profile: str,
+    workspace: str,
+    now: int,
+    ttl_seconds: int = _PATTERN_GRANT_TTL_SECONDS,
+) -> int:
+    """In-transaction implementation; callers already own ``write_txn``."""
+    workspace = str(Path(workspace).resolve())
+    prefix_hash = _pattern_grant_prefix_hash(command)
+    scope = sorted({origin_task_id, *child_ids(conn, origin_task_id)})
+    expires_at = now + int(ttl_seconds)
+    cur = conn.execute(
+        "INSERT INTO task_pattern_grants (origin_task_id, origin_action_id, mutation_kind, "
+        "command_hash_prefix, profile, workspace, scope_task_ids_json, created_at, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (origin_task_id, int(origin_action_id), mutation_kind, prefix_hash, profile or "default",
+         workspace, json.dumps(scope), now, expires_at),
+    )
+    grant_id = int(cur.lastrowid)
+    _append_event(
+        conn, origin_task_id, "pattern_grant_created",
+        {"grant_id": grant_id, "mutation_kind": mutation_kind, "scope_size": len(scope),
+         "expires_at": expires_at},
+    )
+    return grant_id
+
+
+def create_pattern_grant(
+    conn: sqlite3.Connection,
+    *,
+    origin_task_id: str,
+    origin_action_id: int,
+    mutation_kind: str,
+    command: str,
+    profile: str,
+    workspace: str,
+    now: Optional[int] = None,
+    ttl_seconds: int = _PATTERN_GRANT_TTL_SECONDS,
+) -> int:
+    """Create a reusable pattern grant after a real operator approval.
+
+    Scoped to ``origin_task_id`` and its current children (a static snapshot
+    taken now, not re-resolved on lookup). Not single-use: any matching call
+    within scope and TTL auto-approves until expiry or revocation.
+    """
+    now = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        return _create_pattern_grant_in_txn(
+            conn, origin_task_id=origin_task_id, origin_action_id=origin_action_id,
+            mutation_kind=mutation_kind, command=command, profile=profile,
+            workspace=workspace, now=now, ttl_seconds=ttl_seconds,
+        )
+
+
+def find_active_pattern_grant(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    mutation_kind: str,
+    command: str,
+    profile: str,
+    workspace: str,
+    now: Optional[int] = None,
+) -> Optional[int]:
+    """Return the id of a live pattern grant covering this call, else None.
+
+    A "live" grant: not expired, not revoked, matching mutation_kind/profile/
+    workspace/command-hash-prefix exactly, and ``task_id`` present in the
+    grant's scope snapshot.
+    """
+    now = int(time.time()) if now is None else int(now)
+    workspace = str(Path(workspace).resolve())
+    prefix_hash = _pattern_grant_prefix_hash(command)
+    rows = conn.execute(
+        "SELECT id, scope_task_ids_json FROM task_pattern_grants WHERE mutation_kind=? "
+        "AND command_hash_prefix=? AND profile=? AND workspace=? AND expires_at>? "
+        "AND revoked_at IS NULL ORDER BY id DESC",
+        (mutation_kind, prefix_hash, profile or "default", workspace, now),
+    ).fetchall()
+    for row in rows:
+        try:
+            scope = set(json.loads(row["scope_task_ids_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if task_id in scope:
+            return int(row["id"])
+    return None
+
+
+def record_pattern_grant_auto_approval(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    grant_id: int,
+    mutation_kind: str,
+    command: str,
+    profile: str,
+    workspace: str,
+) -> None:
+    """Append-only audit trail for a pattern-grant auto-approval.
+
+    Mirrors record_auto_approved_action's no-secret-side-channel invariant;
+    additionally references the origin grant so the audit trail can be
+    traced back to the real human approval that created it.
+    """
+    now = int(time.time())
+    payload = {
+        "tier": "pattern_grant",
+        "grant_id": int(grant_id),
+        "mutation_kind": mutation_kind,
+        "command_hash": _pending_action_hash(command),
+        "profile": profile,
+        "workspace_hash": _workspace_hash(workspace),
+    }
+    with write_txn(conn):
+        _append_event(conn, task_id, "auto_approved", payload, run_id=run_id)
+
+
 def _pending_action_mutation_kind(command: str, explicit_kind: Optional[str] = None) -> str:
     """Classify terminal payloads, or accept the one internal code payload kind.
 
@@ -9615,8 +9838,18 @@ def consume_approved_action(
     workspace: str,
     now: Optional[int] = None,
     mutation_kind: Optional[str] = None,
+    create_pattern_grant: bool = False,
 ) -> bool:
-    """Atomically consume a grant from the currently running resumed attempt."""
+    """Atomically consume a grant from the currently running resumed attempt.
+
+    ``create_pattern_grant`` (Autonomie-Umbau A/WS1, 2026-07-17): when True and
+    the consume succeeds, additionally create a reusable pattern grant scoped
+    to this task and its children, in the SAME transaction. This is the only
+    place a pattern grant may originate: a real, already-consumed exact
+    single-use grant is the proof of human approval it is minted from. Callers
+    pass True only for execute-code-arbitrary and only when
+    approvals.tiers.enabled (checked by the caller, not here).
+    """
     now = int(time.time()) if now is None else int(now)
     command_hash = _pending_action_hash(command)
     mutation_kind = _pending_action_mutation_kind(command, mutation_kind)
@@ -9667,6 +9900,12 @@ def consume_approved_action(
             {"action_id": int(row["id"]), "run_id": int(run_id)},
             run_id=int(run_id),
         )
+        if create_pattern_grant:
+            _create_pattern_grant_in_txn(
+                conn, origin_task_id=task_id, origin_action_id=int(row["id"]),
+                mutation_kind=mutation_kind, command=command, profile=profile or "default",
+                workspace=workspace, now=now,
+            )
         return True
 
 

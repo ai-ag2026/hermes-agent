@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tools import approval
 
 
 @pytest.fixture
@@ -1701,6 +1702,43 @@ def test_kanban_execute_code_requires_durable_exact_grant_despite_broad_bypasses
         assert action is not None and action.mutation_kind == "execute-code-arbitrary"
 
 
+@pytest.mark.parametrize("bypass", ["yolo", "mode_off", "session", "always", "smart"])
+def test_kanban_execute_code_requires_durable_exact_grant_despite_broad_bypasses_and_tiers_enabled(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch, bypass: str,
+) -> None:
+    """Invariant 2, full-stack: turning tiers ON must not open a new hole.
+
+    A trivially "read-only-looking" execute_code script (it only prints) is
+    still never auto-approved by tier classification -- execute_code has no
+    tier0/1 path at all, only the separate pattern-grant mechanism, which
+    itself requires a real prior exact approval. No such grant exists here.
+    """
+    from tools import approval
+
+    task_id = _create_running_task(monkeypatch)
+    code = "print('arbitrary worker script')"
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+    monkeypatch.setattr(approval, "_tiers_enabled", lambda: True)
+    if bypass == "yolo":
+        monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", True)
+    elif bypass == "mode_off":
+        monkeypatch.setattr(approval, "_get_approval_mode", lambda: "off")
+    elif bypass in {"session", "always"}:
+        monkeypatch.setattr(approval, "is_approved", lambda *_args: True)
+    else:
+        monkeypatch.setattr(approval, "_get_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval, "_smart_approve", lambda *_args: "approve")
+
+    result = approval.check_execute_code_guard(code, "local")
+    assert result["guard_outcome"] == "approval_required"
+    assert result["status"] == "pending_approval"
+    with kb.connect() as conn:
+        action = kb.get_pending_action(conn, task_id)
+        assert action is not None and action.mutation_kind == "execute-code-arbitrary"
+
+
 def test_kanban_execute_code_exact_grant_is_byte_bound_and_consumed_once(
     isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1729,6 +1767,153 @@ def test_kanban_execute_code_exact_grant_is_byte_bound_and_consumed_once(
     with kb.connect() as conn:
         action = conn.execute("SELECT state, consumed_at FROM task_pending_actions WHERE id=?", (action_id,)).fetchone()
         assert action["state"] == "consumed" and action["consumed_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# execute_code pattern grants (Autonomie-Umbau A/WS1, 2026-07-17)
+# ---------------------------------------------------------------------------
+# A pattern grant can ONLY come into existence as a side effect of a real,
+# already-consumed exact single-use grant (a human approved that exact byte
+# sequence). Once seeded, near-identical follow-up scripts sharing the same
+# normalized 200-char prefix auto-approve within TTL/scope, without ever
+# blocking the worker again. Entirely behind approvals.tiers.enabled.
+
+_PATTERN_PREFIX_FILLER = "x = 1\n" * 40  # 240 chars, past the 200-char prefix window
+
+
+def test_execute_code_pattern_grant_seeded_by_real_approval_auto_approves_followup(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    code_a = _PATTERN_PREFIX_FILLER + "final_call_A()\n"
+    code_b = _PATTERN_PREFIX_FILLER + "final_call_B()\n"  # differs only past char 200
+    assert kb._pending_action_hash(code_a) != kb._pending_action_hash(code_b)
+
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+    _enable_tiers(monkeypatch)
+
+    first = approval.check_execute_code_guard(code_a, "local")
+    assert first["guard_outcome"] == "approval_required"
+    action_id = first["kanban_approval"]["action_id"]
+    with kb.connect() as conn:
+        assert kb.approve_pending_action_and_unblock(conn, task_id, action_id)
+        resumed = kb.claim_task(conn, task_id, claimer="resumed-worker")
+        assert resumed is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resumed.current_run_id))
+
+    # Real approval consumed -> a pattern grant is seeded (tiers enabled).
+    second = approval.check_execute_code_guard(code_a, "local")
+    assert second["guard_outcome"] == "allow"
+    assert second.get("kanban_action_grant") is True
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_pattern_grants").fetchone()[0] == 1
+
+    # A near-identical script (same prefix, different tail) auto-approves via
+    # the pattern grant -- no new pending action, task never blocks again.
+    third = approval.check_execute_code_guard(code_b, "local")
+    assert third["guard_outcome"] == "allow"
+    assert third.get("kanban_pattern_grant") is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "running"
+        assert kb.get_pending_action(conn, task_id) is None
+        pattern_events = [e for e in kb.list_events(conn, task_id=task_id)
+                          if e.kind == "auto_approved" and e.payload.get("tier") == "pattern_grant"]
+        assert len(pattern_events) == 1
+        assert pattern_events[0].payload["grant_id"]
+        # No raw code/workspace side channel.
+        assert code_a not in json.dumps(pattern_events[0].payload)
+        assert code_b not in json.dumps(pattern_events[0].payload)
+        assert str(isolated_board.resolve()) not in json.dumps(pattern_events[0].payload)
+
+
+def test_execute_code_pattern_grant_not_created_when_tiers_disabled(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    code_a = _PATTERN_PREFIX_FILLER + "final_call_A()\n"
+    code_b = _PATTERN_PREFIX_FILLER + "final_call_B()\n"
+
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(approval, "_tiers_enabled", lambda: False)
+
+    first = approval.check_execute_code_guard(code_a, "local")
+    action_id = first["kanban_approval"]["action_id"]
+    with kb.connect() as conn:
+        assert kb.approve_pending_action_and_unblock(conn, task_id, action_id)
+        resumed = kb.claim_task(conn, task_id, claimer="resumed-worker")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(resumed.current_run_id))
+
+    assert approval.check_execute_code_guard(code_a, "local")["guard_outcome"] == "allow"
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_pattern_grants").fetchone()[0] == 0
+
+    # No pattern grant exists -> a differing follow-up script pings again.
+    assert approval.check_execute_code_guard(code_b, "local")["guard_outcome"] == "approval_required"
+
+
+def test_pattern_grant_scoped_to_origin_and_children_not_unrelated_task(
+    isolated_board: Path,
+) -> None:
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="backend-eng")
+        child = kb.create_task(conn, title="child", assignee="backend-eng")
+        sibling = kb.create_task(conn, title="sibling", assignee="backend-eng")
+        kb.link_tasks(conn, parent, child)
+        grant_id = kb.create_pattern_grant(
+            conn, origin_task_id=parent, origin_action_id=1,
+            mutation_kind="execute-code-arbitrary", command="print(1)\n",
+            profile="backend-eng", workspace=str(isolated_board), now=1_000_000,
+        )
+        assert grant_id
+        for task_id in (parent, child):
+            assert kb.find_active_pattern_grant(
+                conn, task_id=task_id, mutation_kind="execute-code-arbitrary",
+                command="print(1)\n", profile="backend-eng",
+                workspace=str(isolated_board), now=1_000_100,
+            ) == grant_id
+        assert kb.find_active_pattern_grant(
+            conn, task_id=sibling, mutation_kind="execute-code-arbitrary",
+            command="print(1)\n", profile="backend-eng",
+            workspace=str(isolated_board), now=1_000_100,
+        ) is None
+
+
+def test_pattern_grant_expires_after_ttl(isolated_board: Path) -> None:
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="t", assignee="backend-eng")
+        grant_id = kb.create_pattern_grant(
+            conn, origin_task_id=task_id, origin_action_id=1,
+            mutation_kind="execute-code-arbitrary", command="print(1)\n",
+            profile="backend-eng", workspace=str(isolated_board),
+            now=1_000_000, ttl_seconds=100,
+        )
+        assert kb.find_active_pattern_grant(
+            conn, task_id=task_id, mutation_kind="execute-code-arbitrary",
+            command="print(1)\n", profile="backend-eng",
+            workspace=str(isolated_board), now=1_000_050,
+        ) == grant_id
+        assert kb.find_active_pattern_grant(
+            conn, task_id=task_id, mutation_kind="execute-code-arbitrary",
+            command="print(1)\n", profile="backend-eng",
+            workspace=str(isolated_board), now=1_000_100,
+        ) is None
+
+
+def test_pattern_grant_prefix_mismatch_does_not_match(isolated_board: Path) -> None:
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="t", assignee="backend-eng")
+        kb.create_pattern_grant(
+            conn, origin_task_id=task_id, origin_action_id=1,
+            mutation_kind="execute-code-arbitrary", command=_PATTERN_PREFIX_FILLER + "A()\n",
+            profile="backend-eng", workspace=str(isolated_board), now=1_000_000,
+        )
+        assert kb.find_active_pattern_grant(
+            conn, task_id=task_id, mutation_kind="execute-code-arbitrary",
+            command="totally different script\n", profile="backend-eng",
+            workspace=str(isolated_board), now=1_000_050,
+        ) is None
 
 
 @pytest.mark.parametrize("env_type", ["local", "ssh"])
@@ -2799,3 +2984,341 @@ def test_typed_attention_transition_stale_version_and_two_connections_have_one_w
     assert sorted(results) == ["conflict", "transitioned"]
     with kb.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM task_attentions WHERE id=?", (attention.id,)).fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Freigabe-Stufenmodell / approval tiers (Autonomie-Umbau A/WS1, 2026-07-17)
+# ---------------------------------------------------------------------------
+# A Kanban worker acting read-only (Tier 0) or writing strictly inside its own
+# task workspace (Tier 1) no longer needs an operator ping -- but ONLY when
+# approvals.tiers.enabled is True. Everything else (Manfred's Tier 3 list:
+# self-modify scope, Gitea deletions, foreign-host destructive commands,
+# tirith CRITICAL findings, anything ambiguous) still pings, with or without
+# the flag. execute_code is never tier-classified; it gets its own narrower
+# pattern-grant mechanism seeded only by a real prior exact human approval.
+
+
+def _enable_tiers(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tools import approval
+    monkeypatch.setattr(approval, "_tiers_enabled", lambda: True)
+
+
+def _last_event_kind(conn, task_id: str) -> str:
+    events = kb.list_events(conn, task_id=task_id)
+    assert events
+    return events[-1].kind
+
+
+def test_tiers_default_off_and_disabled_flag_reads_config_default(isolated_board: Path) -> None:
+    from tools import approval
+
+    # No config.yaml written in the isolated test HOME -> load_config() must
+    # not explode, and the tier model must default OFF.
+    assert approval._tiers_enabled() is False
+
+
+def test_tiers_disabled_is_byte_identical_to_pre_tier_behavior(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invariant 1: flag off -> today's ping-everything behavior, unchanged.
+
+    A command that WOULD classify Tier 1 (rm strictly inside the task
+    workspace) still durably blocks the worker on an operator ping when
+    approvals.tiers.enabled is False (the default).
+    """
+    from tools import approval
+
+    task_id = _create_running_task(monkeypatch)
+    target = isolated_board / "scratch.txt"
+    target.write_text("x")
+    command = f"rm {target}"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    monkeypatch.setattr(approval, "_tiers_enabled", lambda: False)
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["status"] == "pending_approval"
+    assert "kanban_tier" not in result
+    with kb.connect() as conn:
+        assert kb.get_pending_action(conn, task_id) is not None
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert not any(e.kind == "auto_approved" for e in kb.list_events(conn, task_id=task_id))
+
+
+def test_tier0_readonly_command_auto_approves_without_ping(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "git status"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    _enable_tiers(monkeypatch)
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["approved"] is True
+    assert result["kanban_tier"] == "tier0"
+    with kb.connect() as conn:
+        assert kb.get_pending_action(conn, task_id) is None
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"  # never blocked -- no ping happened
+        assert kb.get_current_attention(conn, task_id) is None
+        events = kb.list_events(conn, task_id=task_id)
+        auto = [e for e in events if e.kind == "auto_approved"]
+        assert len(auto) == 1
+        assert auto[0].payload["tier"] == "tier0"
+        assert auto[0].payload["mutation_kind"] == "terminal-command"
+        # No raw command/workspace side channel -- only hashes/classifier text.
+        assert command not in json.dumps(auto[0].payload)
+        assert str(isolated_board.resolve()) not in json.dumps(auto[0].payload)
+
+
+def test_tier0_disqualifies_find_with_delete_flag(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import approval
+
+    command = "find . -delete"
+    assert approval._looks_like_tier0_readonly(command) is False
+
+
+def test_tier0_disqualifies_compound_command(isolated_board: Path) -> None:
+    from tools import approval
+
+    assert approval._looks_like_tier0_readonly("git status; rm -rf /") is False
+    assert approval._looks_like_tier0_readonly("cat foo | rm bar") is False
+
+
+def test_tier1_workspace_write_auto_approves_and_audits(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    target = isolated_board / "scratch.txt"
+    target.write_text("x")
+    command = f"rm {target}"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    _enable_tiers(monkeypatch)
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["approved"] is True
+    assert result["kanban_tier"] == "tier1"
+    with kb.connect() as conn:
+        assert kb.get_pending_action(conn, task_id) is None
+        assert kb.get_task(conn, task_id).status == "running"
+        auto = [e for e in kb.list_events(conn, task_id=task_id) if e.kind == "auto_approved"]
+        assert len(auto) == 1 and auto[0].payload["tier"] == "tier1"
+
+
+def test_tier1_write_outside_workspace_stays_tier3_and_pings(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "rm /etc/hosts.not-real"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    _enable_tiers(monkeypatch)
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["status"] == "pending_approval"
+    with kb.connect() as conn:
+        assert kb.get_pending_action(conn, task_id) is not None
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_tier1_ambiguous_command_substitution_fails_closed_to_tier3(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "rm $(cat list-of-files)"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    _enable_tiers(monkeypatch)
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["status"] == "pending_approval"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_tier1_no_path_arguments_fails_closed_to_tier3(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rm with only flags, no path argument, cannot prove containment."""
+    task_id = _create_running_task(monkeypatch)
+    command = "rm -rf"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    _enable_tiers(monkeypatch)
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["status"] == "pending_approval"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_tier3_self_modify_scope_overrides_workspace_containment(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command referencing hermes-agent runtime targets is Tier 3 even when
+    every path argument technically resolves inside the task workspace (e.g.
+    the task workspace IS a hermes-agent worktree)."""
+    task_id = _create_running_task(monkeypatch)
+    nested = isolated_board / "hermes-agent" / "foo.py"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("x")
+    command = f"rm {nested}"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    _enable_tiers(monkeypatch)
+
+    # Sanity: without the self-modify override this WOULD be Tier 1.
+    from tools import approval
+    assert approval._looks_like_tier1_workspace_write(command, str(isolated_board)) is True
+    assert approval._matches_self_modify_scope(command) is True
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["status"] == "pending_approval"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_tier3_gitea_deletion_always_pings_even_when_enabled(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "git push --delete fork topic"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    _enable_tiers(monkeypatch)
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["status"] == "pending_approval"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_tier3_foreign_host_destructive_always_pings_even_when_enabled(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "ssh 192.168.1.155 rm -rf /data"
+    _configure_terminal_pending_guard(monkeypatch, command)
+    _enable_tiers(monkeypatch)
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["status"] == "pending_approval"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_tirith_critical_finding_overrides_to_tier3_never_auto_approved(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invariant 4: tirith CRITICAL can never be auto-approved, even for a
+    command that otherwise reads as Tier 0 (git status)."""
+    from tools import approval
+    import tools.tirith_security as tirith_security
+
+    task_id = _create_running_task(monkeypatch)
+    command = "git status"
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(
+        tirith_security, "check_command_security",
+        lambda _cmd: {
+            "action": "block",
+            "findings": [{"rule_id": "critical-thing", "severity": "CRITICAL", "title": "t", "description": "d"}],
+            "summary": "critical",
+        },
+    )
+    _enable_tiers(monkeypatch)
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["status"] == "pending_approval"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_classify_kanban_action_tirith_critical_is_tier3_unit(isolated_board: Path) -> None:
+    from tools import approval
+
+    tirith_result = {"action": "block", "findings": [{"severity": "critical"}]}
+    assert approval._classify_kanban_action(
+        "git status", mutation_kind="terminal-command", workspace="/tmp",
+        tirith_result=tirith_result,
+    ) == "tier3"
+
+
+def test_classify_kanban_action_execute_code_arbitrary_is_always_tier3_unit(
+    isolated_board: Path,
+) -> None:
+    """Invariant 2 (unit level): mutation_kind execute-code-arbitrary never
+    tier-classifies, regardless of how read-only/contained the payload looks."""
+    from tools import approval
+
+    assert approval._classify_kanban_action(
+        "print('hello')", mutation_kind="execute-code-arbitrary", workspace="/tmp",
+    ) == "tier3"
+
+
+# --- Invariant 3: the non-overridable deny floor is untouched -------------
+
+def test_hardline_deny_floor_unaffected_by_tiers_enabled(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    command = "rm -rf /"
+    _enable_tiers(monkeypatch)
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+
+    result = approval.check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert result.get("guard_outcome") == approval.GUARD_DENY_HARD
+    with kb.connect() as conn:
+        # Hardline block never even reaches the pending-action lifecycle.
+        assert kb.get_pending_action(conn, task_id) is None
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+# --- Invariant 5: no bypass for the PARTIAL-kanban-marker hard deny -------
+
+def test_partial_kanban_markers_still_hard_deny_terminal_with_tiers_enabled(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id = _create_running_task(monkeypatch)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)  # now PARTIAL
+    _enable_tiers(monkeypatch)
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+
+    result = approval.check_all_command_guards("git status", "local")
+    assert result["approved"] is False
+    assert result.get("guard_outcome") == approval.GUARD_DENY_HARD
+    assert "incomplete Kanban action context" in (result.get("message") or "")
+
+
+def test_partial_kanban_markers_still_hard_deny_execute_code_with_tiers_enabled(
+    isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_running_task(monkeypatch)
+    monkeypatch.delenv("HERMES_KANBAN_WORKSPACE", raising=False)  # now PARTIAL
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "")
+    _enable_tiers(monkeypatch)
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+
+    result = approval.check_execute_code_guard("print(1)", "local")
+    assert result["approved"] is False
+    assert result.get("guard_outcome") == approval.GUARD_DENY_HARD
+    assert "incomplete Kanban action context" in (result.get("message") or "")
+
+
+# --- Invariant 6: Manfred's Tier-3 list always pings (covered above by the
+# self-modify / gitea-deletion / foreign-host tests, repeated as an explicit
+# parametrized invariant so a future change to any single classifier cannot
+# silently drop one without a dedicated red test) --------------------------
+
+@pytest.mark.parametrize("command", [
+    "rm hermes-agent/foo.py",                  # self-modify, matched purely by text
+    "git push --delete fork topic",            # Gitea deletion
+    "ssh root@192.168.1.176 rm -rf /data",     # foreign-host destructive
+])
+def test_tier3_manifest_list_examples_always_classify_tier3(command: str) -> None:
+    from tools import approval
+
+    tier = approval._classify_kanban_action(
+        command, mutation_kind="terminal-command", workspace="/nonexistent-workspace",
+    )
+    assert tier == "tier3"
