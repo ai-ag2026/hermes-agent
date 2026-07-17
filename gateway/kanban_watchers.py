@@ -11,13 +11,15 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import time
 from urllib.parse import quote
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Optional
 
@@ -389,6 +391,619 @@ def _filter_operator_owned_triage_ids(
             continue
         kept.append(tid)
     return kept
+
+
+# ---------------------------------------------------------------------------
+# pm-supervisor tick (Autonomie-Umbau Baustein B, 2026-07-17)
+#
+# ``needs_input`` / ``gave_up`` / ``decompose_gave_up`` cards previously went
+# straight to a human ping once they landed in ``blocked``/``triage``. This
+# tick gives an autonomous "product manager" pass at them FIRST: an aux-LLM
+# call chooses one action from a small, bound set; trusted ``kb.*`` helpers
+# execute it. The LLM never mutates the board directly — see
+# ``_decide_pm_action`` / ``_execute_pm_decision`` below.
+#
+# Shape mirrors the auto-decompose tick on purpose (config resolver read
+# live every tick -> per-tick cap -> operator-authors exemption -> durable
+# attempt counter -> idempotent gave-up event), but the tick body itself is
+# module-level (not a closure inside ``_kanban_dispatcher_watcher``) so it —
+# and every helper it calls — can be unit-tested directly with an injected
+# ``call_llm_fn`` instead of only being reachable through the live gateway
+# loop.
+# ---------------------------------------------------------------------------
+
+_PM_SUPERVISOR_ATTEMPTED_EVENT = "pm_supervisor_attempted"
+_PM_SUPERVISOR_GAVE_UP_EVENT = "pm_supervisor_gave_up"
+_PM_SUPERVISOR_ESCALATED_EVENT = "pm_supervisor_escalated"
+_PM_SUPERVISOR_ACTOR = "pm-supervisor"
+
+_PM_VALID_ACTIONS = frozenset({
+    "answer_and_requeue", "clarify_dod", "reassign",
+    "decompose", "close_obsolete", "escalate",
+})
+
+_PM_FALLBACK_MEMO = {
+    "situation": "pm-supervisor could not resolve this card autonomously",
+    "options": [],
+    "recommendation": "manual triage required",
+    "cost_of_ignoring": "card stays stuck until a human looks",
+}
+
+
+def _resolve_pm_supervisor_settings(
+    load_config: Callable[[], Any],
+) -> "tuple[bool, int, int]":
+    """Resolve (enabled, per_tick, max_attempts), live, every tick.
+
+    Default is OFF (``pm_supervisor_enabled`` absent -> ``False``) — unlike
+    auto-decompose (a pre-existing default-on behaviour this project must
+    stay compatible with), the pm-supervisor is a NEW autonomy step the
+    operator opts into. Fails safe to disabled on any config-read error,
+    same reasoning as :func:`_resolve_auto_decompose_settings`: a transient
+    read glitch must never silently turn ON a feature that mutates the
+    board unattended.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return False, 3, 2
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    enabled = bool(kcfg.get("pm_supervisor_enabled", False))
+    try:
+        per_tick = int(kcfg.get("pm_supervisor_per_tick", 3) or 3)
+    except (TypeError, ValueError):
+        per_tick = 3
+    if per_tick < 1:
+        per_tick = 1
+    try:
+        max_attempts = int(kcfg.get("pm_supervisor_max_attempts", 2) or 2)
+    except (TypeError, ValueError):
+        max_attempts = 2
+    if max_attempts < 1:
+        max_attempts = 1
+    return enabled, per_tick, max_attempts
+
+
+def _count_pm_supervisor_attempts(kb_module: Any, task_id: str) -> int:
+    """Durable count of pm-supervisor touches on this card (K-10 pattern)."""
+    conn = kb_module.connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?",
+            (task_id, _PM_SUPERVISOR_ATTEMPTED_EVENT),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def _record_pm_supervisor_attempt(
+    kb_module: Any, task_id: str, *, action: str, outcome: str,
+) -> int:
+    """Record one pm-supervisor touch as a durable, auditable event.
+
+    Called exactly once per executed action, success or failure alike —
+    this is the auditability invariant: every pm mutation is traceable to
+    an event (this) plus a human-readable comment (written by the action
+    executor itself). Returns the new total attempt count.
+    """
+    conn = kb_module.connect()
+    try:
+        with kb_module.write_txn(conn):
+            kb_module._append_event(
+                conn, task_id, _PM_SUPERVISOR_ATTEMPTED_EVENT,
+                {"action": action, "outcome": outcome},
+            )
+        row = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?",
+            (task_id, _PM_SUPERVISOR_ATTEMPTED_EVENT),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def _record_pm_supervisor_gave_up_once(
+    kb_module: Any, task_id: str, *, attempts: int, limit: int,
+) -> bool:
+    """Idempotent ``pm_supervisor_gave_up`` event. True = newly recorded.
+
+    The card is left exactly where it is (status untouched) once the
+    attempt limit is hit — the regular attention/human escalation path
+    takes over from here, same handoff as the decompose loop-breaker.
+    """
+    conn = kb_module.connect()
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+            (task_id, _PM_SUPERVISOR_GAVE_UP_EVENT),
+        ).fetchone()
+        if exists:
+            return False
+        with kb_module.write_txn(conn):
+            kb_module._append_event(
+                conn, task_id, _PM_SUPERVISOR_GAVE_UP_EVENT,
+                {"attempts": attempts, "limit": limit},
+            )
+        return True
+    finally:
+        conn.close()
+
+
+def _list_pm_supervisor_candidate_ids(kb_module: Any, *, board_slug: str) -> "list[str]":
+    """Cards eligible for an autonomous pm pass on this board.
+
+    Two DISTINCT markers feed this, because ``block_reason_code`` is a real
+    ``tasks`` column but ``decompose_gave_up`` never lands there — it is
+    recorded ONLY as a ``task_events`` row by
+    :func:`_record_decompose_gave_up_once` (that card was already sitting in
+    triage and never went through ``block_task`` at all). So:
+
+    * ``block_kind = 'needs_input'`` on a ``blocked`` OR ``triage`` row —
+      covers plain needs_input blocks, the spawn-retry ``gave_up`` breaker
+      (which always pairs ``block_reason_code='gave_up'`` with
+      ``block_kind='needs_input'``, see ``kanban_db.py`` ~13835), and the
+      generic unblock-loop breaker's triage route (which preserves
+      ``block_kind`` when it reroutes ``blocked`` -> ``triage`` at
+      ``BLOCK_RECURRENCE_LIMIT``).
+    * a ``triage`` row with a ``decompose_gave_up`` event — the
+      auto-decompose loop-breaker's marker, which never touches
+      ``block_kind``/``block_reason_code``.
+
+    Excludes, fail-safe, right here (defense in depth — the per-candidate
+    handler re-checks these too right before executing, since the LLM
+    round-trip between selection and execution takes real time):
+    ``human_gate=1``, and any card with a live pending exact-action
+    approval. Fails open to an empty list on any DB error — a lookup
+    hiccup here must not crash the whole tick.
+    """
+    try:
+        conn = kb_module.connect(board=board_slug)
+    except Exception:
+        return []
+    try:
+        rows = conn.execute(
+            """
+            SELECT t.id FROM tasks t
+             WHERE t.status IN ('triage', 'blocked')
+               AND COALESCE(t.human_gate, 0) = 0
+               AND (
+                     t.block_kind = 'needs_input'
+                     OR (
+                          t.status = 'triage'
+                          AND EXISTS (
+                                SELECT 1 FROM task_events e
+                                 WHERE e.task_id = t.id AND e.kind = ?
+                              )
+                        )
+                   )
+               AND NOT EXISTS (
+                     SELECT 1 FROM task_pending_actions a
+                      WHERE a.task_id = t.id AND a.state IN ('pending', 'approved')
+                        AND a.expires_at > ?
+                   )
+             ORDER BY t.created_at ASC
+            """,
+            (_DECOMPOSE_GAVE_UP_EVENT, int(time.time())),
+        ).fetchall()
+        return [r["id"] for r in rows]
+    except Exception:
+        logger.debug(
+            "pm-supervisor: candidate lookup failed on board %s", board_slug, exc_info=True,
+        )
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@dataclass(frozen=True)
+class PmSupervisorDecision:
+    """One bound-action decision from the aux LLM. The LLM never executes
+    anything itself — it only fills this in; trusted ``kb.*`` helpers do
+    the actual mutation. See ``_execute_pm_decision``."""
+
+    action: str
+    comment: str = ""
+    assignee: Optional[str] = None
+    memo: Optional[dict] = None
+    severity: str = "routine"
+
+
+_PM_SYSTEM_PROMPT = """You are the pm-supervisor for the Hermes Agent Kanban board.
+
+A card is stuck: a worker asked a question and blocked (needs_input), or
+gave up after repeated failed attempts (gave_up / decompose_gave_up). Your
+job is to try to unstick it autonomously BEFORE a human is paged, using
+the context you're given (title, body, block reason, recent comments,
+current assignee, the available profile roster).
+
+You will be given the card's title/body, its status and block reason, the
+last several comments, the current assignee, and the roster of profiles
+work can be routed to.
+
+Output a single JSON object with this exact shape:
+
+  {
+    "action": "<one of: answer_and_requeue, clarify_dod, reassign, decompose, close_obsolete, escalate>",
+    "comment": "<text appropriate to the chosen action -- see below>",
+    "assignee": "<profile name from the roster, only for action=reassign, else omit/null>",
+    "memo": {
+      "situation": "<1-2 sentences, only for action=escalate>",
+      "options": ["<option 1>", "<option 2>", ...],
+      "recommendation": "<your recommendation>",
+      "cost_of_ignoring": "<what happens if nobody looks at this>"
+    },
+    "severity": "<critical|routine, only for action=escalate>"
+  }
+
+Action semantics — pick EXACTLY ONE:
+  - "answer_and_requeue": you can answer the worker's question yourself
+    from the given context. "comment" is that answer; the card goes back
+    to the queue.
+  - "clarify_dod": the worker's real problem is an ambiguous definition of
+    done. "comment" restates a concrete, checkable DoD; the card goes back
+    to the queue.
+  - "reassign": a different profile is clearly better suited. "assignee"
+    names it (must be from the roster); "comment" explains why.
+  - "decompose": the card needs to be broken into smaller pieces before
+    anyone can make progress on it. Only valid for a card currently in
+    the triage column.
+  - "close_obsolete": the card is no longer relevant (superseded,
+    duplicate, or the underlying need is gone). "comment" states why.
+  - "escalate": none of the above apply — this genuinely needs a human
+    decision. Fill in "memo" and "severity". Use "critical" only for
+    something time-sensitive or high-blast-radius; everything else is
+    "routine" (collected into the operator's regular digest, not paged
+    immediately).
+
+When you are not confident which action applies, or the context is too
+thin to safely answer/reassign/close, choose "escalate" with
+severity="routine" — do NOT guess at closing or reassigning a card you
+don't understand.
+
+No preamble, no closing remarks, no code fences. Output only the JSON
+object.
+"""
+
+_PM_USER_TEMPLATE = """Task id: {task_id}
+Title: {title}
+Body:
+{body}
+
+Status: {status}
+Block kind: {block_kind}
+Current assignee: {assignee}
+
+Recent comments (oldest first):
+{comments}
+
+Available profiles (for action=reassign):
+{roster}
+
+Default assignee (fallback when nothing fits): {default_assignee}
+"""
+
+
+def _pm_extract_json_blob(raw: str) -> "Optional[dict]":
+    """Lenient JSON-object extraction from an LLM response.
+
+    Deliberately a local copy of ``kanban_decompose._extract_json_blob``'s
+    fence-strip + outer-braces + ``json.loads`` approach rather than an
+    import — the two call sites belong to different modules and this repo's
+    convention (see that function's neighbours) keeps each aux-LLM response
+    parser self-contained. A shared ``json_blob`` utility would be a
+    reasonable follow-up if a third caller shows up.
+    """
+    if not raw:
+        return None
+    stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+    first = stripped.find("{")
+    last = stripped.rfind("}")
+    if first == -1 or last == -1 or last <= first:
+        return None
+    candidate = stripped[first : last + 1]
+    try:
+        val = json.loads(candidate)
+    except Exception:
+        return None
+    if not isinstance(val, dict):
+        return None
+    return val
+
+
+def _decide_pm_action(
+    call_llm_fn: Callable[..., Any],
+    *,
+    task: Any,
+    comments: "list[Any]",
+    profiles_roster: "list[dict]",
+    default_assignee: str,
+) -> PmSupervisorDecision:
+    """One aux-LLM call -> a bound-action decision.
+
+    Never raises. Any failure mode (API error, malformed JSON, unparsable
+    response, unknown/missing action) degrades to ``escalate``
+    severity="routine" — fail SAFE to a human, never silently closes,
+    reassigns, or no-ops a card it didn't understand (invariant 5).
+    """
+    recent = list(comments)[-8:]
+    comments_text = "\n".join(
+        f"- [{getattr(c, 'author', '?')}] {getattr(c, 'body', '')}" for c in recent
+    ) or "(no comments)"
+    roster_text = "\n".join(
+        f"  - {p.get('name')}: {p.get('description') or '(no description)'}"
+        for p in profiles_roster
+    ) or "  (no profiles installed)"
+    user_msg = _PM_USER_TEMPLATE.format(
+        task_id=getattr(task, "id", "?"),
+        title=(getattr(task, "title", "") or "")[:400],
+        body=(getattr(task, "body", "") or "(no body)")[:4000],
+        status=getattr(task, "status", "?"),
+        block_kind=getattr(task, "block_kind", None) or "(none)",
+        assignee=getattr(task, "assignee", None) or "(unassigned)",
+        comments=comments_text,
+        roster=roster_text,
+        default_assignee=default_assignee or "(none configured)",
+    )
+
+    def _fail_safe(situation: str) -> PmSupervisorDecision:
+        memo = dict(_PM_FALLBACK_MEMO)
+        memo["situation"] = situation
+        return PmSupervisorDecision(action="escalate", severity="routine", memo=memo)
+
+    try:
+        resp = call_llm_fn(
+            task="kanban_pm_supervisor",
+            messages=[
+                {"role": "system", "content": _PM_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=1500,
+            timeout=120,
+        )
+    except Exception as exc:
+        logger.info(
+            "pm-supervisor: LLM call failed for %s (%s)", getattr(task, "id", "?"), exc,
+        )
+        return _fail_safe(f"pm-supervisor LLM call failed: {type(exc).__name__}")
+
+    try:
+        raw = resp.choices[0].message.content or ""
+    except Exception:
+        raw = ""
+
+    parsed = _pm_extract_json_blob(raw)
+    if parsed is None:
+        return _fail_safe("pm-supervisor received malformed/unparsable JSON from the aux LLM")
+
+    action = parsed.get("action")
+    if action not in _PM_VALID_ACTIONS:
+        return _fail_safe(f"pm-supervisor LLM returned an unknown action {action!r}")
+
+    comment = parsed.get("comment")
+    comment = comment.strip() if isinstance(comment, str) else ""
+    assignee = parsed.get("assignee")
+    assignee = assignee.strip() if isinstance(assignee, str) and assignee.strip() else None
+    memo = parsed.get("memo")
+    memo = memo if isinstance(memo, dict) else None
+    severity = parsed.get("severity")
+    severity = severity if severity in ("critical", "routine") else "routine"
+    return PmSupervisorDecision(
+        action=action, comment=comment, assignee=assignee, memo=memo, severity=severity,
+    )
+
+
+def _pm_execute_escalate(
+    kb_module: Any, conn: Any, task_id: str, decision: PmSupervisorDecision,
+) -> "tuple[bool, str]":
+    """``escalate``: no status change — the card stays exactly where it is.
+
+    Writes a human-readable comment (deduplicated via ``add_comment_once``,
+    since a repeatedly-stuck card escalating with a similar memo each pass
+    must not spam identical comments) plus a ``pm_supervisor_escalated``
+    event carrying the structured memo as a loose payload key. Immediate
+    vs. digest-collected delivery for severity=critical/routine is left to
+    the attention/notifier cron to interpret from this event — this tick
+    deliberately does not touch the notification pipeline itself (see the
+    handover notes: that pipeline is a separate, carefully-gated surface).
+    """
+    memo = decision.memo if isinstance(decision.memo, dict) else dict(_PM_FALLBACK_MEMO)
+    situation = str(memo.get("situation") or _PM_FALLBACK_MEMO["situation"])[:1000]
+    recommendation = str(memo.get("recommendation") or "")[:1000]
+    comment_body = situation
+    if recommendation:
+        comment_body += f"\n\nRecommendation: {recommendation}"
+    kb_module.add_comment_once(conn, task_id, _PM_SUPERVISOR_ACTOR, comment_body.strip())
+    with kb_module.write_txn(conn):
+        kb_module._append_event(
+            conn, task_id, _PM_SUPERVISOR_ESCALATED_EVENT,
+            {"pm_memo": memo, "severity": decision.severity},
+        )
+    return True, f"escalate:{decision.severity}"
+
+
+def _execute_pm_decision(
+    kb_module: Any, task_id: str, decision: PmSupervisorDecision, *, board_slug: str,
+) -> "tuple[bool, str]":
+    """Execute exactly one bound action through trusted ``kb.*`` helpers.
+
+    Returns ``(ok, outcome_label)`` for the caller's audit event. Every
+    branch re-checks fresh DB state right before mutating — the LLM call
+    that produced ``decision`` can take real wall-clock time, and a human
+    or another process may have already moved the card in the meantime.
+    That re-check is defense in depth on top of the candidate-selection
+    filters, not a replacement for them.
+    """
+    conn = kb_module.connect(board=board_slug)
+    try:
+        task = kb_module.get_task(conn, task_id)
+        if task is None:
+            return False, "task_gone"
+        if task.status not in ("triage", "blocked"):
+            return False, "status_changed"
+        if task.human_gate:
+            return False, "human_gate_set"
+        if kb_module.get_pending_action(conn, task_id) is not None:
+            return False, "pending_action_appeared"
+
+        action = decision.action
+
+        if action in ("answer_and_requeue", "clarify_dod", "reassign"):
+            comment_body = decision.comment or f"pm-supervisor: {action}"
+            kb_module.add_comment(conn, task_id, _PM_SUPERVISOR_ACTOR, comment_body)
+            if action == "reassign":
+                if not decision.assignee:
+                    return False, "reassign_missing_assignee"
+                if not kb_module.assign_task(conn, task_id, decision.assignee):
+                    return False, "reassign_failed"
+            attn = kb_module.get_current_attention(conn, task_id)
+            result = kb_module.transition_task_status_with_attention(
+                conn, task_id=task_id, status="ready", actor=_PM_SUPERVISOR_ACTOR,
+                expected_attention_id=(attn.id if attn else None),
+                expected_attention_version=(attn.version if attn else None),
+            )
+            ok = getattr(result, "status", None) == "transitioned"
+            return ok, (action if ok else f"{action}_failed:{getattr(result, 'status', '?')}")
+
+        if action == "decompose":
+            if task.status != "triage":
+                # decompose_task only accepts triage-status cards -- a
+                # blocked candidate that the LLM chose "decompose" for is a
+                # structurally invalid decision. Fail safe to escalate
+                # rather than silently dropping it (extension of
+                # invariant 5 to "inapplicable", not just "unparsable").
+                return _pm_execute_escalate(
+                    kb_module, conn, task_id,
+                    replace(
+                        decision, action="escalate", severity="routine",
+                        memo={
+                            **_PM_FALLBACK_MEMO,
+                            "situation": "pm-supervisor chose decompose on a non-triage card",
+                        },
+                    ),
+                )
+            if decision.comment:
+                kb_module.add_comment(conn, task_id, _PM_SUPERVISOR_ACTOR, decision.comment)
+            from hermes_cli import kanban_decompose as _decomp
+            conn.close()  # decompose_task opens its own connection(s)
+            outcome = _decomp.decompose_task(task_id, author=_PM_SUPERVISOR_ACTOR)
+            return outcome.ok, ("decompose" if outcome.ok else f"decompose_failed:{outcome.reason}")
+
+        if action == "close_obsolete":
+            comment_body = decision.comment or "pm-supervisor: closing as obsolete"
+            kb_module.add_comment(conn, task_id, _PM_SUPERVISOR_ACTOR, comment_body)
+            ok = kb_module.archive_task(conn, task_id, actor=_PM_SUPERVISOR_ACTOR)
+            return ok, ("close_obsolete" if ok else "close_obsolete_failed")
+
+        if action == "escalate":
+            return _pm_execute_escalate(kb_module, conn, task_id, decision)
+
+        # Unreachable given _decide_pm_action's validation (action is always
+        # one of _PM_VALID_ACTIONS by construction) -- fail safe anyway.
+        return _pm_execute_escalate(
+            kb_module, conn, task_id, replace(decision, action="escalate", severity="routine"),
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _pm_supervisor_handle_candidate(
+    *, kb_module: Any, load_config: Callable[[], Any], call_llm_fn: Callable[..., Any],
+    board_slug: str, task_id: str,
+) -> None:
+    """Decide + execute + record for exactly one candidate card."""
+    conn = kb_module.connect(board=board_slug)
+    try:
+        task = kb_module.get_task(conn, task_id)
+        if task is None:
+            return
+        comments = kb_module.list_comments(conn, task_id)
+    finally:
+        conn.close()
+
+    try:
+        from hermes_cli import profiles as _profiles_mod
+        roster = [
+            {"name": p.name, "description": (p.description or "").strip()}
+            for p in _profiles_mod.list_profiles()
+        ]
+    except Exception:
+        roster = []
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    default_assignee = (kcfg.get("default_assignee") or "").strip() or (task.assignee or "")
+
+    decision = _decide_pm_action(
+        call_llm_fn, task=task, comments=comments,
+        profiles_roster=roster, default_assignee=default_assignee,
+    )
+    ok, outcome = _execute_pm_decision(kb_module, task_id, decision, board_slug=board_slug)
+    _record_pm_supervisor_attempt(kb_module, task_id, action=decision.action, outcome=outcome)
+
+
+def _pm_supervisor_tick(
+    *, kb_module: Any, load_config: Callable[[], Any], call_llm_fn: Callable[..., Any],
+    per_tick: int, max_attempts: int, operator_authors: "frozenset[str]",
+) -> int:
+    """Run the pm-supervisor for up to ``per_tick`` candidates across all
+    boards. Returns the number of candidates actually handled this tick
+    (attempt-limited gave-up skips don't consume the per-tick budget, same
+    as the auto-decompose tick's ``attempted`` counter)."""
+    try:
+        boards = kb_module.list_boards(include_archived=False)
+    except Exception:
+        boards = [kb_module.read_board_metadata(kb_module.DEFAULT_BOARD)]
+    handled = 0
+    for b in boards:
+        if handled >= per_tick:
+            break
+        slug = b.get("slug") or kb_module.DEFAULT_BOARD
+        prev_env = os.environ.get("HERMES_KANBAN_BOARD")
+        try:
+            os.environ["HERMES_KANBAN_BOARD"] = slug
+            candidate_ids = _list_pm_supervisor_candidate_ids(kb_module, board_slug=slug)
+            if candidate_ids:
+                candidate_ids = _filter_operator_owned_triage_ids(
+                    candidate_ids, board_slug=slug,
+                    operator_authors=operator_authors, kb_module=kb_module,
+                )
+            for tid in candidate_ids:
+                if handled >= per_tick:
+                    break
+                prior = _count_pm_supervisor_attempts(kb_module, tid)
+                if prior >= max_attempts:
+                    if _record_pm_supervisor_gave_up_once(
+                        kb_module, tid, attempts=prior, limit=max_attempts,
+                    ):
+                        logger.warning(
+                            "pm-supervisor [%s]: %s gave up after %d attempts (limit %d)",
+                            slug, tid, prior, max_attempts,
+                        )
+                    continue
+                handled += 1
+                try:
+                    _pm_supervisor_handle_candidate(
+                        kb_module=kb_module, load_config=load_config, call_llm_fn=call_llm_fn,
+                        board_slug=slug, task_id=tid,
+                    )
+                except Exception:
+                    logger.exception("pm-supervisor: candidate handling crashed on %s", tid)
+        finally:
+            if prev_env is None:
+                os.environ.pop("HERMES_KANBAN_BOARD", None)
+            else:
+                os.environ["HERMES_KANBAN_BOARD"] = prev_env
+    return handled
 
 
 def _root_dispatch_frozen() -> bool:
@@ -1695,6 +2310,30 @@ class GatewayKanbanWatchersMixin:
         # auto-decompose created and launched destructive tasks while the user
         # was still typing the task description, and the flag "couldn't be
         # disabled" because the gateway had captured its boot-time value.)
+        # pm-supervisor: give needs_input/gave_up/decompose_gave_up cards one
+        # autonomous pass BEFORE they page a human. Off by default
+        # (``kanban.pm_supervisor_enabled``); re-read live every tick, same
+        # reasoning as auto-decompose above. Runs BEFORE auto-decompose so a
+        # card the pm-supervisor routes to "decompose" is picked up by the
+        # very next block in this same tick, not a tick later.
+        def _read_pm_supervisor_settings() -> "tuple[bool, int, int]":
+            return _resolve_pm_supervisor_settings(_load_config)
+
+        def _pm_supervisor_tick_once(per_tick: int, max_attempts: int) -> int:
+            try:
+                from agent.auxiliary_client import call_llm as _call_llm
+            except Exception as exc:
+                logger.warning(
+                    "pm-supervisor: auxiliary client import failed (%s); skipping", exc,
+                )
+                return 0
+            operator_authors = _resolve_operator_authors(_load_config)
+            return _pm_supervisor_tick(
+                kb_module=_kb, load_config=_load_config, call_llm_fn=_call_llm,
+                per_tick=per_tick, max_attempts=max_attempts,
+                operator_authors=operator_authors,
+            )
+
         def _read_auto_decompose_settings() -> tuple[bool, int]:
             """Re-resolve (enabled, per_tick) from current config each tick."""
             return _resolve_auto_decompose_settings(_load_config)
@@ -1867,6 +2506,13 @@ class GatewayKanbanWatchersMixin:
                 pass
 
             try:
+                # pm-supervisor runs before auto-decompose (see comment at its
+                # definition above) — off by default, live-toggled each tick.
+                _pm_enabled, _pm_per_tick, _pm_max_attempts = _read_pm_supervisor_settings()
+                if _pm_enabled:
+                    await asyncio.to_thread(
+                        _pm_supervisor_tick_once, _pm_per_tick, _pm_max_attempts,
+                    )
                 # Re-read the auto-decompose toggle live each tick so a user
                 # flipping kanban.auto_decompose=false to STOP runaway fan-out
                 # takes effect on the next tick, not on gateway restart (#49638).
