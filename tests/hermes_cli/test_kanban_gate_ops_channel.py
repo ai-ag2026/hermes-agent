@@ -118,34 +118,46 @@ def test_ops_channel_escalate_seconds_configurable(isolated_kanban_home, monkeyp
         assert int(ops[0]["escalate_after_seconds"]) == 0  # immediate ops delivery
 
 
-# ── Weg 2: inherit the default board's subscriber channels on every board ──
+# ── Weg 2: operator channels on every board (leak-free rework) ──
 
-def test_default_board_subs_mirrored_to_other_board_gated_card(isolated_kanban_home):
+_OP_CH = [{"platform": "telegram", "chat_id": "-100home", "thread_id": "",
+           "escalate_after_seconds": 120}]
+
+
+def test_operator_channels_subscribed_on_other_board_gated_card(isolated_kanban_home, monkeypatch):
     kb = isolated_kanban_home
-    # default board: an operator cockpit + telegram subscriber on some card
-    with kb.connect(board="default") as dconn:
-        base = kb.create_task(dconn, title="anchor", assignee="pm")
-        kb.add_notify_sub(dconn, task_id=base, platform="webui", chat_id="browser-abc")
-        kb.add_notify_sub(dconn, task_id=base, platform="telegram", chat_id="-100777")
-        # ephemeral platforms must NOT be inherited
-        kb.add_notify_sub(dconn, task_id=base, platform="__session__", chat_id="sess-x")
-    # another board with a gated card, no local subs
+    monkeypatch.setattr(kb, "_operator_gate_channels", lambda: list(_OP_CH))
     with kb.connect(board="tars-ops") as conn:
         tid = _make_gated_card(kb, conn)
         assert list(kb.list_notify_subs(conn, task_id=tid)) == []
-        kb.mirror_default_board_subs_to_gated(conn, board="tars-ops")
+        n = kb.mirror_default_board_subs_to_gated(conn, board="tars-ops")
+        assert n == 1
         got = {(s["platform"], s["chat_id"]) for s in kb.list_notify_subs(conn, task_id=tid)}
-        assert ("webui", "browser-abc") in got
-        assert ("telegram", "-100777") in got
-        assert not any(p == "__session__" for p, _ in got)  # ephemeral excluded
+        assert ("telegram", "-100home") in got
         # idempotent
         kb.mirror_default_board_subs_to_gated(conn, board="tars-ops")
-        got2 = kb.list_notify_subs(conn, task_id=tid)
-        assert len([s for s in got2 if s["platform"] == "webui"]) == 1
+        assert len(kb.list_notify_subs(conn, task_id=tid)) == 1
 
 
-def test_mirror_is_noop_on_default_board(isolated_kanban_home):
+def test_mirror_does_not_leak_arbitrary_default_subs(isolated_kanban_home, monkeypatch):
+    """Finding 1 regression guard: a random subscriber on an unrelated default
+    task must NOT be propagated to another board's gated card."""
     kb = isolated_kanban_home
+    with kb.connect(board="default") as dconn:
+        base = kb.create_task(dconn, title="anchor", assignee="pm")
+        kb.add_notify_sub(dconn, task_id=base, platform="telegram", chat_id="-100stranger")
+    # no operator channels configured
+    monkeypatch.setattr(kb, "_operator_gate_channels", lambda: [])
+    with kb.connect(board="tars-ops") as conn:
+        tid = _make_gated_card(kb, conn)
+        assert kb.mirror_default_board_subs_to_gated(conn, board="tars-ops") == 0
+        subs = kb.list_notify_subs(conn, task_id=tid)
+        assert not any(s["chat_id"] == "-100stranger" for s in subs)
+
+
+def test_mirror_is_noop_on_default_board(isolated_kanban_home, monkeypatch):
+    kb = isolated_kanban_home
+    monkeypatch.setattr(kb, "_operator_gate_channels", lambda: list(_OP_CH))
     with kb.connect(board="default") as conn:
         tid = _make_gated_card(kb, conn)
         assert kb.mirror_default_board_subs_to_gated(conn, board="default") == 0
@@ -153,12 +165,35 @@ def test_mirror_is_noop_on_default_board(isolated_kanban_home):
 
 def test_mirror_disabled_by_config(isolated_kanban_home, monkeypatch):
     kb = isolated_kanban_home
-    with kb.connect(board="default") as dconn:
-        base = kb.create_task(dconn, title="anchor", assignee="pm")
-        kb.add_notify_sub(dconn, task_id=base, platform="webui", chat_id="browser-abc")
+    monkeypatch.setattr(kb, "_operator_gate_channels", lambda: list(_OP_CH))
     monkeypatch.setattr(kb, "_kanban_notify_config",
                         lambda: {"inherit_default_board_subs": False})
     with kb.connect(board="tars-ops") as conn:
         tid = _make_gated_card(kb, conn)
         assert kb.mirror_default_board_subs_to_gated(conn, board="tars-ops") == 0
         assert list(kb.list_notify_subs(conn, task_id=tid)) == []
+
+
+def test_gate_subs_respect_deliberate_unsubscribe(isolated_kanban_home, monkeypatch):
+    """Finding 2 regression guard: a removed sub is NOT revived every tick."""
+    kb = isolated_kanban_home
+    monkeypatch.setattr(kb, "_operator_gate_channels", lambda: list(_OP_CH))
+    with kb.connect(board="tars-ops") as conn:
+        tid = _make_gated_card(kb, conn)
+        kb.mirror_default_board_subs_to_gated(conn, board="tars-ops")
+        # operator removes it
+        kb.remove_notify_sub(conn, task_id=tid, platform="telegram", chat_id="-100home", thread_id="")
+        active = [s for s in kb.list_notify_subs(conn, task_id=tid) if s["platform"] == "telegram"]
+        assert active == []
+        # next notifier tick must NOT resurrect it
+        kb.mirror_default_board_subs_to_gated(conn, board="tars-ops")
+        active2 = [s for s in kb.list_notify_subs(conn, task_id=tid) if s["platform"] == "telegram"]
+        assert active2 == []
+
+
+def test_string_false_config_flag_disables(isolated_kanban_home, monkeypatch):
+    """Finding 5 regression guard: 'false' string must not read as truthy."""
+    kb = isolated_kanban_home
+    assert kb._cfg_flag({"x": "false"}, "x", True) is False
+    assert kb._cfg_flag({"x": "true"}, "x", False) is True
+    assert kb._cfg_flag({}, "x", True) is True

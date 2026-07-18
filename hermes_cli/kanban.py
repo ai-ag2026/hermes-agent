@@ -579,7 +579,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument(
         "--token", default=None,
         help=(
-            "One-time human-gate token, delivered via ntfy. Required to "
+            "One-time human-gate token (issued for this CLI flow; ntfy push is off by default). Required to "
             "complete a human_gate=1 card directly from blocked; ignored "
             "otherwise."
         ),
@@ -640,7 +640,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--human-gate", action="store_true",
         help=(
             "Hard-gate this card: unblocking it requires a one-time token "
-            "pushed to the operator via ntfy (Human-Gate v1) — no worker, "
+            "surfaced to the operator via the WebUI cockpit / Telegram (Human-Gate v1) — no worker, "
             "orchestrator, or tool call can lift it. Interactive/CLI marking "
             "only; use `kanban gate <id> off` to release without a token."
         ),
@@ -662,7 +662,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--token",
         default=None,
         help=(
-            "One-time human-gate token, delivered via ntfy. Required for "
+            "One-time human-gate token (issued for this CLI flow; ntfy push is off by default). Required for "
             "any card marked with `kanban block --human-gate` / `kanban "
             "gate <id> on`; ignored for ungated cards."
         ),
@@ -730,7 +730,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_promote.add_argument(
         "--token", default=None,
         help=(
-            "One-time human-gate token, delivered via ntfy. Required to "
+            "One-time human-gate token (issued for this CLI flow; ntfy push is off by default). Required to "
             "promote a human_gate=1 card from blocked; ignored otherwise. "
             "Applies to the primary task_id only, not --ids."
         ),
@@ -2511,7 +2511,14 @@ def _cmd_gate_token(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"{args.task_id}: {args.action} gate token delivered via ntfy")
+    # ntfy is off by default now; the token is issued for the CLI --token flow
+    # and the durable operator channel / cockpit deliver the notification.
+    from hermes_cli import kanban_db as _kb
+    if _kb.gate_notify_ntfy_enabled():
+        print(f"{args.task_id}: {args.action} gate token issued and pushed via ntfy")
+    else:
+        print(f"{args.task_id}: {args.action} gate token issued "
+              "(release via WebUI cockpit / Telegram, or `kanban {0} <id> --token <t>`)".format(args.action))
     return 0
 
 

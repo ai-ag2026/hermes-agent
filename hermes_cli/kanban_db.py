@@ -8614,11 +8614,20 @@ def _kanban_notify_config() -> dict:
         return {}
 
 
+def _cfg_flag(cfg: dict, key: str, default: bool) -> bool:
+    """Parse a boolean config flag tolerantly. ``bool("false")`` is True in
+    Python, so a stringly-typed ``key: "false"`` must not silently stay on."""
+    val = cfg.get(key, default)
+    if isinstance(val, str):
+        return val.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(val)
+
+
 def gate_notify_ntfy_enabled() -> bool:
     """Whether the legacy ntfy gate-token push is active. Default OFF: the
     durable operator channel (:func:`ensure_ops_channel_gate_subs`) plus the
     cockpit / interactive-CLI grant replaced ntfy for kanban gates."""
-    return bool(_kanban_notify_config().get("gate_notify_ntfy", False))
+    return _cfg_flag(_kanban_notify_config(), "gate_notify_ntfy", False)
 
 
 def resolve_gate_ops_channel() -> Optional[str]:
@@ -8647,7 +8656,7 @@ def ensure_ops_channel_gate_subs(conn: sqlite3.Connection, *, board: Optional[st
     Returns the number of gated cards (re)subscribed.
     """
     cfg = _kanban_notify_config()
-    if not bool(cfg.get("gate_ops_channel_enabled", True)):
+    if not _cfg_flag(cfg, "gate_ops_channel_enabled", True):
         return 0
     chat_id = resolve_gate_ops_channel()
     if not chat_id:
@@ -8673,6 +8682,7 @@ def ensure_ops_channel_gate_subs(conn: sqlite3.Connection, *, board: Optional[st
                 chat_id=chat_id,
                 notifier_profile="default",
                 escalate_after_seconds=escalate,
+                revive_tombstone=False,  # respect a deliberate unsubscribe
             )
             n += 1
         except Exception:
@@ -8683,32 +8693,86 @@ def ensure_ops_channel_gate_subs(conn: sqlite3.Connection, *, board: Optional[st
     return n
 
 
-# Platforms whose subscriptions are durable enough to inherit across boards.
-# ``__session__`` and ``tui`` are per-gateway-session / per-terminal ephemera
-# and must not be mirrored onto other boards' cards.
-_INHERITABLE_SUB_PLATFORMS = frozenset({"webui", "telegram", "discord"})
+def _operator_gate_channels() -> list[dict]:
+    """The operator's own durable channels that should hear about gates on any
+    board: the configured platform *home channels* (gateway.platforms.<p>.
+    home_channel), plus any explicit ``kanban.inherit_sub_chat_ids`` allowlist
+    entries. These are OPERATOR-OWNED, config-declared identities — never
+    identities harvested from arbitrary task subscriptions on some board, which
+    would leak one board's gate (and card titles) to whoever once subscribed to
+    an unrelated task elsewhere.
+
+    Each entry: ``{platform, chat_id, thread_id, escalate_after_seconds}``.
+    """
+    channels: list[dict] = []
+    seen: set[tuple] = set()
+
+    def _add(platform, chat_id, thread_id="", escalate=0):
+        platform = str(platform or "").strip().lower()
+        chat_id = str(chat_id or "").strip()
+        if not platform or not chat_id:
+            return
+        key = (platform, chat_id, str(thread_id or ""))
+        if key in seen:
+            return
+        seen.add(key)
+        try:
+            esc = max(0, int(escalate or 0))
+        except (TypeError, ValueError):
+            esc = 0
+        channels.append({"platform": platform, "chat_id": chat_id,
+                         "thread_id": str(thread_id or ""), "escalate_after_seconds": esc})
+
+    cfg = _kanban_notify_config()
+    # Escalation delay applied to home-channel gate subs (WebUI/cockpit first).
+    try:
+        home_escalate = max(0, int(cfg.get("gate_ops_escalate_seconds", 120)))
+    except (TypeError, ValueError):
+        home_escalate = 120
+
+    # Configured platform home channels (operator-owned, env-overlaid).
+    try:
+        from gateway.config import load_gateway_config
+        gw = load_gateway_config()
+        for platform, pcfg in gw.platforms.items():
+            hc = getattr(pcfg, "home_channel", None) if pcfg else None
+            if hc and getattr(hc, "chat_id", None):
+                name = getattr(platform, "value", platform)
+                _add(name, hc.chat_id, getattr(hc, "thread_id", "") or "", home_escalate)
+    except Exception:
+        pass
+
+    # Explicit operator allowlist (kanban.inherit_sub_chat_ids: list of dicts
+    # or "platform:chat_id" strings). For power users who want extra channels.
+    for item in (cfg.get("inherit_sub_chat_ids") or []):
+        try:
+            if isinstance(item, dict):
+                _add(item.get("platform"), item.get("chat_id"),
+                     item.get("thread_id", ""), item.get("escalate_after_seconds", home_escalate))
+            elif isinstance(item, str) and ":" in item:
+                p, c = item.split(":", 1)
+                _add(p, c, "", home_escalate)
+        except Exception:
+            continue
+    return channels
 
 
 def mirror_default_board_subs_to_gated(conn: sqlite3.Connection, *, board: Optional[str] = None) -> int:
-    """Copy the DEFAULT board's active subscriber identities onto every blocked
-    ``human_gate=1`` card on THIS (non-default) board.
+    """Subscribe the operator's own durable channels to every blocked
+    ``human_gate=1`` card on THIS (non-default) board, so a gate on any board
+    reaches the operator — realising *"every board uses the default board's
+    settings"* WITHOUT the cross-board leak of copying arbitrary task
+    subscriptions.
 
-    Boards are isolated (own DB) and have no per-board notification config, so a
-    gate on a board the operator's cockpit did not create tasks in had no WebUI
-    recipient. This realises the operator policy *"every board uses the default
-    board's settings"*: the default board's durable-ish subscriber channels
-    (``webui`` / ``telegram`` / ``discord`` — not the ephemeral ``__session__``
-    / ``tui`` ones) are mirrored onto other boards' gated cards, so the cockpit
-    the operator actually has open (subscribed on default) is notified about
-    gates everywhere. Delivered by the normal per-board notifier machinery.
-
-    Config: ``kanban.inherit_default_board_subs`` (default True). No-op on the
-    default board. Idempotent (``add_notify_sub`` upserts); scoped to gated
-    cards so it can't explode into a full cross-board subscription mirror.
-    Returns the number of (card, identity) subscriptions written.
+    Recipients come from :func:`_operator_gate_channels` (configured home
+    channels + explicit allowlist), NOT from reading another board's
+    subscription rows. No-op on the default board. Config-gated by
+    ``kanban.inherit_default_board_subs`` (default True). Deliberate
+    unsubscribes are respected (``revive_tombstone=False``). Idempotent; scoped
+    to gated cards. Returns the number of (card, channel) subscriptions written.
     """
     cfg = _kanban_notify_config()
-    if not bool(cfg.get("inherit_default_board_subs", True)):
+    if not _cfg_flag(cfg, "inherit_default_board_subs", True):
         return 0
     try:
         slug = _normalize_board_slug(board) or DEFAULT_BOARD
@@ -8716,54 +8780,33 @@ def mirror_default_board_subs_to_gated(conn: sqlite3.Connection, *, board: Optio
         slug = DEFAULT_BOARD
     if slug == DEFAULT_BOARD:
         return 0
+    channels = _operator_gate_channels()
+    if not channels:
+        return 0
     try:
         rows = conn.execute(
             "SELECT id FROM tasks WHERE status='blocked' AND human_gate=1"
         ).fetchall()
     except Exception:
         return 0
-    if not rows:
-        return 0
-    # Read the default board's distinct active subscriber identities.
-    identities: list = []
-    try:
-        dconn = connect(board=DEFAULT_BOARD)
-    except Exception:
-        return 0
-    try:
-        placeholders = ",".join("?" for _ in _INHERITABLE_SUB_PLATFORMS)
-        identities = dconn.execute(
-            "SELECT DISTINCT platform, chat_id, thread_id, notifier_profile, "
-            "escalate_after_seconds FROM kanban_notify_subs "
-            f"WHERE active=1 AND platform IN ({placeholders})",
-            tuple(_INHERITABLE_SUB_PLATFORMS),
-        ).fetchall()
-    except Exception:
-        identities = []
-    finally:
-        try:
-            dconn.close()
-        except Exception:
-            pass
-    if not identities:
-        return 0
     n = 0
     for row in rows:
-        for idn in identities:
+        for ch in channels:
             try:
                 add_notify_sub(
                     conn,
                     task_id=row["id"],
-                    platform=idn["platform"],
-                    chat_id=idn["chat_id"],
-                    thread_id=(idn["thread_id"] or None),
-                    notifier_profile=idn["notifier_profile"],
-                    escalate_after_seconds=int(idn["escalate_after_seconds"] or 0),
+                    platform=ch["platform"],
+                    chat_id=ch["chat_id"],
+                    thread_id=(ch["thread_id"] or None),
+                    notifier_profile="default",
+                    escalate_after_seconds=ch["escalate_after_seconds"],
+                    revive_tombstone=False,  # respect a deliberate unsubscribe
                 )
                 n += 1
             except Exception:
                 _log.warning(
-                    "human_gate: default-sub mirror failed for %s (board=%s)",
+                    "human_gate: operator-channel gate subscribe failed for %s (board=%s)",
                     row["id"], board,
                 )
     return n
@@ -16342,12 +16385,19 @@ def add_notify_sub(
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
     escalate_after_seconds: int = 0,
+    revive_tombstone: bool = True,
 ) -> None:
     """Register a channel, reactivating a tombstone with a new ABA generation.
 
     ``escalate_after_seconds`` > 0 marks an escalation-tier channel (e.g. the
     Telegram ops channel): its attention deliveries are only armed after the
     attention has gone unaddressed that long (see ``sync_attention_deliveries``).
+
+    ``revive_tombstone=False`` makes an explicitly-removed (``active=0``)
+    subscription STAY removed: the insert path still creates a fresh sub, but a
+    deactivated tombstone is left untouched. Auto-subscribers that re-run every
+    notifier tick (gate provisioning) pass False so a deliberate unsubscribe is
+    not resurrected 5 seconds later.
     """
     now = int(time.time())
     thread = thread_id or ""
@@ -16357,6 +16407,8 @@ def add_notify_sub(
         if row is None:
             conn.execute("INSERT INTO kanban_notify_subs (task_id,platform,chat_id,thread_id,user_id,notifier_profile,created_at,active,generation,escalate_after_seconds) VALUES (?,?,?,?,?,?,?,?,1,?)", (task_id, platform, chat_id, thread, user_id, notifier_profile, now, 1, esc))
         elif not int(row['active']):
+            if not revive_tombstone:
+                return  # deliberate unsubscribe — do not resurrect
             conn.execute("UPDATE kanban_notify_subs SET active=1, generation=generation+1, user_id=COALESCE(?, user_id), notifier_profile=COALESCE(?, notifier_profile), escalate_after_seconds=? WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?", (user_id, notifier_profile, esc, task_id, platform, chat_id, thread))
         elif notifier_profile:
             conn.execute("UPDATE kanban_notify_subs SET notifier_profile=? WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? AND (notifier_profile IS NULL OR notifier_profile='')", (notifier_profile, task_id, platform, chat_id, thread))
