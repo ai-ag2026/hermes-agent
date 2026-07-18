@@ -8605,6 +8605,84 @@ def send_gate_token_ntfy(
     return ok
 
 
+def _kanban_notify_config() -> dict:
+    """The ``kanban`` config subtree (notification/gate settings). Never raises."""
+    try:
+        from hermes_cli.config import load_config
+        return (load_config().get("kanban") or {})
+    except Exception:
+        return {}
+
+
+def gate_notify_ntfy_enabled() -> bool:
+    """Whether the legacy ntfy gate-token push is active. Default OFF: the
+    durable operator channel (:func:`ensure_ops_channel_gate_subs`) plus the
+    cockpit / interactive-CLI grant replaced ntfy for kanban gates."""
+    return bool(_kanban_notify_config().get("gate_notify_ntfy", False))
+
+
+def resolve_gate_ops_channel() -> Optional[str]:
+    """Durable, board-agnostic operator channel for gate notifications:
+    ``kanban.gate_ops_chat_id`` in config, else the ``TELEGRAM_OPS_CHANNEL``
+    env var. Returns None when neither is set (feature simply no-ops)."""
+    cfg = _kanban_notify_config()
+    cid = str(cfg.get("gate_ops_chat_id") or os.getenv("TELEGRAM_OPS_CHANNEL") or "").strip()
+    return cid or None
+
+
+def ensure_ops_channel_gate_subs(conn: sqlite3.Connection, *, board: Optional[str] = None) -> int:
+    """Idempotently subscribe the durable operator channel to every blocked,
+    ``human_gate=1`` card on this board's DB.
+
+    This is what makes a gate reach the operator on **any** board — not only
+    boards a browser cockpit happens to be watching. The WebUI subscriptions
+    are ephemeral per-session browser channels; this durable channel is the
+    board-agnostic safety net that replaced the old ntfy push. Delivered
+    through the normal per-board notifier machinery (native cursors/dedup);
+    ``escalate_after_seconds`` holds the ops push back so the WebUI cockpit
+    gets it first and the ops channel only escalates if it goes unaddressed.
+
+    Idempotent: ``add_notify_sub`` upserts on (task_id, platform, chat_id,
+    thread_id), so re-running every notifier tick is a harmless no-op.
+    Returns the number of gated cards (re)subscribed.
+    """
+    cfg = _kanban_notify_config()
+    if not bool(cfg.get("gate_ops_channel_enabled", True)):
+        return 0
+    chat_id = resolve_gate_ops_channel()
+    if not chat_id:
+        return 0
+    try:
+        escalate = int(cfg.get("gate_ops_escalate_seconds", 120))
+    except (TypeError, ValueError):
+        escalate = 120
+    escalate = max(0, escalate)
+    try:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status='blocked' AND human_gate=1"
+        ).fetchall()
+    except Exception:
+        return 0
+    n = 0
+    for row in rows:
+        try:
+            add_notify_sub(
+                conn,
+                task_id=row["id"],
+                platform="telegram",
+                chat_id=chat_id,
+                notifier_profile="default",
+                escalate_after_seconds=escalate,
+            )
+            n += 1
+        except Exception:
+            _log.warning(
+                "human_gate: ops-channel subscribe failed for %s (board=%s)",
+                row["id"], board,
+            )
+    return n
+
+
 def issue_and_notify_gate_token(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8612,20 +8690,26 @@ def issue_and_notify_gate_token(
     action: str = "unblock",
     board: Optional[str] = None,
 ) -> bool:
-    """Issue a fresh gate token for a blocked ``human_gate=1`` card and
-    push it via ntfy in one step. Returns True only if a token was both
-    issued and delivered.
+    """Issue a fresh gate token for a blocked ``human_gate=1`` card.
 
-    On any failure the card stays hard-blocked (fail closed): either no
-    token was issued at all (nothing to gate), or a token hash is now
-    persisted with nobody holding the plaintext. Rescue path in both
-    cases: ``hermes kanban gate <id> off`` (interactive CLI only).
+    By default (``kanban.gate_notify_ntfy`` off) the token is issued for the
+    interactive-CLI ``--token`` path but NOT pushed via ntfy — the durable
+    ops-channel subscription and the cockpit grant are the notify/release
+    paths now, so issuance succeeds without a delivery dependency (no
+    hard-lock). When ``gate_notify_ntfy`` is re-enabled, the legacy behaviour
+    returns: push via ntfy and fail-closed if delivery fails.
     """
     if action not in {"unblock", "complete", "promote"}:
         raise ValueError(f"unsupported human-gate action: {action}")
     token = issue_gate_token(conn, task_id, action=action, board=board)
     if token is None:
         return False
+    if not gate_notify_ntfy_enabled():
+        # ntfy is out of the kanban gate path; the durable ops channel
+        # (ensure_ops_channel_gate_subs) delivers the hint and the cockpit /
+        # `hermes kanban gate <id> off` release the card. Token issued for
+        # the CLI --token flow; nothing to deliver here.
+        return True
     delivered = send_gate_token_ntfy(task_id, token, board=board, action=action)
     if not delivered:
         _log.warning(

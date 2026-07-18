@@ -1767,16 +1767,31 @@ class GatewayKanbanWatchersMixin:
     def _kanban_issue_pending_gate_tokens(
         self, conn, *, board: Optional[str] = None,
     ) -> None:
-        """Issue + ntfy-push a fresh unblock token for every gated card
-        that doesn't currently have a redeemable one (Human-Gate v1).
+        """Provision gate notifications for every gated card on this board.
+
+        Two steps, both board-agnostic (they fire even when no chat platform
+        subscribed):
+          1. Subscribe the durable operator channel to every blocked,
+             human_gate card (``ensure_ops_channel_gate_subs``) so a gate
+             reaches the operator on ANY board via the normal notifier
+             delivery — this replaced the old ntfy push.
+          2. Issue a one-time CLI ``--token`` for cards without one (kept for
+             the interactive rescue path; ntfy delivery is off by default).
 
         Sync helper called from ``_kanban_notifier_watcher``'s per-board
         ``_collect()`` on the SAME connection it already opened for that
-        board this tick — no extra connect. Takes no ``self`` state; it's
-        an instance method only for stylistic consistency with the other
-        small kanban helpers on this mixin (``_kanban_advance`` etc.).
+        board this tick — no extra connect.
         """
         from hermes_cli import kanban_db as _kb
+        # (1) Durable ops-channel subscription for gated cards (idempotent).
+        try:
+            _kb.ensure_ops_channel_gate_subs(conn, board=board)
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: ops-channel gate subscribe failed for board %s: %s",
+                board, exc,
+            )
+        # (2) One-time CLI token issuance (ntfy push gated behind config).
         rows = conn.execute(
             "SELECT id FROM tasks WHERE status = 'blocked' AND human_gate = 1 "
             "AND gate_token_hash IS NULL"
