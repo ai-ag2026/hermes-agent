@@ -91,7 +91,10 @@ class _HandshakeNoiseFilter(logging.Filter):
             msg = record.getMessage()
         except Exception:
             return True
-        return "opening handshake failed" not in msg and "did not receive a valid HTTP request" not in msg
+        return (
+            "opening handshake failed" not in msg
+            and "did not receive a valid HTTP request" not in msg
+        )
 
 
 def check_requirements() -> bool:
@@ -122,8 +125,9 @@ class ReachyAdapter(BasePlatformAdapter):
         self._robots: Dict[str, Any] = {}
         # robot_id -> turn_id of the most recently dispatched client turn (see _current_turn_id)
         self._turn_ids: Dict[str, str] = {}
-        # tool_call_id -> Future awaiting the robot's tool_result (body-tool surface)
-        self._tool_futures: Dict[str, "asyncio.Future"] = {}
+        # tool_call_id -> (robot_id, websocket, Future) awaiting a tool_result.
+        # A call is owned by the exact connection that accepted its tool_call.
+        self._tool_futures: Dict[str, tuple[str, Any, "asyncio.Future"]] = {}
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -137,7 +141,12 @@ class ReachyAdapter(BasePlatformAdapter):
         try:
             self._server = await ws_serve(self._handle_conn, self._host, self._port)
         except Exception as e:  # pragma: no cover - bind failure path
-            logger.error("[reachy] failed to start ws server on %s:%s: %s", self._host, self._port, e)
+            logger.error(
+                "[reachy] failed to start ws server on %s:%s: %s",
+                self._host,
+                self._port,
+                e,
+            )
             return False
         self._mark_connected()
         global _ACTIVE_ADAPTER
@@ -151,6 +160,7 @@ class ReachyAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._mark_disconnected()
         for rid, ws in list(self._robots.items()):
+            self._fail_robot_tool_futures(rid, ws)
             try:
                 await ws.close()
             except Exception:
@@ -191,7 +201,18 @@ class ReachyAdapter(BasePlatformAdapter):
             # only drop the mapping if it still points at this socket
             if self._robots.get(robot_id) is websocket:
                 self._robots.pop(robot_id, None)
+            self._fail_robot_tool_futures(robot_id, websocket)
             logger.info("[reachy] robot disconnected: %s", robot_id)
+
+    def _fail_robot_tool_futures(self, robot_id: str, websocket: Any) -> None:
+        """Wake only calls whose exact owning connection has ended."""
+        for pending_robot_id, pending_websocket, fut in self._tool_futures.values():
+            if (
+                pending_robot_id == robot_id
+                and pending_websocket is websocket
+                and not fut.done()
+            ):
+                fut.set_exception(ConnectionError(f"robot {robot_id} disconnected"))
 
     @staticmethod
     def _robot_id_from_path(path: str) -> str:
@@ -232,14 +253,24 @@ class ReachyAdapter(BasePlatformAdapter):
                 await self._dispatch_text(robot_id, text, turn_id=turn_id)
         elif ftype == "tool_result":
             tcid = str(frame.get("tool_call_id") or "").strip()
-            fut = self._tool_futures.get(tcid)
-            if fut is not None and not fut.done():
-                fut.set_result(frame.get("result") if isinstance(frame.get("result"), dict) else {})
+            entry = self._tool_futures.get(tcid)
+            if (
+                entry is not None
+                and entry[0] == robot_id
+                and entry[1] is websocket
+                and not entry[2].done()
+            ):
+                fut = entry[2]
+                fut.set_result(
+                    frame.get("result") if isinstance(frame.get("result"), dict) else {}
+                )
         else:
             logger.debug("[reachy] unhandled frame type %r from %s", ftype, robot_id)
         return robot_id
 
-    async def _dispatch_text(self, robot_id: str, text: str, *, turn_id: Optional[str] = None) -> None:
+    async def _dispatch_text(
+        self, robot_id: str, text: str, *, turn_id: Optional[str] = None
+    ) -> None:
         source = self.build_source(
             chat_id=robot_id,
             chat_name=f"Reachy {robot_id}",
@@ -290,31 +321,48 @@ class ReachyAdapter(BasePlatformAdapter):
         return obj
 
     async def call_robot_tool(
-        self, robot_id: str, action: str, params: Optional[Dict[str, Any]] = None, *, timeout_s: float = 12.0
+        self,
+        robot_id: str,
+        action: str,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout_s: float = 12.0,
     ) -> Dict[str, Any]:
         """Body-tool surface (gap-map Stufe 3): push a tool_call frame to the robot app and
         await its tool_result. The app executes through its MovementManager/tool registry with
         a client-side allowlist; this side only correlates request and response."""
-        if robot_id not in self._robots:
+        websocket = self._robots.get(robot_id)
+        if websocket is None:
             return {"error": f"robot {robot_id} not connected"}
         tcid = uuid.uuid4().hex
         fut: "asyncio.Future" = asyncio.get_running_loop().create_future()
-        self._tool_futures[tcid] = fut
+        self._tool_futures[tcid] = (robot_id, websocket, fut)
         try:
-            ok = await self._push(
-                robot_id,
-                {"type": "tool_call", "tool_call_id": tcid, "action": action, "params": params or {}},
-            )
-            if not ok:
-                return {"error": f"robot {robot_id} not reachable"}
-            return await asyncio.wait_for(fut, timeout=timeout_s)
+            async with asyncio.timeout(timeout_s):
+                ok = await self._push(
+                    robot_id,
+                    {
+                        "type": "tool_call",
+                        "tool_call_id": tcid,
+                        "action": action,
+                        "params": params or {},
+                    },
+                    websocket=websocket,
+                )
+                if not ok:
+                    return {"error": f"robot {robot_id} not reachable"}
+                return await fut
         except asyncio.TimeoutError:
             return {"error": f"robot tool timed out after {timeout_s:.0f}s"}
+        except ConnectionError as e:
+            return {"error": str(e)}
         finally:
             self._tool_futures.pop(tcid, None)
 
-    async def _push(self, robot_id: str, obj: Dict[str, Any]) -> bool:
-        ws = self._robots.get(robot_id)
+    async def _push(
+        self, robot_id: str, obj: Dict[str, Any], *, websocket: Optional[Any] = None
+    ) -> bool:
+        ws = websocket if websocket is not None else self._robots.get(robot_id)
         if ws is None:
             return False
         try:
@@ -379,14 +427,18 @@ class ReachyAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"robot {chat_id} not connected")
         return SendResult(success=True, message_id=message_id)
 
-    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+    async def send_typing(
+        self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
         # Tagged like every outbound frame: untagged typing fell back to the client's temporal
         # rule and reset the ACTIVE turn's per-frame timeout even when it belonged to another
         # (e.g. proactive) turn (review 2026-07-02 round 2, P2). Tagged, it routes/drops cleanly
         # and doubles as the liveness signal for the client's stall watchdog.
         await self._push(
             chat_id,
-            self._tag_turn({"type": "typing", "robot_id": chat_id}, self._current_turn_id(chat_id)),
+            self._tag_turn(
+                {"type": "typing", "robot_id": chat_id}, self._current_turn_id(chat_id)
+            ),
         )
 
     async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
@@ -407,7 +459,11 @@ class ReachyAdapter(BasePlatformAdapter):
         await self._push(
             chat_id,
             self._tag_turn(
-                {"type": "turn_end", "robot_id": chat_id, "outcome": getattr(outcome, "value", str(outcome))},
+                {
+                    "type": "turn_end",
+                    "robot_id": chat_id,
+                    "outcome": getattr(outcome, "value", str(outcome)),
+                },
                 turn_id,
             ),
         )
@@ -437,7 +493,9 @@ def _env_enablement() -> Optional[dict]:
     return seed
 
 
-async def _standalone_send(pconfig, chat_id: str, message: str, **kwargs) -> Dict[str, Any]:
+async def _standalone_send(
+    pconfig, chat_id: str, message: str, **kwargs
+) -> Dict[str, Any]:
     """Out-of-process cron delivery is not possible: Reachy needs the live
     WebSocket held by the running gateway adapter."""
     return {

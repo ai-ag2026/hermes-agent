@@ -117,14 +117,23 @@ def test_transport_round_trip():
                 assert f1["kind"] == "stream" and f1["message_id"] == mid
                 assert f1["content"] == "Hallo" and f1["final"] is False
 
-                r2 = await adapter.edit_message("reachy", mid, "Hallo Manfred, wie geht", finalize=True)
+                r2 = await adapter.edit_message(
+                    "reachy", mid, "Hallo Manfred, wie geht", finalize=True
+                )
                 assert r2.success is True
                 f2 = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
-                assert f2["kind"] == "stream" and f2["content"] == "Hallo Manfred, wie geht"
+                assert (
+                    f2["kind"] == "stream"
+                    and f2["content"] == "Hallo Manfred, wie geht"
+                )
                 assert f2["final"] is True
 
                 # turn boundary: on_processing_complete -> turn_end frame
-                from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
+                from gateway.platforms.base import (
+                    MessageEvent,
+                    MessageType,
+                    ProcessingOutcome,
+                )
 
                 src = adapter.build_source(chat_id="reachy", user_id="reachy")
                 ev = MessageEvent(text="x", message_type=MessageType.TEXT, source=src)
@@ -168,7 +177,9 @@ def test_turn_id_echoed_on_interactive_frames_and_null_for_proactive():
 
         async def _fake_handle(event):
             # runs while _CURRENT_TURN_ID is set to the client's id
-            await adapter.edit_message("reachy", "m1", "Ein schwarzes Loch,", finalize=False)
+            await adapter.edit_message(
+                "reachy", "m1", "Ein schwarzes Loch,", finalize=False
+            )
             await adapter.on_processing_complete(event, _Outcome())
             assert event.metadata.get("reachy_turn_id") == "t-123"
 
@@ -177,17 +188,35 @@ def test_turn_id_echoed_on_interactive_frames_and_null_for_proactive():
         assert await adapter.connect() is True
         try:
             async with ws_connect(f"ws://127.0.0.1:{port}/robot/reachy") as client:
-                await client.send(json.dumps({"type": "stt", "text": "was ist ein schwarzes loch", "turn_id": "t-123"}))
+                await client.send(
+                    json.dumps({
+                        "type": "stt",
+                        "text": "was ist ein schwarzes loch",
+                        "turn_id": "t-123",
+                    })
+                )
                 say = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
-                assert say["type"] == "say" and say["turn_id"] == "t-123" and say["origin"] == "turn"
+                assert (
+                    say["type"] == "say"
+                    and say["turn_id"] == "t-123"
+                    and say["origin"] == "turn"
+                )
                 te = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
-                assert te["type"] == "turn_end" and te["turn_id"] == "t-123" and te["origin"] == "turn"
+                assert (
+                    te["type"] == "turn_end"
+                    and te["turn_id"] == "t-123"
+                    and te["origin"] == "turn"
+                )
 
                 # proactive: a send OUTSIDE any turn scope -> turn_id None, origin proactive
                 res = await adapter.send("reachy", "Recherche fertig: Wellington.")
                 assert res.success is True
                 pro = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
-                assert pro["type"] == "say" and pro["turn_id"] is None and pro["origin"] == "proactive"
+                assert (
+                    pro["type"] == "say"
+                    and pro["turn_id"] is None
+                    and pro["origin"] == "proactive"
+                )
         finally:
             await adapter.disconnect()
 
@@ -212,7 +241,9 @@ def test_interrupt_frame_dispatches_like_stt():
         assert await adapter.connect() is True
         try:
             async with ws_connect(f"ws://127.0.0.1:{port}/robot/reachy") as client:
-                await client.send(json.dumps({"type": "interrupt", "text": "stopp mal"}))
+                await client.send(
+                    json.dumps({"type": "interrupt", "text": "stopp mal"})
+                )
                 for _ in range(50):
                     if captured:
                         break
@@ -246,7 +277,9 @@ def test_pending_drain_frames_carry_latest_turn_id():
                 # emulated here by emitting the answer while ContextVar is still t-old.
                 await adapter._dispatch_text("reachy", "neue frage", turn_id="t-new")
                 # back in turn-1 context (ContextVar t-old): emit as the drain task would
-                await adapter.edit_message("reachy", "m-drain", "Antwort auf die neue Frage.", finalize=True)
+                await adapter.edit_message(
+                    "reachy", "m-drain", "Antwort auf die neue Frage.", finalize=True
+                )
             # second (nested) dispatch: no emission — the answer above stands in for it
 
         adapter.handle_message = _fake_handle  # type: ignore[assignment]
@@ -254,10 +287,20 @@ def test_pending_drain_frames_carry_latest_turn_id():
         assert await adapter.connect() is True
         try:
             async with ws_connect(f"ws://127.0.0.1:{port}/robot/reachy") as client:
-                await client.send(json.dumps({"type": "stt", "text": "alte frage", "turn_id": "t-old"}))
+                await client.send(
+                    json.dumps({
+                        "type": "stt",
+                        "text": "alte frage",
+                        "turn_id": "t-old",
+                    })
+                )
                 say = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
                 # emitted from the OLD context AFTER t-new was dispatched -> must carry t-new
-                assert say["type"] == "say" and say["turn_id"] == "t-new" and say["origin"] == "turn"
+                assert (
+                    say["type"] == "say"
+                    and say["turn_id"] == "t-new"
+                    and say["origin"] == "turn"
+                )
         finally:
             await adapter.disconnect()
 
@@ -281,9 +324,15 @@ def test_typing_frames_are_turn_tagged():
         assert await adapter.connect() is True
         try:
             async with ws_connect(f"ws://127.0.0.1:{port}/robot/reachy") as client:
-                await client.send(json.dumps({"type": "stt", "text": "hi", "turn_id": "t-9"}))
+                await client.send(
+                    json.dumps({"type": "stt", "text": "hi", "turn_id": "t-9"})
+                )
                 ty = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
-                assert ty["type"] == "typing" and ty["turn_id"] == "t-9" and ty["origin"] == "turn"
+                assert (
+                    ty["type"] == "typing"
+                    and ty["turn_id"] == "t-9"
+                    and ty["origin"] == "turn"
+                )
         finally:
             await adapter.disconnect()
 
@@ -307,24 +356,220 @@ def test_call_robot_tool_roundtrip_and_timeout():
                 async def robot_side():
                     frame = json.loads(await asyncio.wait_for(client.recv(), timeout=2))
                     assert frame["type"] == "tool_call" and frame["action"] == "emote"
-                    await client.send(json.dumps({
-                        "type": "tool_result", "tool_call_id": frame["tool_call_id"],
-                        "result": {"status": "queued", "emotion": frame["params"]["emotion"]},
-                        "robot_id": "reachy",
-                    }))
+                    await client.send(
+                        json.dumps({
+                            "type": "tool_result",
+                            "tool_call_id": frame["tool_call_id"],
+                            "result": {
+                                "status": "queued",
+                                "emotion": frame["params"]["emotion"],
+                            },
+                            "robot_id": "reachy",
+                        })
+                    )
 
                 robot_task = asyncio.create_task(robot_side())
-                result = await adapter.call_robot_tool("reachy", "emote", {"emotion": "happy"})
+                result = await adapter.call_robot_tool(
+                    "reachy", "emote", {"emotion": "happy"}
+                )
                 await robot_task
                 assert result == {"status": "queued", "emotion": "happy"}
 
                 # timeout path: nobody answers
                 t0 = asyncio.get_event_loop().time()
-                result2 = await adapter.call_robot_tool("reachy", "dance", {}, timeout_s=0.3)
+                result2 = await adapter.call_robot_tool(
+                    "reachy", "dance", {}, timeout_s=0.3
+                )
                 assert "timed out" in result2.get("error", "")
                 assert asyncio.get_event_loop().time() - t0 < 2.0
                 assert not adapter._tool_futures  # no leaked futures
         finally:
             await adapter.disconnect()
+
+    asyncio.run(scenario())
+
+
+def test_call_robot_tool_bounds_blocking_websocket_send_by_total_timeout():
+    """The tool-call budget covers the outbound WebSocket push, not just tool_result wait."""
+
+    class BlockingWebSocket:
+        async def send(self, _payload):
+            await asyncio.Event().wait()
+
+    async def scenario():
+        adapter = _make_adapter(_free_port())
+        adapter._robots["reachy"] = BlockingWebSocket()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        result = await asyncio.wait_for(
+            adapter.call_robot_tool(
+                "reachy", "emote", {"emotion": "happy"}, timeout_s=0.05
+            ),
+            timeout=0.25,
+        )
+        assert "timed out" in result.get("error", "")
+        assert loop.time() - started < 0.2
+        assert not adapter._tool_futures
+
+    asyncio.run(scenario())
+
+
+def test_robot_disconnect_fails_open_tool_call_without_waiting_for_timeout():
+    """A connection ending while a robot tool is open promptly releases its caller."""
+
+    class ConnectionWebSocket:
+        class Request:
+            path = "/robot/reachy"
+
+        request = Request()
+
+        def __init__(self):
+            self.sent = asyncio.Event()
+            self.disconnected = asyncio.Event()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await self.disconnected.wait()
+            raise StopAsyncIteration
+
+        async def send(self, _payload):
+            self.sent.set()
+
+    async def scenario():
+        adapter = _make_adapter(_free_port())
+        ws = ConnectionWebSocket()
+        connection_task = asyncio.create_task(adapter._handle_conn(ws))
+        for _ in range(10):
+            if adapter._robots.get("reachy") is ws:
+                break
+            await asyncio.sleep(0)
+        assert adapter._robots.get("reachy") is ws
+
+        tool_task = asyncio.create_task(
+            adapter.call_robot_tool("reachy", "emote", timeout_s=10)
+        )
+        await asyncio.wait_for(ws.sent.wait(), timeout=0.1)
+        ws.disconnected.set()
+        await asyncio.wait_for(connection_task, timeout=0.1)
+
+        result = await asyncio.wait_for(tool_task, timeout=0.2)
+        assert "disconnected" in result.get("error", "")
+        assert not adapter._tool_futures
+
+    asyncio.run(scenario())
+
+
+def test_stale_replaced_socket_disconnect_keeps_new_socket_tool_call_open():
+    """An old connection's finally must not fail a call owned by its replacement socket."""
+
+    class ConnectionWebSocket:
+        class Request:
+            path = "/robot/reachy"
+
+        request = Request()
+
+        def __init__(self):
+            self.sent = asyncio.Event()
+            self.disconnected = asyncio.Event()
+            self.frames = []
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await self.disconnected.wait()
+            raise StopAsyncIteration
+
+        async def send(self, payload):
+            self.frames.append(json.loads(payload))
+            self.sent.set()
+
+    async def scenario():
+        adapter = _make_adapter(_free_port())
+        old_ws = ConnectionWebSocket()
+        new_ws = ConnectionWebSocket()
+        old_task = asyncio.create_task(adapter._handle_conn(old_ws))
+        await asyncio.sleep(0)
+        new_task = asyncio.create_task(adapter._handle_conn(new_ws))
+        for _ in range(10):
+            if adapter._robots.get("reachy") is new_ws:
+                break
+            await asyncio.sleep(0)
+        assert adapter._robots.get("reachy") is new_ws
+
+        tool_task = asyncio.create_task(
+            adapter.call_robot_tool("reachy", "emote", timeout_s=10)
+        )
+        await asyncio.wait_for(new_ws.sent.wait(), timeout=0.1)
+        tool_call_id = new_ws.frames[0]["tool_call_id"]
+
+        old_ws.disconnected.set()
+        await asyncio.wait_for(old_task, timeout=0.1)
+        assert not tool_task.done()
+
+        await adapter._on_inbound(
+            "reachy",
+            json.dumps({
+                "type": "tool_result",
+                "tool_call_id": tool_call_id,
+                "result": {"status": "ok"},
+            }),
+            new_ws,
+        )
+        assert await asyncio.wait_for(tool_task, timeout=0.1) == {"status": "ok"}
+
+        new_ws.disconnected.set()
+        await asyncio.wait_for(new_task, timeout=0.1)
+
+    asyncio.run(scenario())
+
+
+def test_foreign_robot_tool_result_cannot_resolve_another_robots_call():
+    """A tool_result must match both the pending robot and its socket owner."""
+
+    class WebSocket:
+        def __init__(self):
+            self.sent = asyncio.Event()
+            self.frames = []
+
+        async def send(self, payload):
+            self.frames.append(json.loads(payload))
+            self.sent.set()
+
+    async def scenario():
+        adapter = _make_adapter(_free_port())
+        robot_a = WebSocket()
+        robot_b = WebSocket()
+        adapter._robots.update({"robot-a": robot_a, "robot-b": robot_b})
+
+        tool_task = asyncio.create_task(
+            adapter.call_robot_tool("robot-a", "emote", timeout_s=10)
+        )
+        await asyncio.wait_for(robot_a.sent.wait(), timeout=0.1)
+        tool_call_id = robot_a.frames[0]["tool_call_id"]
+
+        await adapter._on_inbound(
+            "robot-b",
+            json.dumps({
+                "type": "tool_result",
+                "tool_call_id": tool_call_id,
+                "result": {"status": "foreign"},
+            }),
+            robot_b,
+        )
+        assert not tool_task.done()
+
+        await adapter._on_inbound(
+            "robot-a",
+            json.dumps({
+                "type": "tool_result",
+                "tool_call_id": tool_call_id,
+                "result": {"status": "ok"},
+            }),
+            robot_a,
+        )
+        assert await asyncio.wait_for(tool_task, timeout=0.1) == {"status": "ok"}
 
     asyncio.run(scenario())
