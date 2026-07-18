@@ -1783,12 +1783,23 @@ class GatewayKanbanWatchersMixin:
         board this tick — no extra connect.
         """
         from hermes_cli import kanban_db as _kb
-        # (1) Durable ops-channel subscription for gated cards (idempotent).
+        # (1a) Durable ops-channel subscription for gated cards (idempotent).
         try:
             _kb.ensure_ops_channel_gate_subs(conn, board=board)
         except Exception as exc:
             logger.warning(
                 "kanban notifier: ops-channel gate subscribe failed for board %s: %s",
+                board, exc,
+            )
+        # (1b) Inherit the default board's subscriber channels onto this
+        # (non-default) board's gated cards, so the operator's cockpit is
+        # notified about gates on every board ("all boards use default's
+        # settings"). No-op on default; idempotent.
+        try:
+            _kb.mirror_default_board_subs_to_gated(conn, board=board)
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: default-sub mirror failed for board %s: %s",
                 board, exc,
             )
         # (2) One-time CLI token issuance (ntfy push gated behind config).

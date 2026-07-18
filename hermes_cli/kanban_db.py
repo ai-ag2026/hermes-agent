@@ -8683,6 +8683,92 @@ def ensure_ops_channel_gate_subs(conn: sqlite3.Connection, *, board: Optional[st
     return n
 
 
+# Platforms whose subscriptions are durable enough to inherit across boards.
+# ``__session__`` and ``tui`` are per-gateway-session / per-terminal ephemera
+# and must not be mirrored onto other boards' cards.
+_INHERITABLE_SUB_PLATFORMS = frozenset({"webui", "telegram", "discord"})
+
+
+def mirror_default_board_subs_to_gated(conn: sqlite3.Connection, *, board: Optional[str] = None) -> int:
+    """Copy the DEFAULT board's active subscriber identities onto every blocked
+    ``human_gate=1`` card on THIS (non-default) board.
+
+    Boards are isolated (own DB) and have no per-board notification config, so a
+    gate on a board the operator's cockpit did not create tasks in had no WebUI
+    recipient. This realises the operator policy *"every board uses the default
+    board's settings"*: the default board's durable-ish subscriber channels
+    (``webui`` / ``telegram`` / ``discord`` — not the ephemeral ``__session__``
+    / ``tui`` ones) are mirrored onto other boards' gated cards, so the cockpit
+    the operator actually has open (subscribed on default) is notified about
+    gates everywhere. Delivered by the normal per-board notifier machinery.
+
+    Config: ``kanban.inherit_default_board_subs`` (default True). No-op on the
+    default board. Idempotent (``add_notify_sub`` upserts); scoped to gated
+    cards so it can't explode into a full cross-board subscription mirror.
+    Returns the number of (card, identity) subscriptions written.
+    """
+    cfg = _kanban_notify_config()
+    if not bool(cfg.get("inherit_default_board_subs", True)):
+        return 0
+    try:
+        slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    except (TypeError, ValueError):
+        slug = DEFAULT_BOARD
+    if slug == DEFAULT_BOARD:
+        return 0
+    try:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status='blocked' AND human_gate=1"
+        ).fetchall()
+    except Exception:
+        return 0
+    if not rows:
+        return 0
+    # Read the default board's distinct active subscriber identities.
+    identities: list = []
+    try:
+        dconn = connect(board=DEFAULT_BOARD)
+    except Exception:
+        return 0
+    try:
+        placeholders = ",".join("?" for _ in _INHERITABLE_SUB_PLATFORMS)
+        identities = dconn.execute(
+            "SELECT DISTINCT platform, chat_id, thread_id, notifier_profile, "
+            "escalate_after_seconds FROM kanban_notify_subs "
+            f"WHERE active=1 AND platform IN ({placeholders})",
+            tuple(_INHERITABLE_SUB_PLATFORMS),
+        ).fetchall()
+    except Exception:
+        identities = []
+    finally:
+        try:
+            dconn.close()
+        except Exception:
+            pass
+    if not identities:
+        return 0
+    n = 0
+    for row in rows:
+        for idn in identities:
+            try:
+                add_notify_sub(
+                    conn,
+                    task_id=row["id"],
+                    platform=idn["platform"],
+                    chat_id=idn["chat_id"],
+                    thread_id=(idn["thread_id"] or None),
+                    notifier_profile=idn["notifier_profile"],
+                    escalate_after_seconds=int(idn["escalate_after_seconds"] or 0),
+                )
+                n += 1
+            except Exception:
+                _log.warning(
+                    "human_gate: default-sub mirror failed for %s (board=%s)",
+                    row["id"], board,
+                )
+    return n
+
+
 def issue_and_notify_gate_token(
     conn: sqlite3.Connection,
     task_id: str,

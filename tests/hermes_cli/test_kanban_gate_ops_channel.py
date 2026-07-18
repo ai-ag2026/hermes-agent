@@ -116,3 +116,49 @@ def test_ops_channel_escalate_seconds_configurable(isolated_kanban_home, monkeyp
         ops = [s for s in subs if s["chat_id"] == "-1009999999999"]
         assert len(ops) == 1
         assert int(ops[0]["escalate_after_seconds"]) == 0  # immediate ops delivery
+
+
+# ── Weg 2: inherit the default board's subscriber channels on every board ──
+
+def test_default_board_subs_mirrored_to_other_board_gated_card(isolated_kanban_home):
+    kb = isolated_kanban_home
+    # default board: an operator cockpit + telegram subscriber on some card
+    with kb.connect(board="default") as dconn:
+        base = kb.create_task(dconn, title="anchor", assignee="pm")
+        kb.add_notify_sub(dconn, task_id=base, platform="webui", chat_id="browser-abc")
+        kb.add_notify_sub(dconn, task_id=base, platform="telegram", chat_id="-100777")
+        # ephemeral platforms must NOT be inherited
+        kb.add_notify_sub(dconn, task_id=base, platform="__session__", chat_id="sess-x")
+    # another board with a gated card, no local subs
+    with kb.connect(board="tars-ops") as conn:
+        tid = _make_gated_card(kb, conn)
+        assert list(kb.list_notify_subs(conn, task_id=tid)) == []
+        kb.mirror_default_board_subs_to_gated(conn, board="tars-ops")
+        got = {(s["platform"], s["chat_id"]) for s in kb.list_notify_subs(conn, task_id=tid)}
+        assert ("webui", "browser-abc") in got
+        assert ("telegram", "-100777") in got
+        assert not any(p == "__session__" for p, _ in got)  # ephemeral excluded
+        # idempotent
+        kb.mirror_default_board_subs_to_gated(conn, board="tars-ops")
+        got2 = kb.list_notify_subs(conn, task_id=tid)
+        assert len([s for s in got2 if s["platform"] == "webui"]) == 1
+
+
+def test_mirror_is_noop_on_default_board(isolated_kanban_home):
+    kb = isolated_kanban_home
+    with kb.connect(board="default") as conn:
+        tid = _make_gated_card(kb, conn)
+        assert kb.mirror_default_board_subs_to_gated(conn, board="default") == 0
+
+
+def test_mirror_disabled_by_config(isolated_kanban_home, monkeypatch):
+    kb = isolated_kanban_home
+    with kb.connect(board="default") as dconn:
+        base = kb.create_task(dconn, title="anchor", assignee="pm")
+        kb.add_notify_sub(dconn, task_id=base, platform="webui", chat_id="browser-abc")
+    monkeypatch.setattr(kb, "_kanban_notify_config",
+                        lambda: {"inherit_default_board_subs": False})
+    with kb.connect(board="tars-ops") as conn:
+        tid = _make_gated_card(kb, conn)
+        assert kb.mirror_default_board_subs_to_gated(conn, board="tars-ops") == 0
+        assert list(kb.list_notify_subs(conn, task_id=tid)) == []
