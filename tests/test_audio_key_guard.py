@@ -45,6 +45,26 @@ class TestBaseUrlIsPrivate:
         with patch("socket.getaddrinfo", side_effect=OSError("nxdomain")):
             assert base_url_is_private("https://transient.example.com/v1") is False
 
+    def test_cgnat_range_is_private(self):
+        # RFC 6598 100.64.0.0/10 is not ipaddress.is_private but must be withheld.
+        with patch("socket.getaddrinfo",
+                   return_value=[(2, 1, 6, "", ("100.64.0.5", 443))]):
+            assert base_url_is_private("https://cgnat.example.com/v1") is True
+
+    def test_hanging_dns_does_not_block_and_is_non_private(self):
+        import time as _t
+
+        def _slow(*a, **k):
+            _t.sleep(30)  # simulate a hung resolver
+            return []
+
+        with patch("socket.getaddrinfo", _slow):
+            start = _t.monotonic()
+            got = base_url_is_private("https://hang.example.com/v1")
+            elapsed = _t.monotonic() - start
+        assert got is False
+        assert elapsed < 5  # bounded by the 3s join deadline, not 30s
+
     def test_any_private_answer_trips_the_guard(self):
         # Mixed answers: one public, one private → private wins (fail-safe).
         with patch("socket.getaddrinfo", return_value=[
