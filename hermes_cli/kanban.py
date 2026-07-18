@@ -1755,7 +1755,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"  status:    {task.status}")
     if task.human_gate:
         # Never print the hash — only ever the fact that a gate exists.
-        print("  HUMAN GATE: on (unblock needs a one-time token via ntfy)")
+        print("  HUMAN GATE: on (release via the WebUI cockpit / Telegram gate button, "
+              "or `hermes kanban gate <id> off`)")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
@@ -3396,7 +3397,7 @@ Common subcommands:
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
-  `block <id> [reason]` Mark blocked (add `--human-gate` for a hard ntfy-token gate); `schedule <id> [reason]` parks time-delay work; `unblock <id> [--token …]` to revive; `gate <id> on|off` to (un)mark a gate
+  `block <id> [reason]` Mark blocked (add `--human-gate` for a hard human gate, released via WebUI cockpit / Telegram / `gate <id> off`); `schedule <id> [reason]` parks time-delay work; `unblock <id> [--token …]` to revive; `gate <id> on|off` to (un)mark a gate
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts
