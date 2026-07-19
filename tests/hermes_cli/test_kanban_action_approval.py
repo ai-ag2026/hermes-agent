@@ -3086,6 +3086,28 @@ def test_tier0_disqualifies_compound_command(isolated_board: Path) -> None:
     assert approval._looks_like_tier0_readonly("cat foo | rm bar") is False
 
 
+def test_tier0_rejects_test_runners_and_interpreters(isolated_board: Path) -> None:
+    """Test/build commands execute project code and write files.
+
+    Empirically confirmed 2026-07-19: a command classified read-only here
+    created a file in the same run. They must stay mutations.
+    """
+    from tools import approval
+
+    for command in (
+        "pytest",
+        "pytest tests/",
+        "python3 -m pytest -q",
+        "python -m py_compile foo.py",
+        "python3 -m py_compile foo.py",
+    ):
+        assert approval._looks_like_tier0_readonly(command) is False, command
+
+    # Genuinely read-only verbs stay Tier 0.
+    assert approval._looks_like_tier0_readonly("git status") is True
+    assert approval._looks_like_tier0_readonly("cat README.md") is True
+
+
 def test_tier1_workspace_write_auto_approves_and_audits(
     isolated_board: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -865,6 +865,65 @@ class _IdempotencyCache:
 _idem_cache = _IdempotencyCache()
 
 
+class _RunIdempotencyRegistry:
+    """Map ``Idempotency-Key`` -> already-started run for POST /v1/runs.
+
+    A run start is not a cacheable computation: it has side effects (an agent
+    executes tools) and returns immediately. A client that retries after its
+    own request timeout must therefore get *the same* ``run_id`` back rather
+    than a second privileged run. Reusing the same key with a different body
+    is a client bug, not a retry, and is reported as a conflict instead of
+    silently binding to the earlier run.
+
+    Reservation and lookup happen without awaiting, so concurrent handlers on
+    the single-threaded event loop cannot interleave into a double start.
+    """
+
+    def __init__(self, max_items: int = 1000, ttl_seconds: int = 900):
+        from collections import OrderedDict
+
+        self._store: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._ttl = ttl_seconds
+        self._max = max_items
+
+    def _purge(self) -> None:
+        now = time.time()
+        for key in [k for k, v in self._store.items() if now - v["ts"] > self._ttl]:
+            self._store.pop(key, None)
+        while len(self._store) > self._max:
+            self._store.popitem(last=False)
+
+    @staticmethod
+    def fingerprint(body: Dict[str, Any]) -> str:
+        canonical = json.dumps(body, sort_keys=True, default=str, ensure_ascii=False)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def lookup(self, key: str, fingerprint: str) -> tuple[Optional[str], bool]:
+        """Return ``(run_id, conflict)`` for a known key.
+
+        ``(None, False)`` means the key is new and the caller owns the start.
+        """
+        self._purge()
+        item = self._store.get(key)
+        if item is None:
+            return None, False
+        if item["fp"] != fingerprint:
+            return None, True
+        return item["run_id"], False
+
+    def reserve(self, key: str, fingerprint: str, run_id: str) -> None:
+        self._store[key] = {"run_id": run_id, "fp": fingerprint, "ts": time.time()}
+        self._store.move_to_end(key)
+        self._purge()
+
+    def release(self, key: str) -> None:
+        """Drop a reservation whose run never started (rejected/failed)."""
+        self._store.pop(key, None)
+
+
+_run_idem_registry = _RunIdempotencyRegistry()
+
+
 def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     from hashlib import sha256
     subset = {k: body.get(k) for k in keys}
@@ -4946,7 +5005,36 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        # Idempotent retries: a client whose POST timed out must be able to
+        # re-send it without starting a second privileged run (#1925 S2a).
+        idem_key = (request.headers.get("Idempotency-Key") or "").strip()
+        idem_fp = ""
+        if idem_key:
+            idem_fp = _RunIdempotencyRegistry.fingerprint(body)
+            existing_run_id, conflict = _run_idem_registry.lookup(idem_key, idem_fp)
+            if conflict:
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was already used with a different request body",
+                        err_type="invalid_request_error",
+                    ),
+                    status=409,
+                )
+            if existing_run_id:
+                status = self._run_statuses.get(existing_run_id, {})
+                return web.json_response(
+                    {
+                        "run_id": existing_run_id,
+                        "status": status.get("status", "running"),
+                        "created_at": status.get("created_at", time.time()),
+                        "idempotent_replay": True,
+                    },
+                    status=200,
+                )
+
         run_id = f"run_{uuid.uuid4().hex}"
+        if idem_key:
+            _run_idem_registry.reserve(idem_key, idem_fp, run_id)
         session_id = body.get("session_id") or stored_session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
