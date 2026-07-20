@@ -90,6 +90,7 @@ import logging
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2647,6 +2648,76 @@ def _migrate_task_attention_shape(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX idx_task_attentions_task_created ON task_attentions(task_id, created_at DESC)")
 
 
+def _migrate_board_identity(conn: sqlite3.Connection) -> None:
+    """Give each board an immutable ``board_uuid`` (ADR-1, D0).
+
+    Why boards need an identity at all. Task ids are ``"t_" + token_hex(4)``
+    and are generated **per board**, with a single retry on collision *within*
+    one database. Two boards can therefore hand out the same ``t_xxxxxxxx``
+    with nothing to detect it. Any cross-board reference built on the task id
+    alone is globally ambiguous, so ``work_uid`` needs a board namespace.
+
+    Why not the directory slug. Slugs are renameable. A reference minted today
+    would silently point at nothing -- or worse, at a different board -- after
+    a rename. The uuid survives renames; that is its entire job.
+
+    Why a trigger and not a convention. ADR-1 asks for a *mechanical* guard.
+    A rewritten ``board_uuid`` invalidates every existing ``work_uid``
+    reference at once, and it does so silently. Clone and import tooling must
+    go through an explicit, audited ``reidentify`` step on a target that is
+    not yet mounted -- that is a new identity, not a restore.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS board_meta ("
+        "  key TEXT PRIMARY KEY,"
+        "  value TEXT NOT NULL,"
+        "  created_at INTEGER"
+        ")"
+    )
+    # Created only when absent. A restore of the *same* logical board keeps
+    # its uuid, so references stay valid after disaster recovery.
+    conn.execute(
+        "INSERT OR IGNORE INTO board_meta (key, value, created_at) "
+        "VALUES ('board_uuid', ?, strftime('%s','now'))",
+        (str(uuid.uuid4()),),
+    )
+    # A plain UPDATE is refused. The trigger is the guard; the comment above
+    # is only the reason.
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS board_uuid_immutable "
+        "BEFORE UPDATE OF value ON board_meta "
+        "WHEN OLD.key = 'board_uuid' "
+        "BEGIN SELECT RAISE(ABORT, 'board_uuid is immutable; use the audited "
+        "reidentify path on an unmounted target'); END"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS board_uuid_undeletable "
+        "BEFORE DELETE ON board_meta "
+        "WHEN OLD.key = 'board_uuid' "
+        "BEGIN SELECT RAISE(ABORT, 'board_uuid is immutable'); END"
+    )
+
+
+def get_board_uuid(conn: sqlite3.Connection) -> Optional[str]:
+    """Return this board's immutable uuid, or None on a pre-D0 database."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM board_meta WHERE key='board_uuid'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return row[0] if row else None
+
+
+def build_work_uid(board_uuid: str, task_id: str) -> str:
+    """Compose the globally unique work identifier.
+
+    Namespaced because ``task_id`` alone is not unique across boards -- see
+    ``_migrate_board_identity``.
+    """
+    return f"kanban:{board_uuid}:{task_id}"
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -2948,6 +3019,93 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ):
         if name not in cols:
             _add_column_if_missing(conn, "tasks", name, definition)
+
+    # ----- D0: Work-Contract-Felder (Hauptsession-Umbau, ADR-1) -----
+    #
+    # The gap matrix in ADR-1 compared the work contract from GESAMTSKIZZE
+    # v4.1 §W1 against the live schema: of 19 target fields, 8 already existed
+    # under a different name and 3 more existed but incompletely. Only these
+    # remain, and none of them needs a different data shape -- they are scalar
+    # columns. That is why there is no new work database: the 60-column
+    # ``tasks`` table already IS the work store.
+    #
+    # Every column is nullable with no default. NULL is the honest value for
+    # a legacy row: it means "this task predates the contract", not "the
+    # contract is satisfied" and not "it is violated". Back-filling a guess
+    # would make old cards indistinguishable from cards that genuinely
+    # declared their terms.
+    for name, definition, _why in (
+        # What kind of work this is. Cron-style standing work behaves
+        # differently from one-shot work; today that distinction lives only in
+        # the producer, not in the row.
+        ("work_kind", "work_kind TEXT", "one-shot vs. standing"),
+        ("standing_state", "standing_state TEXT", "lifecycle of standing work"),
+        # Which core (agent identity) owns the work. Deliberately NOT
+        # person_id -- ADR-5 keeps the human and the acting core separate, so
+        # that "Manfred asked for it" and "this core is accountable for it"
+        # never collapse into one field.
+        ("owner_core_id", "owner_core_id TEXT", "accountable core, per ADR-5"),
+        # Where the work came from. Today every task is implicitly
+        # conversation-born; once cron, processes and webhooks create work,
+        # that assumption stops holding.
+        ("origin_kind", "origin_kind TEXT", "conversation|cron|process|webhook"),
+        ("origin_key", "origin_key TEXT", "dedup key, see unique index below"),
+        ("origin_conversation_ref", "origin_conversation_ref TEXT", "back-reference"),
+        # Content fingerprint of the originating request. ADR-4 uses it to
+        # tell "the same request retried" from "a different request that
+        # happens to reuse a key" -- the second must fail loudly, not silently
+        # dedupe into the first.
+        ("payload_digest", "payload_digest TEXT", "same-key-different-body guard"),
+        # Acceptance AFTER a run. This is a different concept from
+        # ``human_gate``, which is approval BEFORE an action. Conflating them
+        # was an early error in the design: a card can need neither, either or
+        # both.
+        ("acceptance_required", "acceptance_required INTEGER", "review after run"),
+        ("review_policy_version", "review_policy_version TEXT", "which policy applied"),
+        # Writer generation for CAS. ADR-6 is explicit that this is NOT an
+        # authority transfer to some other component -- it is a monotone
+        # counter that lets a stale writer detect it has been superseded.
+        ("authority_epoch", "authority_epoch INTEGER", "writer generation, ADR-6"),
+        ("writer_mode", "writer_mode TEXT", "how the current writer holds it"),
+        # A promise the system made and must keep across sessions. Without a
+        # persisted commitment, "I'll get back to you" dies with the process
+        # that said it.
+        ("commitment", "commitment TEXT", "durable promise"),
+        ("commitment_due_at", "commitment_due_at INTEGER", "when it comes due"),
+        # Prose goal/DoD. ``completion_contract`` is a closed set of three
+        # boolean evidence flags and rejects unknown keys; it cannot express
+        # "done means the client can log in from the LAN". That text lives in
+        # ``body`` today, where nothing can check it.
+        ("definition_of_done", "definition_of_done TEXT", "prose DoD"),
+        # Tenant as resolved at creation time. The live ``tenant`` column can
+        # be re-pointed later; an audit needs to know what was true when the
+        # work was accepted.
+        ("route_tenant_snapshot", "route_tenant_snapshot TEXT", "tenant at creation"),
+    ):
+        if name not in cols:
+            _add_column_if_missing(conn, "tasks", name, definition)
+
+    # ADR-4: dedup on (origin_kind, origin_key) instead of the racy
+    # ``idempotency_key`` check-then-insert. A PARTIAL index is required --
+    # a plain UNIQUE would collapse every legacy NULL row into one conflict.
+    # The predicate must be repeated verbatim in any ``ON CONFLICT`` target
+    # that means to hit this index; SQLite matches partial indexes by
+    # predicate, and omitting it fails at runtime rather than at parse time.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_origin_key "
+        "ON tasks(origin_kind, origin_key) "
+        "WHERE origin_key IS NOT NULL AND origin_kind IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_owner_core "
+        "ON tasks(owner_core_id) WHERE owner_core_id IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_commitment_due "
+        "ON tasks(commitment_due_at) WHERE commitment_due_at IS NOT NULL"
+    )
+
+    _migrate_board_identity(conn)
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
