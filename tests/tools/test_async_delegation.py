@@ -6,6 +6,7 @@ formatting, capacity rejection, and crash handling.
 """
 
 import json
+import logging
 import os
 import queue
 import subprocess
@@ -339,6 +340,62 @@ def test_submit_failure_removes_durable_running_record(tmp_path, monkeypatch):
     assert result["status"] == "rejected"
     with ad._DB_LOCK, ad._connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone()[0] == 0
+
+
+def _persist_terminal(delegation_id: str, dispatched_at: float, *, delivered: bool) -> None:
+    ad._persist_dispatch(
+        {
+            "delegation_id": delegation_id,
+            "session_key": "owner",
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": dispatched_at,
+        }
+    )
+    ad._persist_completion(
+        {
+            "delegation_id": delegation_id,
+            "status": "completed",
+            "completed_at": dispatched_at,
+        },
+        {"status": "completed", "summary": delegation_id},
+    )
+    if delivered:
+        ad.mark_completion_delivered(delegation_id)
+
+
+def test_terminal_cap_never_deletes_undelivered_completions(tmp_path, monkeypatch, caplog):
+    """Overflowing the cap with pending-only records must not lose results.
+
+    Regression for the 2026-07-19 finding: three unacknowledged completions
+    under a cap of two silently dropped the oldest one, so a requester waiting
+    for that result never learned it existed.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
+    for index in range(3):
+        _persist_terminal(f"deleg_pending_{index}", float(index + 1), delivered=False)
+
+    ad._prune_durable_records()
+
+    survivors = [
+        f"deleg_pending_{i}" for i in range(3) if ad.get_durable_delegation(f"deleg_pending_{i}")
+    ]
+    assert survivors == ["deleg_pending_0", "deleg_pending_1", "deleg_pending_2"]
+
+
+def test_pending_overflow_warns_instead_of_discarding(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_MAX_DURABLE_PENDING", 1)
+    for index in range(2):
+        _persist_terminal(f"deleg_overflow_{index}", float(index + 1), delivered=False)
+
+    with caplog.at_level(logging.WARNING, logger=ad.logger.name):
+        ad._prune_durable_records()
+
+    assert ad.get_durable_delegation("deleg_overflow_0") is not None
+    assert ad.get_durable_delegation("deleg_overflow_1") is not None
+    assert any("backpressure" in record.message for record in caplog.records)
 
 
 def test_pending_retention_prunes_delivered_before_undelivered(tmp_path, monkeypatch):

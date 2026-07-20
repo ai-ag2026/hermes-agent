@@ -2060,11 +2060,17 @@ def _tiers_enabled() -> bool:
 # is always safe; auto-approving a compound command on a partial parse is not.
 _TIER_SHELL_METACHAR_RE = re.compile(r"[;&|`]|\$\(|<\(|>\(|>|<")
 
+# Tier 0 is "reading cannot mutate anything". Test runners, build tools and
+# interpreters do NOT belong here even though their names look innocuous: a
+# test session imports project code, runs fixtures/conftest and plugins, and
+# routinely writes files, caches, databases and artifacts (empirically
+# confirmed 2026-07-19 -- a `pytest` run classified as read-only created a
+# file in the same invocation). They stay tier-classified as mutations and
+# reach autonomy through operation-class grants on a sandboxed runner, not by
+# being mistaken for `cat`.
 _TIER0_LEADING_VERB_RE = re.compile(
     r"^(?:"
     r"git\s+(?:show|diff|status|log|ls-remote)\b"
-    r"|(?:python3?\s+-m\s+)?pytest\b"
-    r"|(?:python3?\s+-m\s+)?py_compile\b"
     r"|grep\b"
     r"|find\b"
     r"|ls\b"
