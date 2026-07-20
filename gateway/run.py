@@ -7265,6 +7265,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
 
+        # Reconcile the durable process ledger with reality (P0). The
+        # checkpoint above only knows about processes that were *running*;
+        # this pass classifies runs whose owner died before recording an
+        # outcome as `unknown` and flags deliveries interrupted mid-flight as
+        # `ambiguous`. Neither is retried automatically -- inventing an
+        # outcome would be worse than reporting that we do not know.
+        try:
+            from tools import process_ledger
+
+            reconciled = process_ledger.recover_after_restart()
+            if reconciled["marked_unknown"] or reconciled["marked_ambiguous"]:
+                logger.warning(
+                    "Process ledger recovery: %s run(s) unknown, %s "
+                    "delivery/deliveries ambiguous, %s still running",
+                    reconciled["marked_unknown"],
+                    reconciled["marked_ambiguous"],
+                    reconciled["still_running"],
+                )
+        except Exception as e:
+            logger.warning("Process ledger recovery: %s", e)
+
         # Suspend sessions that were active when the gateway last exited.
         # This prevents stuck sessions from being blindly resumed on restart,
         # which can create an unrecoverable loop (#7536).  Suspended sessions

@@ -750,6 +750,7 @@ class ProcessRegistry:
                     self._running[session.id] = session
 
                 self._write_checkpoint()
+                self._ledger_record_spawn(session)
                 return session
 
             except ImportError:
@@ -802,6 +803,7 @@ class ProcessRegistry:
                 self._running[session.id] = session
 
             self._write_checkpoint()
+            self._ledger_record_spawn(session)
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
@@ -922,8 +924,82 @@ class ProcessRegistry:
 
         if not session.exited:
             self._write_checkpoint()
+        self._ledger_record_spawn(session)
 
         return session
+
+    # ----- Durable Ledger Bridge (P0) -----
+    #
+    # The registry's own persistence is a checkpoint of *running* work; it
+    # deliberately excludes finished sessions. That made a finished result
+    # exist nowhere but memory. These three helpers mirror the lifecycle into
+    # a durable ledger so a crash between exit and pickup can no longer
+    # destroy the outcome.
+    #
+    # Ledger failures never abort the process lifecycle -- a broken ledger
+    # would otherwise take down process spawning itself. They are logged at
+    # ERROR, not swallowed at debug like _write_checkpoint() does, because a
+    # persistently failing ledger silently reopens the loss window.
+
+    def _ledger_record_spawn(self, session: "ProcessSession") -> None:
+        try:
+            from tools import process_ledger
+
+            process_ledger.record_spawn(
+                session.id,
+                session_id=session.id,
+                session_key=session.session_key,
+                command=session.command,
+                cwd=session.cwd,
+                task_id=session.task_id,
+                pid=session.pid,
+                pid_scope=session.pid_scope,
+                host_start_time=session.host_start_time,
+                started_at=session.started_at,
+                routing={
+                    "platform": session.watcher_platform,
+                    "chat_id": session.watcher_chat_id,
+                    "user_id": session.watcher_user_id,
+                    "thread_id": session.watcher_thread_id,
+                    "message_id": session.watcher_message_id,
+                    "notify_on_complete": session.notify_on_complete,
+                },
+            )
+        except Exception:
+            logger.error(
+                "process ledger: failed to record spawn of %s -- its result "
+                "will not survive a crash before pickup",
+                session.id, exc_info=True,
+            )
+
+    def _ledger_record_terminal(self, session: "ProcessSession",
+                                payload: Optional[Dict[str, Any]]) -> None:
+        try:
+            from tools import process_ledger
+            from tools.ansi_strip import strip_ansi
+
+            if session.termination_source:
+                state = "killed"
+            elif session.exit_code:
+                state = "failed"
+            else:
+                state = "completed"
+            process_ledger.record_terminal(
+                session.id,
+                state=state,
+                exit_code=session.exit_code,
+                completion_reason=session.completion_reason,
+                termination_source=session.termination_source,
+                output=strip_ansi(session.output_buffer or ""),
+                payload=payload,
+                notify=bool(payload),
+            )
+        except Exception:
+            logger.error(
+                "process ledger: failed to record terminal state of %s -- "
+                "its result exists only in memory",
+                session.id, exc_info=True,
+            )
 
     # ----- Reader / Poller Threads -----
 
@@ -1089,7 +1165,7 @@ class ProcessRegistry:
         if was_running and session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            self.completion_queue.put({
+            completion = {
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
@@ -1102,7 +1178,16 @@ class ProcessRegistry:
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
-            })
+            }
+            # Durability before hand-off: the payload is written to the ledger
+            # first, so a crash between here and the consumer no longer loses
+            # the result. The in-memory queue stays the fast path.
+            self._ledger_record_terminal(session, completion)
+            self.completion_queue.put(completion)
+        elif was_running:
+            # No notification wanted, but the outcome is still recorded --
+            # "nobody asked to be told" is not the same as "it never happened".
+            self._ledger_record_terminal(session, None)
 
     # ----- Query Methods -----
 
