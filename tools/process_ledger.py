@@ -294,9 +294,14 @@ def record_terminal(
     output: Optional[str] = None,
     payload: Optional[Dict[str, Any]] = None,
     notify: bool = True,
-    db_path: Optional[Path] = None,
+    db_path: Optional[Path],
 ) -> bool:
     """Terminalise a run and enqueue its obligation in ONE transaction.
+
+    ``db_path`` is a REQUIRED keyword with no default. A default would let a
+    caller omit it by accident and silently fall back to a globally resolved
+    path -- which is the leak. Making it required moves the mistake from
+    runtime to the call site, where it is visible.
 
     Contract §2 and §3. Returns ``True`` when this call performed the
     terminalisation, ``False`` when the run was already terminal — the caller
@@ -309,6 +314,23 @@ def record_terminal(
     """
     if state not in TERMINAL_STATES:
         raise ValueError(f"not a terminal state: {state!r}")
+    if db_path is None:
+        # FAIL-CLOSED. Falling back to a globally resolved path here is what
+        # produced the production leak: a background thread outliving its
+        # caller's environment writes to whatever HERMES_HOME now says, and
+        # `_connect()` will happily create the directory, turning a misroute
+        # into a formally valid second database instead of a visible error.
+        #
+        # Refusing loses this outcome -- but an unbound terminal write had
+        # already lost it, by putting it in a store nobody reads. A loud
+        # refusal is recoverable; a silent stray database is not.
+        logger.error(
+            "process ledger: refusing to terminalise %s without a bound "
+            "store. The caller must bind one at spawn; writing to a "
+            "globally-resolved path is how test data reaches production.",
+            process_id,
+        )
+        return False
     now = time.time()
     snapshot = (output or "")[-MAX_OUTPUT_SNAPSHOT_CHARS:]
 

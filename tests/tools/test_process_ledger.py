@@ -69,7 +69,7 @@ def test_terminal_state_survives_process_death():
     for a restarted gateway -- still finds it.
     """
     _spawn("p1")
-    assert pl.record_terminal("p1", state="completed", exit_code=0,
+    assert pl.record_terminal("p1", db_path=pl.ledger_path(), state="completed", exit_code=0,
                               output="the result", payload={"r": 1}) is True
 
     pl.reset_schema_cache()  # simulate a cold process attaching to the store
@@ -109,7 +109,7 @@ def test_crash_after_terminal_commit_before_drain_keeps_obligation():
     still be claimable after a restart.
     """
     _spawn("p1")
-    pl.record_terminal("p1", state="completed", exit_code=0, payload={"r": 1})
+    pl.record_terminal("p1", db_path=pl.ledger_path(), state="completed", exit_code=0, payload={"r": 1})
 
     pl.recover_after_restart()
 
@@ -127,7 +127,7 @@ def test_crash_during_delivery_becomes_ambiguous_not_pending():
     row becomes ``ambiguous`` and is excluded from automatic claiming.
     """
     _spawn("p1")
-    pl.record_terminal("p1", state="completed", payload={"r": 1})
+    pl.record_terminal("p1", db_path=pl.ledger_path(), state="completed", payload={"r": 1})
     claimed = pl.claim_next("consumer-a")
     assert claimed  # consumer now holds the claim, then "dies"
 
@@ -141,7 +141,7 @@ def test_crash_during_delivery_becomes_ambiguous_not_pending():
 def test_expired_lease_is_reclaimable_but_delivered_is_not():
     """A consumer that stalls without crashing must not block delivery forever."""
     _spawn("p1")
-    pl.record_terminal("p1", state="completed", payload={"r": 1})
+    pl.record_terminal("p1", db_path=pl.ledger_path(), state="completed", payload={"r": 1})
     first = pl.claim_next("consumer-a")[0]
 
     assert pl.claim_next("consumer-b") == [], "lease is still valid"
@@ -200,8 +200,8 @@ def test_terminalisation_happens_exactly_once():
     ``[IMPORTANT: ...]`` message.
     """
     _spawn("p1")
-    assert pl.record_terminal("p1", state="completed", exit_code=0) is True
-    assert pl.record_terminal("p1", state="killed", exit_code=137) is False
+    assert pl.record_terminal("p1", db_path=pl.ledger_path(), state="completed", exit_code=0) is True
+    assert pl.record_terminal("p1", db_path=pl.ledger_path(), state="killed", exit_code=137) is False
 
     run = pl.get_run("p1")
     assert run["state"] == "completed", "terminal state must be immutable"
@@ -210,7 +210,7 @@ def test_terminalisation_happens_exactly_once():
 
 def test_spawn_is_idempotent_and_cannot_resurrect_a_terminal_run():
     _spawn("p1")
-    pl.record_terminal("p1", state="failed", exit_code=1)
+    pl.record_terminal("p1", db_path=pl.ledger_path(), state="failed", exit_code=1)
     pl.record_spawn("p1", command="sleep 1")
     assert pl.get_run("p1")["state"] == "failed"
 
@@ -229,18 +229,18 @@ def test_retention_never_deletes_an_open_obligation():
         for i in range(20):
             pid = f"delivered_{i}"
             _spawn(pid)
-            pl.record_terminal(pid, state="completed", payload={"i": i})
+            pl.record_terminal(pid, db_path=pl.ledger_path(), state="completed", payload={"i": i})
             claim = pl.claim_next(f"c{i}")[0]
             pl.mark_delivered(claim["obligation_id"], claim["claim_generation"])
 
         for i in range(3):
             pid = f"open_{i}"
             _spawn(pid)
-            pl.record_terminal(pid, state="completed", payload={"i": i})
+            pl.record_terminal(pid, db_path=pl.ledger_path(), state="completed", payload={"i": i})
 
         # Force one more prune pass.
         _spawn("trigger")
-        pl.record_terminal("trigger", state="completed", payload={})
+        pl.record_terminal("trigger", db_path=pl.ledger_path(), state="completed", payload={})
 
         for i in range(3):
             assert pl.get_run(f"open_{i}") is not None, \
@@ -260,10 +260,10 @@ def test_backpressure_warns_instead_of_deleting(caplog):
         for i in range(4):
             pid = f"p{i}"
             _spawn(pid)
-            pl.record_terminal(pid, state="completed", payload={})
+            pl.record_terminal(pid, db_path=pl.ledger_path(), state="completed", payload={})
         with caplog.at_level("WARNING"):
             _spawn("px")
-            pl.record_terminal("px", state="completed", payload={})
+            pl.record_terminal("px", db_path=pl.ledger_path(), state="completed", payload={})
         assert any("backpressure" in r.message for r in caplog.records)
         assert pl.counts().get("outbox_pending", 0) == 5, \
             "backpressure must retain, never delete"
@@ -292,14 +292,14 @@ def test_unknown_run_is_not_reclassified_on_a_second_recovery():
 
 def test_output_snapshot_is_bounded():
     _spawn("p1")
-    pl.record_terminal("p1", state="completed", output="x" * 50_000)
+    pl.record_terminal("p1", db_path=pl.ledger_path(), state="completed", output="x" * 50_000)
     assert len(pl.get_run("p1")["output_snapshot"]) == pl.MAX_OUTPUT_SNAPSHOT_CHARS
 
 
 def test_non_terminal_state_is_rejected():
     _spawn("p1")
     with pytest.raises(ValueError):
-        pl.record_terminal("p1", state="running")
+        pl.record_terminal("p1", db_path=pl.ledger_path(), state="running")
 
 
 def test_ledger_path_resolves_at_call_time(tmp_path, monkeypatch):
@@ -371,7 +371,7 @@ def test_terminal_without_spawn_row_still_records_the_outcome(caplog):
     so loudly.
     """
     with caplog.at_level("WARNING"):
-        assert pl.record_terminal("orphan", state="failed", exit_code=2,
+        assert pl.record_terminal("orphan", db_path=pl.ledger_path(), state="failed", exit_code=2,
                                   payload={"r": "x"}) is True
     run = pl.get_run("orphan")
     assert run["state"] == "failed" and run["exit_code"] == 2
@@ -435,3 +435,87 @@ def _await_terminal_at(db_path, process_id, timeout=15.0):
                 return
         _t.sleep(0.05)
     raise AssertionError(f"no terminal row for {process_id} in {db_path}")
+
+
+# --------------------------------------- R5 hardening: the failure CLASS
+
+
+def test_terminal_write_without_a_binding_is_refused(caplog):
+    """Fail-closed, not fail-open.
+
+    Resolving the path globally here is what put a row in the production
+    store: a background thread outliving its caller's environment writes to
+    whatever HERMES_HOME now says, and ``_connect()`` creates the directory --
+    turning a misroute into a formally valid second database rather than a
+    visible error.
+
+    Refusing loses this outcome. But an unbound write had already lost it, by
+    putting it where nobody reads. A loud refusal is recoverable; a silent
+    stray database is not.
+    """
+    with caplog.at_level("ERROR"):
+        assert pl.record_terminal("unbound", state="completed", db_path=None) is False
+    assert any("without a bound store" in r.message for r in caplog.records)
+
+
+def test_the_store_is_bound_before_any_thread_exists(tmp_path, monkeypatch):
+    """Binding after the reader starts leaves a race.
+
+    A process that terminalises very quickly could otherwise reach the
+    terminal hook while ``_ledger_db_path`` is still None -- and with
+    fail-closed in place that means a silently dropped outcome.
+    """
+    from tools.process_registry import ProcessRegistry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    pl.reset_schema_cache()
+    registry = ProcessRegistry()
+    session = registry.spawn_local("true")
+
+    assert session._ledger_db_path is not None
+    assert str(tmp_path) in str(session._ledger_db_path)
+
+
+def test_a_very_short_process_still_lands_in_its_store(tmp_path, monkeypatch):
+    """The race above, exercised rather than reasoned about."""
+    from tools.process_registry import ProcessRegistry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    pl.reset_schema_cache()
+    registry = ProcessRegistry()
+    session = registry.spawn_local("true")
+    registry.wait(session.id, timeout=30)
+
+    run = _await_terminal(session.id)
+    assert run is not None and run["state"] in pl.TERMINAL_STATES
+
+
+def test_the_binding_survives_a_checkpoint_round_trip(tmp_path, monkeypatch):
+    """A recovered session must terminalise into the store it was born in.
+
+    Recovery is exactly the case where the environment may have changed since
+    the spawn, so re-resolving would send the terminal write somewhere its
+    spawn row does not live.
+    """
+    import json
+
+    from tools import process_registry as pr
+    from tools.process_registry import ProcessRegistry
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(pr, "CHECKPOINT_PATH", home / "processes.json")
+    pl.reset_schema_cache()
+
+    registry = ProcessRegistry()
+    session = registry.spawn_local("sleep 30")
+    bound = str(session._ledger_db_path)
+    registry._write_checkpoint()
+
+    entries = json.loads((home / "processes.json").read_text())
+    assert entries, "checkpoint did not record the running session"
+    assert entries[0]["ledger_db_path"] == bound, \
+        "the store binding was not carried into the checkpoint"
+
+    registry.kill_process(session.id)

@@ -3097,15 +3097,28 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # the first core's item. COALESCE because owner_core_id is NULL on the
     # single-core path we run today; NULL is one implicit core, and SQLite
     # would otherwise treat every NULL as distinct and enforce nothing.
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_origin_key "
+    # An intermediate revision on this branch created the SAME index name with
+    # an UNSCOPED definition. `CREATE ... IF NOT EXISTS` is a no-op against it,
+    # so a board opened once by that revision would silently keep the wrong
+    # constraint -- two cores colliding on a key that is only meaningful within
+    # one of them. Names are not definitions; the check therefore reads the
+    # stored SQL and replaces the index whenever it is not the scoped form.
+    _ORIGIN_INDEX_SQL = (
+        "CREATE UNIQUE INDEX idx_tasks_origin_key "
         "ON tasks(COALESCE(owner_core_id, ''), origin_kind, origin_key) "
         "WHERE origin_key IS NOT NULL AND origin_kind IS NOT NULL"
     )
-    # The earlier, unscoped form shipped in an intermediate commit on this
-    # branch. Drop it so a board created against that revision does not keep
-    # enforcing a constraint the contract does not ask for.
-    conn.execute("DROP INDEX IF EXISTS idx_tasks_origin_key_unscoped")
+    existing_origin_idx = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_tasks_origin_key'"
+    ).fetchone()
+    if existing_origin_idx is None:
+        conn.execute(_ORIGIN_INDEX_SQL)
+    elif "owner_core_id" not in (existing_origin_idx[0] or ""):
+        # Replace, do not merely add: leaving the unscoped index in place
+        # alongside a scoped one would keep enforcing the wrong constraint.
+        conn.execute("DROP INDEX idx_tasks_origin_key")
+        conn.execute(_ORIGIN_INDEX_SQL)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_owner_core "
         "ON tasks(owner_core_id) WHERE owner_core_id IS NOT NULL"
