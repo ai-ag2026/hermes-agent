@@ -5764,6 +5764,54 @@ def _stale_review_claim_run(
     return run_id
 
 
+def _acceptance_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether a card marked ``acceptance_required`` may reach ``done``.
+
+    Returns True for every card that does not carry the flag, so the guard is
+    a no-op on the entire existing corpus -- legacy rows have NULL, which is
+    "this card predates the contract", not "it needs acceptance".
+
+    A card that does carry it needs an ``ACCEPT`` on record. Anything else --
+    no review at all, a REJECT, a rework request -- means the result has not
+    been accepted, and "no decision yet" must read as *not accepted* rather
+    than as *not refused*. Getting that default backwards would make the flag
+    worse than useless: it would look like a safeguard while passing
+    everything through.
+    """
+    try:
+        row = conn.execute(
+            "SELECT acceptance_required FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # Pre-D0 database: the column does not exist, so no card can be
+        # carrying the flag.
+        return True
+    if row is None:
+        return True
+    flag = row[0] if not isinstance(row, sqlite3.Row) else row["acceptance_required"]
+    if not flag:
+        return True
+
+    decision = conn.execute(
+        """
+        SELECT payload FROM task_events
+         WHERE task_id = ? AND kind = 'review_decided'
+         ORDER BY id DESC LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if decision is None:
+        return False
+    payload = decision[0] if not isinstance(decision, sqlite3.Row) else decision["payload"]
+    try:
+        data = json.loads(payload) if payload else {}
+    except (TypeError, ValueError):
+        # An unparseable decision is not an acceptance. Failing open here
+        # would let a corrupt payload act as a universal bypass.
+        return False
+    return str(data.get("decision", "")).upper() == "ACCEPT"
+
+
 def _pending_review_request(
     conn: sqlite3.Connection, task_id: str
 ) -> Optional[dict]:
@@ -7494,6 +7542,27 @@ def _complete_task_locked(
     # ACCEPT decision. This prevents a reviewer run from bypassing the handshake
     # by calling the generic completion path.
     if _pending_review_request(conn, task_id) is not None:
+        return False
+
+    # D0 acceptance guard (ADR-1). ``acceptance_required=1`` means this card
+    # may not reach ``done`` on the worker's own say-so; someone other than the
+    # producer has to accept the result.
+    #
+    # This is deliberately enforced HERE rather than in a tool or CLI layer,
+    # for the same reason the human-gate check lives here: the dashboard PATCH,
+    # bulk update and bare ``hermes kanban complete`` all converge on this
+    # function, and a guard placed anywhere upstream would be one of several
+    # doors rather than the door.
+    #
+    # Note this is NOT ``human_gate``, which is approval BEFORE an action. A
+    # card can carry neither, either or both.
+    if not _acceptance_satisfied(conn, task_id):
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_acceptance_required",
+                {"reason": "acceptance_required=1 and no accepted review "
+                           "decision on record"},
+            )
         return False
 
     # Validate and promote evidence before the done CAS and scratch cleanup.

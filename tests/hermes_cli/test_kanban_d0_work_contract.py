@@ -272,3 +272,139 @@ def test_identical_task_ids_on_two_boards_yield_distinct_work_uids(tmp_path):
             kanban_db.get_board_uuid(conn), "t_deadbeef"))
         conn.close()
     assert uids[0] != uids[1]
+
+
+# ----------------------------------------------- D0 DoD: origin_key race
+
+
+def test_two_creators_with_the_same_origin_key_yield_exactly_one_item(tmp_path):
+    """The DoD race test: two creators, one key, one item.
+
+    This is the scenario the old ``idempotency_key`` check-then-insert loses.
+    Two threads read "no such key", both decide to insert, and two cards for
+    one request appear. The unique index moves the decision into SQLite, where
+    it is atomic: the loser gets IntegrityError instead of a duplicate.
+    """
+    import threading
+
+    db = tmp_path / "race.db"
+    kanban_db.connect(db).close()  # initialise once, outside the race
+
+    created, conflicts, errors = [], [], []
+    barrier = threading.Barrier(8)
+
+    def creator(n: int) -> None:
+        conn = kanban_db.connect(db)
+        try:
+            task_id = kanban_db.create_task(conn, title=f"creator {n}")
+            barrier.wait(timeout=10)  # maximise overlap on the write
+            try:
+                conn.execute(
+                    "UPDATE tasks SET origin_kind='cron', origin_key='the-one-key' "
+                    "WHERE id=?", (task_id,))
+                conn.commit()
+                created.append(task_id)
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                conflicts.append(task_id)
+        except Exception as exc:  # pragma: no cover - surfaces real breakage
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=creator, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, f"unexpected errors: {errors}"
+    assert len(created) == 1, f"expected exactly one winner, got {len(created)}"
+    assert len(conflicts) == 7
+
+    conn = kanban_db.connect(db)
+    n = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE origin_key='the-one-key'").fetchone()[0]
+    conn.close()
+    assert n == 1, "the unique index did not hold under concurrency"
+
+
+# ------------------------------------ D0 DoD: acceptance_required bypass
+
+
+def test_acceptance_required_blocks_direct_completion(board):
+    """The negative test the DoD asks for.
+
+    A card marked ``acceptance_required`` must not reach ``done`` through the
+    generic completion path -- which is where the dashboard PATCH, bulk update
+    and bare CLI completion all converge.
+    """
+    task_id = kanban_db.create_task(board, title="needs acceptance")
+    board.execute("UPDATE tasks SET acceptance_required=1 WHERE id=?", (task_id,))
+    board.commit()
+
+    assert kanban_db.complete_task(board, task_id, result="done by worker") is False
+    assert kanban_db.get_task(board, task_id).status != "done"
+
+    kinds = [r[0] for r in board.execute(
+        "SELECT kind FROM task_events WHERE task_id=?", (task_id,))]
+    assert "completion_blocked_acceptance_required" in kinds, \
+        "the refusal must be auditable, not silent"
+
+
+def test_acceptance_required_absent_or_zero_is_a_no_op(board):
+    """The guard must not change behaviour for the existing corpus."""
+    for value in (None, 0):
+        task_id = kanban_db.create_task(board, title=f"legacy {value}")
+        board.execute(
+            "UPDATE tasks SET acceptance_required=?, status='ready' WHERE id=?",
+            (value, task_id))
+        board.commit()
+        assert kanban_db.complete_task(board, task_id, result="ok") is True
+
+
+def test_no_decision_yet_counts_as_not_accepted(board):
+    """The default direction matters more than the mechanism.
+
+    "No decision on record" must read as *not accepted*. Reading it as *not
+    refused* would make the flag look like a safeguard while letting
+    everything through.
+    """
+    task_id = kanban_db.create_task(board, title="awaiting review")
+    board.execute("UPDATE tasks SET acceptance_required=1 WHERE id=?", (task_id,))
+    board.commit()
+    assert kanban_db._acceptance_satisfied(board, task_id) is False
+
+
+def test_a_reject_decision_does_not_satisfy_acceptance(board):
+    task_id = kanban_db.create_task(board, title="rejected")
+    board.execute("UPDATE tasks SET acceptance_required=1 WHERE id=?", (task_id,))
+    board.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES (?,?,?,strftime('%s','now'))",
+        (task_id, "review_decided", '{"decision": "REJECT"}'))
+    board.commit()
+    assert kanban_db._acceptance_satisfied(board, task_id) is False
+
+
+def test_an_accept_decision_satisfies_acceptance(board):
+    task_id = kanban_db.create_task(board, title="accepted")
+    board.execute("UPDATE tasks SET acceptance_required=1 WHERE id=?", (task_id,))
+    board.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES (?,?,?,strftime('%s','now'))",
+        (task_id, "review_decided", '{"decision": "ACCEPT"}'))
+    board.commit()
+    assert kanban_db._acceptance_satisfied(board, task_id) is True
+
+
+def test_a_corrupt_decision_payload_is_not_an_acceptance(board):
+    """Failing open on a malformed payload would be a universal bypass."""
+    task_id = kanban_db.create_task(board, title="corrupt")
+    board.execute("UPDATE tasks SET acceptance_required=1 WHERE id=?", (task_id,))
+    board.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) "
+        "VALUES (?,?,?,strftime('%s','now'))",
+        (task_id, "review_decided", "{not json"))
+    board.commit()
+    assert kanban_db._acceptance_satisfied(board, task_id) is False
