@@ -99,13 +99,22 @@ def payload_digest(payload: Any) -> str:
 
 
 def _existing_by_origin(conn: sqlite3.Connection, origin_kind: str,
-                        origin_key: str) -> Optional[sqlite3.Row]:
-    row = conn.execute(
+                        origin_key: str,
+                        owner_core_id: Optional[str] = None) -> Optional[sqlite3.Row]:
+    """Look up by the SCOPED key, matching the W1 contract.
+
+    Scoping by ``owner_core_id`` matters even while we run single-core: an
+    unscoped lookup would let a second core's request deduplicate into the
+    first core's item, which is a silent loss of the second request.
+    ``COALESCE`` mirrors the index -- NULL is one implicit core, not many
+    distinct ones.
+    """
+    return conn.execute(
         "SELECT id, payload_digest FROM tasks "
-        "WHERE origin_kind = ? AND origin_key = ?",
-        (origin_kind, origin_key),
+        "WHERE COALESCE(owner_core_id, '') = COALESCE(?, '') "
+        "  AND origin_kind = ? AND origin_key = ?",
+        (owner_core_id, origin_kind, origin_key),
     ).fetchone()
-    return row
 
 
 def promote(
@@ -147,7 +156,7 @@ def promote(
 
     digest = payload_digest(payload)
 
-    existing = _existing_by_origin(conn, origin_kind, origin_key)
+    existing = _existing_by_origin(conn, origin_kind, origin_key, owner_core_id)
     if existing is not None:
         return _resolve_existing(existing, origin_kind, origin_key, digest)
 
@@ -182,7 +191,7 @@ def promote(
         # Another writer won the race between our SELECT and this INSERT.
         # That is the expected outcome, not an error: the unique index did its
         # job. Re-read and treat it exactly like any other retry.
-        existing = _existing_by_origin(conn, origin_kind, origin_key)
+        existing = _existing_by_origin(conn, origin_kind, origin_key, owner_core_id)
         if existing is None:
             raise
         logger.debug(
@@ -208,3 +217,74 @@ def _resolve_existing(row: sqlite3.Row, origin_kind: str, origin_key: str,
     return PromotionResult(task_id=existing_id, created=False,
                            origin_kind=origin_kind, origin_key=origin_key,
                            payload_digest=digest)
+
+
+# ------------------------------------------------- the commitment threshold
+
+
+@dataclass(frozen=True)
+class ThresholdVerdict:
+    promote: bool
+    tier: str            # "A" (ephemeral) or "B" (adopted)
+    reasons: tuple
+
+    def __bool__(self) -> bool:
+        return self.promote
+
+
+def crosses_commitment_threshold(
+    *,
+    survives_turn: bool = False,
+    promised_to_person: bool = False,
+    detached_process: bool = False,
+    expects_artifacts: bool = False,
+    may_need_retry_or_review: bool = False,
+    standing: bool = False,
+) -> ThresholdVerdict:
+    """Decide whether work becomes a work item, per GESAMTSKIZZE §3.
+
+    **Tier A (ephemeral):** a run with a parent reference. No work item, no
+    card. A short parallel lookup whose answer the parent reads and folds into
+    its own turn is finished when the turn is finished; there is nothing left
+    to track.
+
+    **Tier B (adopted):** the work outlives the turn, or something was
+    promised, or a detached process is still running, or artifacts are
+    expected, or a retry/blocker/review/late delivery is possible. The
+    operational test the plan gives is the useful one: **could TARS honestly
+    say "done" right now?** If not, there has to be a row.
+
+    Why both directions are failures:
+
+    * Promoting Tier A pollutes the board. Dozens of cards for lookups nobody
+      will ever look at bury the work that matters -- and a board nobody trusts
+      gets ignored, which costs more than the cards saved.
+    * Not promoting Tier B loses the work. Nothing tracks it, nothing retries
+      it, nothing notices it never finished. That is the failure this whole
+      programme exists to fix.
+
+    The predicate is deliberately explicit rather than inferred. A caller that
+    has to name *why* something is adopted cannot drift into promoting
+    everything "just in case", which is how the board filled with noise in the
+    first place.
+    """
+    reasons = []
+    if standing:
+        reasons.append("standing order: outlives every individual run")
+    if promised_to_person:
+        reasons.append("a promise was made and must survive the session")
+    if survives_turn:
+        reasons.append("the work outlives the turn that started it")
+    if detached_process:
+        reasons.append("a detached process is still running")
+    if expects_artifacts:
+        reasons.append("artifacts or side effects are expected")
+    if may_need_retry_or_review:
+        reasons.append("a retry, blocker or review is possible")
+
+    if reasons:
+        return ThresholdVerdict(promote=True, tier="B", reasons=tuple(reasons))
+    return ThresholdVerdict(
+        promote=False, tier="A",
+        reasons=("ephemeral: the parent reads the result inside its own turn",),
+    )

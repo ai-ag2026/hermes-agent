@@ -3091,11 +3091,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # The predicate must be repeated verbatim in any ``ON CONFLICT`` target
     # that means to hit this index; SQLite matches partial indexes by
     # predicate, and omitting it fails at runtime rather than at parse time.
+    # Scoped by owner_core_id, per the W1 contract. Leaving it out would make
+    # two different cores collide on a key that is only meaningful within one
+    # of them -- the second core's work would be silently deduplicated into
+    # the first core's item. COALESCE because owner_core_id is NULL on the
+    # single-core path we run today; NULL is one implicit core, and SQLite
+    # would otherwise treat every NULL as distinct and enforce nothing.
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_origin_key "
-        "ON tasks(origin_kind, origin_key) "
+        "ON tasks(COALESCE(owner_core_id, ''), origin_kind, origin_key) "
         "WHERE origin_key IS NOT NULL AND origin_kind IS NOT NULL"
     )
+    # The earlier, unscoped form shipped in an intermediate commit on this
+    # branch. Drop it so a board created against that revision does not keep
+    # enforcing a constraint the contract does not ask for.
+    conn.execute("DROP INDEX IF EXISTS idx_tasks_origin_key_unscoped")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_owner_core "
         "ON tasks(owner_core_id) WHERE owner_core_id IS NOT NULL"
