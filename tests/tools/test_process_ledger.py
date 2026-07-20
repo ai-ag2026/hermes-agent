@@ -377,3 +377,61 @@ def test_terminal_without_spawn_row_still_records_the_outcome(caplog):
     assert run["state"] == "failed" and run["exit_code"] == 2
     assert pl.get_obligation("orphan")["delivery_state"] == "pending"
     assert any("without a spawn row" in r.message for r in caplog.records)
+
+
+def test_the_terminal_write_follows_the_spawn_even_if_home_moves(tmp_path, monkeypatch):
+    """The leak found by the 2026-07-20 full-suite run.
+
+    A background process is spawned on one thread and terminalised later on
+    its reader thread. If the ledger path is re-resolved at that moment and
+    ``HERMES_HOME`` has since changed -- which is exactly what happens when a
+    test's fixture tears down while the process is still running -- the
+    terminal write lands in a *different* store than the spawn write. The
+    production ledger then grows a row with NULL command and cwd: the
+    signature of a terminal half with no spawn half.
+
+    Call-time resolution fixed the import-freeze leak and created this one.
+    The store is now bound to the session at spawn.
+    """
+    from tools.process_registry import ProcessRegistry
+
+    spawn_home = tmp_path / "spawn-home"
+    other_home = tmp_path / "other-home"
+    spawn_home.mkdir()
+    other_home.mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(spawn_home))
+    pl.reset_schema_cache()
+    registry = ProcessRegistry()
+    session = registry.spawn_local("sleep 0.6 && echo moved")
+
+    # The fixture that spawned it tears down while the process still runs.
+    monkeypatch.setenv("HERMES_HOME", str(other_home))
+
+    assert registry.wait(session.id, timeout=30)["status"] == "exited"
+    _await_terminal_at(spawn_home / "processes.db", session.id)
+
+    assert not (other_home / "processes.db").exists(), \
+        "the terminal write followed HERMES_HOME instead of its own session"
+
+
+def _await_terminal_at(db_path, process_id, timeout=15.0):
+    import sqlite3
+    import time as _t
+
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if db_path.exists():
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                row = con.execute(
+                    "SELECT state FROM process_runs WHERE process_id=?",
+                    (process_id,)).fetchone()
+            except sqlite3.Error:
+                row = None
+            finally:
+                con.close()
+            if row and row[0] in pl.TERMINAL_STATES:
+                return
+        _t.sleep(0.05)
+    raise AssertionError(f"no terminal row for {process_id} in {db_path}")

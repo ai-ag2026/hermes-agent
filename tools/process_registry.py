@@ -136,6 +136,10 @@ class ProcessSession:
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    # Durable-ledger store this session was born into. Captured at spawn so
+    # the terminal write on the reader thread cannot land in a different
+    # store than the spawn write (see _ledger_record_spawn).
+    _ledger_db_path: Optional[Any] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
 
 
@@ -945,6 +949,13 @@ class ProcessRegistry:
         try:
             from tools import process_ledger
 
+            # Bind the store to the session ONCE, here. The terminal write
+            # happens later on the reader thread, and re-resolving the path at
+            # that moment can land in a different store than the spawn write --
+            # which is exactly how a full-suite run leaked one row into the
+            # production ledger on 2026-07-20, with NULL command and cwd
+            # because only the terminal half arrived.
+            session._ledger_db_path = process_ledger.ledger_path()
             process_ledger.record_spawn(
                 session.id,
                 session_id=session.id,
@@ -964,6 +975,7 @@ class ProcessRegistry:
                     "message_id": session.watcher_message_id,
                     "notify_on_complete": session.notify_on_complete,
                 },
+                db_path=session._ledger_db_path,
             )
         except Exception:
             logger.error(
@@ -986,6 +998,7 @@ class ProcessRegistry:
                 state = "completed"
             process_ledger.record_terminal(
                 session.id,
+                db_path=getattr(session, "_ledger_db_path", None),
                 state=state,
                 exit_code=session.exit_code,
                 completion_reason=session.completion_reason,
