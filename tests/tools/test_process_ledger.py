@@ -519,3 +519,125 @@ def test_the_binding_survives_a_checkpoint_round_trip(tmp_path, monkeypatch):
         "the store binding was not carried into the checkpoint"
 
     registry.kill_process(session.id)
+
+
+# ------------------- R6: lifecycle ordering and fail-closed start/recovery
+
+
+def test_a_process_that_exits_immediately_is_never_left_running(tmp_path, monkeypatch):
+    """The race an independent review reproduced deterministically.
+
+    With the reader started before registry membership, a process that
+    finishes at once reaches ``_move_to_finished()`` while the session is not
+    yet in ``_running``. That call finds nothing to pop and persists no
+    terminal state; the later registration then puts the already-dead session
+    back into ``_running``. Result: listed as finished AND running, with a
+    ledger row stuck at ``running`` forever.
+
+    Rather than hoping the timing hits, this forces the interleaving by
+    running the reader synchronously to completion before spawn_local
+    continues -- which is exactly how the review reproduced it.
+    """
+    import threading
+
+    from tools import process_registry as pr
+    from tools.process_registry import ProcessRegistry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    pl.reset_schema_cache()
+    registry = ProcessRegistry()
+
+    real_start = threading.Thread.start
+
+    def synchronous_start(self):
+        # Run the reader to completion *inside* start(), so by the time
+        # spawn_local() resumes the process has already been terminalised.
+        if self.name.startswith("proc-reader-"):
+            self.run()
+            return
+        real_start(self)
+
+    # Patched and restored by hand rather than via monkeypatch.undo(): undo()
+    # reverts EVERY change made through the fixture, including the HERMES_HOME
+    # redirect above. Doing that here sent a later ledger read to the real home
+    # and created an empty database there -- the same leak class again, this
+    # time caused by the test rather than the code.
+    threading.Thread.start = synchronous_start
+    try:
+        session = registry.spawn_local("true")
+    finally:
+        threading.Thread.start = real_start
+
+    run = pl.get_run(session.id)
+    assert run is not None, "no ledger row at all"
+    assert run["state"] in pl.TERMINAL_STATES, \
+        f"ledger row stuck at {run['state']!r} -- the spawn/terminal race is back"
+    assert session.id not in registry._running, \
+        "a finished session was put back into _running"
+
+
+def test_spawn_is_refused_when_the_store_cannot_be_created(tmp_path, monkeypatch):
+    """Fail-closed at START, not only at terminalisation.
+
+    Logging a binding failure and starting anyway leaves an unrecorded
+    background process running -- durability lost silently, which is the
+    condition this whole slice exists to remove.
+    """
+    from tools.process_registry import ProcessRegistry
+
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+    monkeypatch.setenv("HERMES_HOME", str(blocked))
+    pl.reset_schema_cache()
+
+    registry = ProcessRegistry()
+    with pytest.raises(Exception):
+        registry.spawn_local("sleep 30")
+    assert not registry._running, "an unrecorded process was left running"
+
+
+def test_recovery_without_a_recorded_store_stays_unbound(tmp_path, monkeypatch, caplog):
+    """An old or damaged checkpoint must not adopt the current store.
+
+    Re-binding here would be the same global re-resolution the terminal
+    invariant exists to prevent: the session would terminalise into a store
+    its spawn row never touched. Unbound plus a refused terminal write is the
+    honest outcome.
+    """
+    import json
+
+    from tools import process_registry as pr
+    from tools.process_registry import ProcessRegistry
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(pr, "CHECKPOINT_PATH", home / "processes.json")
+    pl.reset_schema_cache()
+
+    import subprocess
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        (home / "processes.json").write_text(json.dumps([{
+            "session_id": "proc_legacy",
+            "command": "sleep 30",
+            "pid": proc.pid,
+            "pid_scope": "host",
+            "host_start_time": None,
+            "cwd": str(home),
+            "started_at": 1.0,
+            "notify_on_complete": False,
+            "watch_patterns": [],
+            # deliberately no ledger_db_path -- a pre-binding checkpoint
+        }]))
+        registry = ProcessRegistry()
+        with caplog.at_level("ERROR"):
+            registry.recover_from_checkpoint()
+        session = registry.get("proc_legacy")
+        if session is not None:
+            assert session._ledger_db_path is None, \
+                "recovery re-bound an unbound session to the current store"
+            assert any("UNBOUND" in r.message for r in caplog.records)
+    finally:
+        proc.kill()
+        proc.wait()

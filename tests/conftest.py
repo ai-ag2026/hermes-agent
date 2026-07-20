@@ -988,3 +988,21 @@ def _live_system_guard(request, monkeypatch):
         pass
 
     yield
+
+
+# --- Mechanical production-store write guard (R6 requirement) ------------
+#
+# Enabled for the whole session, before any test runs. See tests/store_guard.py
+# for why this is a guard rather than another round of hash bracketing: the
+# same leak class recurred four times under four different immediate causes,
+# and detection-after-the-fact only found it when the bracketed file set and
+# test scope happened to line up.
+from tests import store_guard as _store_guard
+
+
+def pytest_configure(config):  # noqa: D103 - pytest hook
+    _store_guard.enable()
+
+
+def pytest_unconfigure(config):  # noqa: D103 - pytest hook
+    _store_guard.disable()

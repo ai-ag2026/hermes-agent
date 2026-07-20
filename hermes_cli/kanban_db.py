@@ -3108,17 +3108,41 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON tasks(COALESCE(owner_core_id, ''), origin_kind, origin_key) "
         "WHERE origin_key IS NOT NULL AND origin_kind IS NOT NULL"
     )
+    def _normalise_sql(text: str) -> str:
+        """Whitespace-insensitive comparison of two DDL statements.
+
+        A substring test for ``owner_core_id`` is not a definition check: an
+        index that mentions the column only in its WHERE predicate, or scopes
+        by it in the wrong position, would pass while enforcing something
+        else. Comparing against the canonical statement is the only check that
+        means what it says.
+        """
+        return " ".join((text or "").split()).rstrip(";")
+
     existing_origin_idx = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='index' "
         "AND name='idx_tasks_origin_key'"
     ).fetchone()
-    if existing_origin_idx is None:
-        conn.execute(_ORIGIN_INDEX_SQL)
-    elif "owner_core_id" not in (existing_origin_idx[0] or ""):
-        # Replace, do not merely add: leaving the unscoped index in place
-        # alongside a scoped one would keep enforcing the wrong constraint.
-        conn.execute("DROP INDEX idx_tasks_origin_key")
-        conn.execute(_ORIGIN_INDEX_SQL)
+    current_sql = existing_origin_idx[0] if existing_origin_idx else None
+
+    if _normalise_sql(current_sql) != _normalise_sql(_ORIGIN_INDEX_SQL):
+        # Replace, do not merely add: leaving a wrong index in place alongside
+        # a correct one would keep enforcing the wrong constraint.
+        #
+        # DROP and CREATE run inside ONE transaction. The connection is in
+        # autocommit (`isolation_level=None`), so without an explicit
+        # transaction an I/O, lock or disk error between the two statements
+        # would leave the table with NO uniqueness constraint at all -- worse
+        # than the wrong one it replaced.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if current_sql is not None:
+                conn.execute("DROP INDEX idx_tasks_origin_key")
+            conn.execute(_ORIGIN_INDEX_SQL)
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_owner_core "
         "ON tasks(owner_core_id) WHERE owner_core_id IS NOT NULL"

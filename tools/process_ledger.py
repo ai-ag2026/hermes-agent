@@ -614,3 +614,18 @@ def counts() -> Dict[str, int]:
 def reset_schema_cache() -> None:
     """Drop the per-path schema memo. Tests redirect HERMES_HOME per test."""
     _SCHEMA_READY.clear()
+
+
+def ensure_store(db_path: Path) -> None:
+    """Prove the store is usable before a process depends on it.
+
+    Resolving a path is not a capability. A directory that cannot be created,
+    or a database that cannot be opened or written, would otherwise only fail
+    later on the reader thread -- where nobody is watching and the result is
+    already gone. Failing here, before the child process exists, turns a
+    silent durability loss into a refused spawn.
+    """
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _DB_LOCK, _connect(path) as conn:
+        conn.execute("SELECT COUNT(*) FROM process_runs").fetchone()

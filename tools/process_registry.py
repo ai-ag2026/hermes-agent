@@ -744,7 +744,15 @@ class ProcessRegistry:
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
-                # PTY reader thread
+                # Same ordering rule as the pipe path: registry membership
+                # and the durable spawn row before the reader exists.
+                with self._lock:
+                    self._prune_if_needed()
+                    self._running[session.id] = session
+
+                self._write_checkpoint()
+                self._ledger_record_spawn(session)
+
                 reader = threading.Thread(
                     target=self._pty_reader_loop,
                     args=(session,),
@@ -753,13 +761,6 @@ class ProcessRegistry:
                 )
                 session._reader_thread = reader
                 reader.start()
-
-                with self._lock:
-                    self._prune_if_needed()
-                    self._running[session.id] = session
-
-                self._write_checkpoint()
-                self._ledger_record_spawn(session)
                 return session
 
             except ImportError:
@@ -797,7 +798,24 @@ class ProcessRegistry:
         session.host_start_time = self._safe_host_start_time(session.pid)
 
         try:
-            # Start output reader thread
+            # ORDER MATTERS. Registry membership and the durable spawn row must
+            # exist BEFORE the reader can observe the process exiting.
+            #
+            # With the reader started first, a process that finishes
+            # immediately reaches `_move_to_finished()` before the session is
+            # in `_running`. That call finds nothing to pop, so it does not
+            # persist a terminal state -- and the later registration then puts
+            # the already-dead session back into `_running`. The result is a
+            # session simultaneously listed as finished and running, whose
+            # ledger row stays `running` forever. An independent review
+            # reproduced exactly that by forcing the interleaving.
+            with self._lock:
+                self._prune_if_needed()
+                self._running[session.id] = session
+
+            self._write_checkpoint()
+            self._ledger_record_spawn(session)
+
             reader = threading.Thread(
                 target=self._reader_loop,
                 args=(session,),
@@ -806,13 +824,6 @@ class ProcessRegistry:
             )
             session._reader_thread = reader
             reader.start()
-
-            with self._lock:
-                self._prune_if_needed()
-                self._running[session.id] = session
-
-            self._write_checkpoint()
-            self._ledger_record_spawn(session)
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
@@ -917,17 +928,8 @@ class ProcessRegistry:
             session.termination_source = "failed_start"
             session.output_buffer = f"Failed to start: {e}"
 
-        if not session.exited:
-            # Start a poller thread that periodically reads the log file
-            reader = threading.Thread(
-                target=self._env_poller_loop,
-                args=(session, env, log_path, pid_path, exit_path),
-                daemon=True,
-                name=f"proc-poller-{session.id}",
-            )
-            session._reader_thread = reader
-            reader.start()
-
+        # Same ordering rule as the local paths: registry membership and the
+        # durable spawn row before the poller can observe an exit.
         with self._lock:
             self._prune_if_needed()
             if not session.exited:
@@ -936,6 +938,16 @@ class ProcessRegistry:
         if not session.exited:
             self._write_checkpoint()
         self._ledger_record_spawn(session)
+
+        if not session.exited:
+            reader = threading.Thread(
+                target=self._env_poller_loop,
+                args=(session, env, log_path, pid_path, exit_path),
+                daemon=True,
+                name=f"proc-poller-{session.id}",
+            )
+            session._reader_thread = reader
+            reader.start()
 
         return session
 
@@ -959,16 +971,15 @@ class ProcessRegistry:
         reader thread exists. Everything downstream uses this value and never
         re-resolves ``HERMES_HOME``.
         """
-        try:
-            from tools import process_ledger
+        from tools import process_ledger
 
-            session._ledger_db_path = process_ledger.ledger_path()
-        except Exception:
-            session._ledger_db_path = None
-            logger.error(
-                "process ledger: could not bind a store for %s; its terminal "
-                "state will NOT be persisted", session.id, exc_info=True,
-            )
+        # Resolve AND prove the store is usable, before the child exists.
+        # Merely computing a path is not a capability: a path that cannot be
+        # created or written to would only fail later, on the reader thread,
+        # where the failure is invisible and the result is already lost.
+        path = process_ledger.ledger_path()
+        process_ledger.ensure_store(path)
+        session._ledger_db_path = path
 
     def _ledger_record_spawn(self, session: "ProcessSession") -> None:
         try:
@@ -1004,10 +1015,11 @@ class ProcessRegistry:
             )
         except Exception:
             logger.error(
-                "process ledger: failed to record spawn of %s -- its result "
-                "will not survive a crash before pickup",
+                "process ledger: failed to record spawn of %s -- refusing to "
+                "run an unrecorded background process",
                 session.id, exc_info=True,
             )
+            raise
 
     def _ledger_record_terminal(self, session: "ProcessSession",
                                 payload: Optional[Dict[str, Any]]) -> None:
@@ -2128,12 +2140,20 @@ class ProcessRegistry:
                 from pathlib import Path as _Path
                 session._ledger_db_path = _Path(recorded_store)
             else:
-                logger.warning(
-                    "process ledger: recovered session %s had no recorded "
-                    "store; binding a fresh one, its spawn row may live "
-                    "elsewhere", session.id,
+                # FAIL-CLOSED. Binding the currently resolved store would be
+                # the very global re-resolution the terminal invariant exists
+                # to prevent: an old or damaged checkpoint would silently
+                # terminalise into a store its spawn row never touched. The
+                # session stays unbound, so its terminal write is refused
+                # loudly rather than misrouted quietly.
+                session._ledger_db_path = None
+                logger.error(
+                    "process ledger: recovered session %s has no recorded "
+                    "store. Leaving it UNBOUND -- its terminal state will be "
+                    "refused rather than written to a store it does not "
+                    "belong to. Checkpoint predates the binding or is damaged.",
+                    session.id,
                 )
-                self._bind_ledger_store(session)
             with self._lock:
                 self._running[session.id] = session
             recovered += 1
