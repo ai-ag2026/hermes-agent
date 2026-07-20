@@ -408,3 +408,80 @@ def test_a_corrupt_decision_payload_is_not_an_acceptance(board):
         (task_id, "review_decided", "{not json"))
     board.commit()
     assert kanban_db._acceptance_satisfied(board, task_id) is False
+
+
+# ------------------------------- R5: the D0 -> D1 intermediate upgrade path
+
+
+def test_an_unscoped_origin_index_is_replaced_not_kept(tmp_path):
+    """The upgrade bug an independent review reproduced.
+
+    An intermediate revision created ``idx_tasks_origin_key`` with an
+    UNSCOPED definition. ``CREATE UNIQUE INDEX IF NOT EXISTS`` is a no-op
+    against an existing name, so a board opened once by that revision kept the
+    wrong constraint -- and ``quick_check=ok`` plus an intact task count
+    concealed it completely. A drop targeting a *different* name never fired.
+
+    Fresh boards hid this: they have no prior index, so the correct one is
+    created and everything looks right. Only a board that passed through the
+    intermediate revision shows it.
+
+    Names are not definitions. The migration now reads the stored SQL.
+    """
+    db = tmp_path / "upgraded.db"
+    conn = kanban_db.connect(db)
+
+    # Recreate exactly what the intermediate revision left behind.
+    conn.execute("DROP INDEX IF EXISTS idx_tasks_origin_key")
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_tasks_origin_key "
+        "ON tasks(origin_kind, origin_key) "
+        "WHERE origin_key IS NOT NULL AND origin_kind IS NOT NULL")
+    conn.commit()
+    stale = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='idx_tasks_origin_key'"
+    ).fetchone()[0]
+    assert "owner_core_id" not in stale
+    conn.close()
+
+    # ``connect()`` caches initialised paths per process, so reopening in the
+    # same process would skip the migration entirely -- which is why the
+    # manual two-process reproduction of this bug behaved differently from a
+    # single-process test. ``init_db()`` is the documented way to force the
+    # migration pass, and it is what a restarted gateway effectively does.
+    kanban_db.init_db(db)
+    conn = kanban_db.connect(db)
+    repaired = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='idx_tasks_origin_key'"
+    ).fetchone()[0]
+    assert "owner_core_id" in repaired, \
+        "the unscoped index survived the upgrade"
+
+    # And the repaired constraint actually behaves as scoped.
+    a = kanban_db.create_task(conn, title="core a")
+    b = kanban_db.create_task(conn, title="core b")
+    conn.execute("UPDATE tasks SET owner_core_id='core-a', origin_kind='cron', "
+                 "origin_key='shared' WHERE id=?", (a,))
+    conn.execute("UPDATE tasks SET owner_core_id='core-b', origin_kind='cron', "
+                 "origin_key='shared' WHERE id=?", (b,))
+    conn.commit()  # must not raise
+    conn.close()
+
+
+def test_the_repair_is_idempotent(tmp_path):
+    """Reopening must not churn an already-correct index."""
+    db = tmp_path / "stable.db"
+    conn = kanban_db.connect(db)
+    first = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='idx_tasks_origin_key'"
+    ).fetchone()[0]
+    conn.close()
+
+    for _ in range(3):
+        kanban_db.init_db(db)
+        conn = kanban_db.connect(db)
+        again = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='idx_tasks_origin_key'"
+        ).fetchone()[0]
+        conn.close()
+        assert again == first

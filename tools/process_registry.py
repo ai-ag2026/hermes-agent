@@ -136,6 +136,10 @@ class ProcessSession:
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    # Durable-ledger store this session was born into. Captured at spawn so
+    # the terminal write on the reader thread cannot land in a different
+    # store than the spawn write (see _ledger_record_spawn).
+    _ledger_db_path: Optional[Any] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
 
 
@@ -713,6 +717,11 @@ class ProcessRegistry:
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
+        # Bind the durable store BEFORE anything concurrent exists. Binding
+        # after the reader thread starts leaves a window in which a very
+        # short-lived process reaches the terminal hook unbound -- and an
+        # unbound terminal write is exactly the leak this binding prevents.
+        self._bind_ledger_store(session)
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
@@ -857,6 +866,8 @@ class ProcessRegistry:
             env_ref=env,
             pid_scope="sandbox",
         )
+        # Bind before any concurrency exists -- see _bind_ledger_store.
+        self._bind_ledger_store(session)
 
         # Run the command in the sandbox with output capture
         temp_dir = self._env_temp_dir(env)
@@ -941,10 +952,35 @@ class ProcessRegistry:
     # ERROR, not swallowed at debug like _write_checkpoint() does, because a
     # persistently failing ledger silently reopens the loss window.
 
+    def _bind_ledger_store(self, session: "ProcessSession") -> None:
+        """Resolve and pin the durable store for this session's whole life.
+
+        Called at construction, before the process is spawned and before any
+        reader thread exists. Everything downstream uses this value and never
+        re-resolves ``HERMES_HOME``.
+        """
+        try:
+            from tools import process_ledger
+
+            session._ledger_db_path = process_ledger.ledger_path()
+        except Exception:
+            session._ledger_db_path = None
+            logger.error(
+                "process ledger: could not bind a store for %s; its terminal "
+                "state will NOT be persisted", session.id, exc_info=True,
+            )
+
     def _ledger_record_spawn(self, session: "ProcessSession") -> None:
         try:
             from tools import process_ledger
 
+            # The terminal write happens later on the reader thread;
+            # re-resolving the path there can land in a different store than
+            # the spawn write -- which is how a full-suite run leaked one row
+            # into the production ledger on 2026-07-20, with NULL command and
+            # cwd because only the terminal half arrived.
+            if session._ledger_db_path is None:
+                self._bind_ledger_store(session)
             process_ledger.record_spawn(
                 session.id,
                 session_id=session.id,
@@ -964,6 +1000,7 @@ class ProcessRegistry:
                     "message_id": session.watcher_message_id,
                     "notify_on_complete": session.notify_on_complete,
                 },
+                db_path=session._ledger_db_path,
             )
         except Exception:
             logger.error(
@@ -986,6 +1023,7 @@ class ProcessRegistry:
                 state = "completed"
             process_ledger.record_terminal(
                 session.id,
+                db_path=getattr(session, "_ledger_db_path", None),
                 state=state,
                 exit_code=session.exit_code,
                 completion_reason=session.completion_reason,
@@ -1993,6 +2031,13 @@ class ProcessRegistry:
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
+                            # Carried across restart so a recovered session
+                            # terminalises into the store it was born in.
+                            # Without this the binding is lost exactly where
+                            # it matters most: a process that outlived the
+                            # gateway.
+                            "ledger_db_path": (str(s._ledger_db_path)
+                                               if s._ledger_db_path else None),
                         })
             
             # Atomic write to avoid corruption on crash
@@ -2072,6 +2117,23 @@ class ProcessRegistry:
                 notify_on_complete=entry.get("notify_on_complete", False),
                 watch_patterns=entry.get("watch_patterns", []),
             )
+            # Rehydrate the store binding rather than re-resolving it. A
+            # recovered session is precisely the case where the environment
+            # may have changed since the spawn, so re-resolving would send its
+            # terminal write somewhere its spawn row does not live. Falling
+            # back to a fresh binding is better than none, but is logged so
+            # the gap is visible rather than assumed.
+            recorded_store = entry.get("ledger_db_path")
+            if recorded_store:
+                from pathlib import Path as _Path
+                session._ledger_db_path = _Path(recorded_store)
+            else:
+                logger.warning(
+                    "process ledger: recovered session %s had no recorded "
+                    "store; binding a fresh one, its spawn row may live "
+                    "elsewhere", session.id,
+                )
+                self._bind_ledger_store(session)
             with self._lock:
                 self._running[session.id] = session
             recovered += 1

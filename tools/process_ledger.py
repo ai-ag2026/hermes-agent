@@ -94,6 +94,21 @@ def ledger_path() -> Path:
 
     Deliberately not a module constant: freezing this at import is the exact
     defect that let tests write into the production cron store.
+
+    But call-time resolution alone is not enough for a process's *lifecycle*.
+    A background process is spawned on one thread and terminalised later on
+    its reader thread -- possibly after the test that spawned it has torn down
+    its ``HERMES_HOME`` redirect. Resolving again at that moment sends the
+    terminal write to a different store than the spawn write.
+
+    That is not hypothetical: during the 2026-07-20 full-suite run exactly one
+    row appeared in the production ``~/.hermes/processes.db``, with NULL
+    command and cwd -- the signature of a terminal write with no matching
+    spawn row. My fix for the import-freeze leak had created a
+    lifetime-mismatch leak.
+
+    So callers that span a process lifetime must capture this ONCE at spawn
+    and pass it back in as ``db_path``. See ``ProcessRegistry._ledger_*``.
     """
     from hermes_cli.config import get_hermes_home
 
@@ -147,7 +162,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_state ON process_runs(state);
 
 
 @contextmanager
-def _connect() -> Iterator[sqlite3.Connection]:
+def _connect(db_path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
     """Open the ledger with durability settings and a real busy timeout.
 
     ``BEGIN IMMEDIATE`` is used by callers that write, so that the terminal
@@ -156,7 +171,7 @@ def _connect() -> Iterator[sqlite3.Connection]:
     ``write_txn()`` provides, not the weaker implicit DBAPI transaction that
     ``async_delegations`` uses today.
     """
-    path = ledger_path()
+    path = Path(db_path) if db_path is not None else ledger_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
     try:
@@ -241,6 +256,7 @@ def record_spawn(
     host_start_time: Optional[float] = None,
     routing: Optional[Dict[str, Any]] = None,
     started_at: Optional[float] = None,
+    db_path: Optional[Path] = None,
 ) -> None:
     """Persist a run at spawn time (contract §1).
 
@@ -248,7 +264,7 @@ def record_spawn(
     untouched, so a retried spawn path cannot resurrect a terminalised run.
     """
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _connect(db_path) as conn:
         with _write_txn(conn):
             conn.execute(
                 """INSERT INTO process_runs (
@@ -278,8 +294,14 @@ def record_terminal(
     output: Optional[str] = None,
     payload: Optional[Dict[str, Any]] = None,
     notify: bool = True,
+    db_path: Optional[Path],
 ) -> bool:
     """Terminalise a run and enqueue its obligation in ONE transaction.
+
+    ``db_path`` is a REQUIRED keyword with no default. A default would let a
+    caller omit it by accident and silently fall back to a globally resolved
+    path -- which is the leak. Making it required moves the mistake from
+    runtime to the call site, where it is visible.
 
     Contract §2 and §3. Returns ``True`` when this call performed the
     terminalisation, ``False`` when the run was already terminal — the caller
@@ -292,10 +314,27 @@ def record_terminal(
     """
     if state not in TERMINAL_STATES:
         raise ValueError(f"not a terminal state: {state!r}")
+    if db_path is None:
+        # FAIL-CLOSED. Falling back to a globally resolved path here is what
+        # produced the production leak: a background thread outliving its
+        # caller's environment writes to whatever HERMES_HOME now says, and
+        # `_connect()` will happily create the directory, turning a misroute
+        # into a formally valid second database instead of a visible error.
+        #
+        # Refusing loses this outcome -- but an unbound terminal write had
+        # already lost it, by putting it in a store nobody reads. A loud
+        # refusal is recoverable; a silent stray database is not.
+        logger.error(
+            "process ledger: refusing to terminalise %s without a bound "
+            "store. The caller must bind one at spawn; writing to a "
+            "globally-resolved path is how test data reaches production.",
+            process_id,
+        )
+        return False
     now = time.time()
     snapshot = (output or "")[-MAX_OUTPUT_SNAPSHOT_CHARS:]
 
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK, _connect(db_path) as conn:
         with _write_txn(conn):
             cur = conn.execute(
                 """UPDATE process_runs
