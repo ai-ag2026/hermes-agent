@@ -3650,6 +3650,7 @@ def create_task(
     project_id: Optional[str] = None,
     completion_contract: Optional[dict] = None,
     allow_workspace_refs: bool = False,
+    work_contract: Optional[dict] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3871,6 +3872,10 @@ def create_task(
             return row["id"]
 
     now = int(time.time())
+    # Local alias so the INSERT below stays readable. An empty dict means
+    # "no work contract", which writes NULL everywhere -- the same honest
+    # value a legacy row carries.
+    _wc = work_contract or {}
 
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
@@ -3963,8 +3968,13 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        task_class, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        task_class, completion_contract,
+                        origin_kind, origin_key, payload_digest, work_kind,
+                        owner_core_id, origin_conversation_ref,
+                        acceptance_required, definition_of_done, commitment,
+                        commitment_due_at, route_tenant_snapshot, authority_epoch
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3989,6 +3999,26 @@ def create_task(
                         session_id,
                         task_class,
                         json.dumps(completion_contract, sort_keys=True) if completion_contract else None,
+                        # D1 work contract. Written in the SAME INSERT rather
+                        # than a follow-up UPDATE: an UPDATE would leave a
+                        # window in which the row exists without its
+                        # origin_key, and therefore without the uniqueness
+                        # that makes promotion idempotent at all. `write_txn`
+                        # is not reentrant, so a caller cannot wrap this
+                        # function to close that window from outside.
+                        _wc.get("origin_kind"),
+                        _wc.get("origin_key"),
+                        _wc.get("payload_digest"),
+                        _wc.get("work_kind"),
+                        _wc.get("owner_core_id"),
+                        _wc.get("origin_conversation_ref"),
+                        (1 if _wc.get("acceptance_required") else 0)
+                        if _wc.get("acceptance_required") is not None else None,
+                        _wc.get("definition_of_done"),
+                        _wc.get("commitment"),
+                        _wc.get("commitment_due_at"),
+                        _wc.get("route_tenant_snapshot"),
+                        _wc.get("authority_epoch"),
                     ),
                 )
                 for pid in parents:
