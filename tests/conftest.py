@@ -428,6 +428,74 @@ def _isolate_hermes_home(_hermetic_environment):
     return None
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cron_store(tmp_path, monkeypatch, _hermetic_environment):
+    """Route the cron store at a per-test tempdir — for the WHOLE suite.
+
+    ``cron/jobs.py`` resolves its paths once, at *import* time
+    (``HERMES_DIR = get_hermes_home().resolve()``), so the ``HERMES_HOME``
+    redirect in ``_hermetic_environment`` never reaches them: by the time any
+    fixture runs, the module constants are already bound to the real
+    ``~/.hermes/cron``. Every test that creates a job therefore wrote into the
+    production store.
+
+    This lived under ``tests/cron/conftest.py`` and so only covered the
+    ``tests/cron`` subtree. That is not where the leak was: on 2026-07-20
+    ``tests/hermes_cli/test_console_engine.py`` created job ``alpha``
+    (``say hello``, every 1h) in the real ``~/.hermes/cron/jobs.json``, where
+    the live scheduler then executed it hourly. A subtree-scoped guard cannot
+    catch that — cron jobs are created from CLI, gateway and tool tests too —
+    so the fixture belongs here, at suite root.
+
+    Two properties matter and are load-bearing:
+
+    1. **Order-independent.** Every read/write funnels through
+       ``_current_cron_store()``, which reads these module globals at *call*
+       time. Patching them from a fixture therefore works no matter when
+       ``cron.jobs`` was imported or in what order files were collected.
+    2. **Precedence-preserving.** We patch the module constants rather than
+       entering ``use_cron_store()``. ``_current_cron_store()`` prefers an
+       explicit ContextVar override and only falls back to these constants, so
+       tests pinning their own paths — ``@patch("cron.jobs.CRON_DIR", ...)``,
+       the ``tmp_cron_dir`` fixture in ``tests/hermes_cli/test_cron.py``, or
+       their own ``use_cron_store()`` scope — still win over this fixture.
+
+    The two ticker markers are patched separately and deliberately: they are
+    read straight from the module globals (``record_ticker_heartbeat`` →
+    ``TICKER_HEARTBEAT_FILE``), NOT through ``_current_cron_store()``, so the
+    store redirect alone left them pointing at the live
+    ``~/.hermes/cron/ticker_heartbeat``.
+
+    Anchored on the same ``HERMES_HOME`` tempdir that ``_hermetic_environment``
+    exports, so the env-based resolution in ``cron/scheduler.py``
+    (``_get_hermes_home()``) and these constants agree on one store instead of
+    splitting writes across two.
+    """
+    try:
+        from cron import jobs as cron_jobs
+    except ImportError:
+        # No importable cron module ⇒ no code path can reach the cron store,
+        # so there is nothing to isolate. This is not a fail-open: the leak
+        # this fixture closes requires cron.jobs to be importable.
+        yield None
+        return
+
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    cron_dir = hermes_home / "cron"
+    cron_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(cron_jobs, "HERMES_DIR", hermes_home, raising=False)
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", cron_dir, raising=False)
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", cron_dir / "jobs.json", raising=False)
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", cron_dir / "output", raising=False)
+    monkeypatch.setattr(
+        cron_jobs, "TICKER_HEARTBEAT_FILE", cron_dir / "ticker_heartbeat", raising=False
+    )
+    monkeypatch.setattr(
+        cron_jobs, "TICKER_SUCCESS_FILE", cron_dir / "ticker_last_success", raising=False
+    )
+    yield hermes_home
+
+
 # ── Module-level state reset — replaced by per-file process isolation ──────
 #
 # Each test FILE runs in a freshly-spawned ``python -m pytest <file>``
