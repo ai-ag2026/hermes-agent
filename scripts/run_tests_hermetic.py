@@ -377,6 +377,7 @@ def main() -> int:
         f"Start:      {time.strftime('%Y-%m-%d %H:%M:%S %z')}",
         f"Repo:       {REPO}",
         f"Target-SHA: {git_rev}",
+        f"Python:     {sys.version.split()[0]} ({sys.executable})",
         *[f"Runner-Blob: {rel} sha256={digest}"
           for rel, digest in runner_ident.items()],
         f"Befehl:     {' '.join(cmd)}",
