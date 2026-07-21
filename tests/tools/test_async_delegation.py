@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -470,10 +471,62 @@ def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch
     assert ad.claim_completion_delivery("deleg_claim", "consumer-a")
     assert not ad.claim_completion_delivery("deleg_claim", "consumer-b")
     assert ad.release_completion_delivery("deleg_claim", "consumer-a")
+    # C-1: a release arms the per-record backoff, so the retry is not
+    # immediate anymore — it becomes possible once the backoff has passed.
+    assert not ad.claim_completion_delivery("deleg_claim", "consumer-b")
+    _advance_module_time(monkeypatch, ad._delivery_backoff_seconds(1) + 0.001)
     assert ad.claim_completion_delivery("deleg_claim", "consumer-b")
     assert ad.complete_completion_delivery("deleg_claim", "consumer-b")
     assert not ad.claim_completion_delivery("deleg_claim", "consumer-c")
     assert ad.get_durable_delegation("deleg_claim")["delivery_state"] == "delivered"
+
+
+def _advance_module_time(monkeypatch, seconds: float) -> None:
+    """Shift ad's view of time.time() forward without sleeping."""
+    real_time = time.time
+    offset = getattr(ad.time, "_test_offset", 0.0) + seconds
+    fake = types.SimpleNamespace(time=lambda: real_time() + offset,
+                                 _test_offset=offset)
+    monkeypatch.setattr(ad, "time", fake)
+
+
+def test_c1_release_backoff_bounds_claim_rate(tmp_path, monkeypatch):
+    """Befund C-1: N failing delivery cycles over T seconds must produce
+    O(log T) claims, not T x loop-rate claims. Measured pre-fix: up to
+    ~5 claims/s against one record for 11 minutes (deleg_b636ccbb, 3573
+    attempts)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg_backoff", "session_key": "owner",
+        "origin_ui_session_id": "", "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(
+        {"delegation_id": "deleg_backoff", "status": "completed",
+         "completed_at": 2.0},
+        {"status": "completed", "summary": "done"},
+    )
+
+    # Simulate a consumer whose injection always fails, polling at 10 Hz for
+    # 120 simulated seconds.
+    claims = 0
+    for _ in range(1200):
+        if ad.claim_completion_delivery("deleg_backoff", "consumer"):
+            claims += 1
+            assert ad.release_completion_delivery("deleg_backoff", "consumer")
+        _advance_module_time(monkeypatch, 0.1)
+
+    # 1+2+4+...+60s backoff: 120 s of failures allow at most ~9 claims.
+    assert claims <= 9, f"Backoff greift nicht: {claims} Claims in 120 s"
+    assert claims >= 3, "Backoff überdrosselt: Retry findet praktisch nicht statt"
+
+    # Success resets the backoff state entirely.
+    _advance_module_time(monkeypatch, ad._DELIVERY_BACKOFF_CAP_SECONDS + 1)
+    assert ad.claim_completion_delivery("deleg_backoff", "consumer")
+    assert ad.complete_completion_delivery("deleg_backoff", "consumer")
+    row = ad.get_durable_delegation("deleg_backoff")
+    assert row["delivery_state"] == "delivered"
 
 
 # ---------------------------------------------------------------------------
