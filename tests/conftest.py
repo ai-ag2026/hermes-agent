@@ -493,6 +493,30 @@ def _isolated_cron_store(tmp_path, monkeypatch, _hermetic_environment):
     monkeypatch.setattr(
         cron_jobs, "TICKER_SUCCESS_FILE", cron_dir / "ticker_last_success", raising=False
     )
+
+    # ``cron/executions.py`` (Upstream-Carry d9dd05b69/abc22cdf1) repeats the
+    # import-time freeze this fixture exists for: ``EXECUTIONS_FILE =
+    # get_hermes_home().resolve() / "cron" / ...`` binds at first import —
+    # typically transitively via ``cron.scheduler`` during collection — long
+    # before HERMES_HOME redirection can matter. Patch it the moment the
+    # module is importable; before the carry lands this block is a no-op.
+    # ``EXECUTIONS_FILE.name`` keeps this correct across both carry stages
+    # (executions.json → executions.db); the lock file only exists in the
+    # JSON stage.
+    try:
+        from cron import executions as cron_executions
+    except ImportError:
+        pass
+    else:
+        monkeypatch.setattr(
+            cron_executions, "EXECUTIONS_FILE",
+            cron_dir / cron_executions.EXECUTIONS_FILE.name, raising=False)
+        if hasattr(cron_executions, "EXECUTIONS_LOCK_FILE"):
+            monkeypatch.setattr(
+                cron_executions, "EXECUTIONS_LOCK_FILE",
+                cron_dir / cron_executions.EXECUTIONS_LOCK_FILE.name,
+                raising=False)
+
     yield hermes_home
 
 
