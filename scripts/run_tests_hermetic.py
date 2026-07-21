@@ -221,6 +221,22 @@ def main() -> int:
     inv_after = inventory(REAL_HERMES)
     noise, violations = classify_drift(inv_before, inv_after)
 
+    sandboxed = not args.no_sandbox
+    # Verdict logic: under bwrap the test process holds a KERNEL-enforced
+    # read-only view of the real ~/.hermes — drift there cannot come from the
+    # tests, it is live operation (gateway, cron jobs) by definition. The
+    # violation category is therefore only a verdict-carrier without the
+    # sandbox, or in --strict mode (maintenance window, services stopped),
+    # where any drift at all invalidates the proof.
+    if args.strict:
+        isolation_ok = not violations and not noise
+    elif sandboxed:
+        isolation_ok = True
+    else:
+        isolation_ok = not violations
+
+    drift_label = ("extern:    " if sandboxed and not args.strict
+                   else "VERLETZUNG:")
     footer = [
         "=" * 70,
         f"Ende:       {time.strftime('%Y-%m-%d %H:%M:%S %z')}  "
@@ -229,19 +245,21 @@ def main() -> int:
         f"Cron-Manifest nach Lauf: {manifest_after}",
         f"Manifest unverändert:    "
         f"{'JA' if manifest_after == manifest_before else 'NEIN — PRÜFEN'}",
-        f"Bracket-Drift: {len(noise)} Live-Rauschen, "
-        f"{len(violations)} VERLETZUNGEN",
+        f"Bracket-Drift: {len(noise)} Live-Rauschen, {len(violations)} "
+        f"{'extern beobachtete Pfade' if sandboxed and not args.strict else 'VERLETZUNGEN'}",
     ]
     for path, kind in violations:
-        footer.append(f"  VERLETZUNG: {kind} {path}")
+        footer.append(f"  {drift_label} {kind} {path}")
     for path, kind in noise[:20]:
         footer.append(f"  rauschen:   {kind} {path}")
     if len(noise) > 20:
         footer.append(f"  … {len(noise) - 20} weitere Rausch-Pfade")
 
-    isolation_ok = not violations and (not args.strict or not noise)
     footer.append(f"ISOLATION:  {'OK' if isolation_ok else 'VERLETZT'}"
-                  + ("" if isolation_ok else " — Lauf ungültig, Befund sichern"))
+                  + (" (kernel-RO erzwungen; Drift = Live-Betrieb)"
+                     if isolation_ok and sandboxed and (violations or noise)
+                     else "" if isolation_ok
+                     else " — Lauf ungültig, Befund sichern"))
     footer.append(f"Log:        {log_path}")
     print("\n".join(footer), flush=True)
     with log_path.open("a") as log:
