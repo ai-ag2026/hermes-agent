@@ -620,8 +620,60 @@ def _ensure_current_event_loop(request):
 _LIVE_SYSTEM_GUARD_BYPASS_MARK = "live_system_guard_bypass"
 
 
+def _tripwire_real_home() -> Path:
+    """The real home from the passwd database, NOT ``$HOME``.
+
+    ``$HOME`` is exactly what a hermetic runner redirects — and what a
+    spoofing caller would redirect too. The passwd entry is mechanical
+    ground truth no environment variable can move.
+    """
+    try:
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):  # non-POSIX fallback
+        return Path.home()
+
+
+def _hermetic_refusal(real_home: Path, environ) -> str | None:
+    """Refusal reason if this process could write a live store, else None.
+
+    Pure decision core, unit-testable with injected paths/env. The contract
+    (hardened after the 2026-07-21 TARS review, which spoofed the old
+    ``HERMES_HERMETIC=1`` attestation):
+
+    * There is NO trusted environment flag. Hermeticity is only ever
+      *observed*: every live store (``state.db`` present) must be
+      non-writable for this process — which under the runner's bwrap
+      read-only bind is kernel-enforced (``EROFS``).
+    * ``HERMES_HERMETIC_PROTECT`` may name ADDITIONAL roots to check (the
+      runner passes the original custom ``HERMES_HOME`` etc.). Forging it
+      can only tighten the check, never loosen it.
+    * The single escape hatch stays the spelled-out human override for
+      forensic setups.
+    """
+    stores = [real_home / ".hermes"]
+    for extra in environ.get("HERMES_HERMETIC_PROTECT", "").split(os.pathsep):
+        if extra:
+            stores.append(Path(extra))
+    writable_live = [s for s in stores
+                     if (s / "state.db").exists() and os.access(s, os.W_OK)]
+    if not writable_live:
+        return None  # nothing live in sight, or kernel already protects it
+    if environ.get("HERMES_ALLOW_UNHERMETIC") == "yes-i-accept-the-risk":
+        return None  # deliberate, spelled-out override for forensic setups
+    return (
+        "ABGEBROCHEN: Testlauf mit beschreibbarem echten Live-Store "
+        f"({', '.join(str(s) for s in writable_live)}). Genau so wurde am "
+        "20.07.2026 die Installation gelöscht. Nutze "
+        "scripts/run_tests_hermetic.py (kernel-erzwungenes read-only via "
+        "bwrap; ein Attestierungs-Flag gibt es nicht mehr) — oder setze "
+        "HERMES_ALLOW_UNHERMETIC=yes-i-accept-the-risk, wenn du wirklich "
+        "weißt, was du tust."
+    )
+
+
 def _refuse_unhermetic_run() -> None:
-    """Abort BEFORE collection if this process could write the real ~/.hermes.
+    """Abort BEFORE collection if this process could write a live store.
 
     2026-07-20 23:56: a review subagent ran ``python -m pytest -q tests/``
     without process-wide isolation and most of the real ``~/.hermes`` was
@@ -632,27 +684,14 @@ def _refuse_unhermetic_run() -> None:
     ``docs/hauptsession-umbau/VORFALL-20260720-WIEDERHERSTELLUNG.md``.
 
     The only supported entry point on a machine with a live install is
-    ``scripts/run_tests_hermetic.py`` (process-wide HOME/HERMES_HOME/XDG/
-    TMPDIR redirection + kernel-enforced read-only ``~/.hermes`` via bwrap).
-    It sets ``HERMES_HERMETIC=1`` as its attestation. CI and dev machines
-    without a live store (no ``~/.hermes/state.db``) are unaffected.
+    ``scripts/run_tests_hermetic.py``. It does not *declare* hermeticity —
+    it *produces* it (kernel-read-only stores), and that produced state is
+    what ``_hermetic_refusal`` verifies. CI and dev machines without a live
+    store (no ``state.db``) are unaffected.
     """
-    if os.environ.get("HERMES_HERMETIC") == "1":
-        return
-    real_store = Path.home() / ".hermes"
-    if not (real_store / "state.db").exists():
-        return  # no live install in sight — nothing to protect
-    if not os.access(real_store, os.W_OK):
-        return  # read-only (e.g. sandboxed) — kernel already protects it
-    if os.environ.get("HERMES_ALLOW_UNHERMETIC") == "yes-i-accept-the-risk":
-        return  # deliberate, spelled-out override for forensic setups
-    raise pytest.UsageError(
-        "ABGEBROCHEN: Testlauf gegen ein beschreibbares echtes ~/.hermes "
-        f"({real_store}). Genau so wurde am 20.07.2026 die Installation "
-        "gelöscht. Nutze scripts/run_tests_hermetic.py — oder setze "
-        "HERMES_ALLOW_UNHERMETIC=yes-i-accept-the-risk, wenn du wirklich "
-        "weißt, was du tust."
-    )
+    reason = _hermetic_refusal(_tripwire_real_home(), os.environ)
+    if reason is not None:
+        raise pytest.UsageError(reason)
 
 
 def pytest_configure(config):  # noqa: D401 — pytest hook

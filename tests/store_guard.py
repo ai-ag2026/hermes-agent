@@ -42,10 +42,36 @@ import os
 import sqlite3
 from pathlib import Path
 
-# Resolved once, deliberately: this must be the real home, not a redirected
-# one. Everything else in this codebase resolves paths at call time; this is
-# the exception that proves why the rule exists.
-_REAL_HOME = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).resolve()
+
+def _passwd_home() -> Path:
+    """The real home from the passwd database, NOT ``$HOME``.
+
+    ``$HOME`` is exactly what a hermetic runner (or a spoofing caller)
+    redirects; the passwd entry is ground truth no environment can move.
+    Hardened after the 2026-07-21 TARS review alongside the conftest
+    tripwire — the two must agree on what "real" means.
+    """
+    try:
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):  # non-POSIX fallback
+        return Path.home()
+
+
+# Resolved once, deliberately: these must be the real stores, not redirected
+# ones. Everything else in this codebase resolves paths at call time; this is
+# the exception that proves why the rule exists. Protected are BOTH the
+# passwd-home store (immune to a redirected $HOME) and whatever HERMES_HOME
+# pointed at when this module loaded — a custom/profile store the passwd
+# path would miss.
+_REAL_HOME = (_passwd_home() / ".hermes").resolve()
+_PROTECTED = tuple(dict.fromkeys(
+    p for p in (
+        _REAL_HOME,
+        Path(os.environ["HERMES_HOME"]).resolve()
+        if os.environ.get("HERMES_HOME") else None,
+    ) if p is not None
+))
 
 _original_connect = sqlite3.connect
 _enabled = False
@@ -69,7 +95,8 @@ def _under_real_home(target: str) -> bool:
         resolved = Path(path_part).expanduser().resolve()
     except (OSError, RuntimeError):
         return False
-    return resolved == _REAL_HOME or _REAL_HOME in resolved.parents
+    return any(resolved == root or root in resolved.parents
+               for root in _PROTECTED)
 
 
 def _guarded_connect(database, *args, **kwargs):
@@ -77,7 +104,7 @@ def _guarded_connect(database, *args, **kwargs):
     if _enabled and _under_real_home(target) and not _is_read_only_uri(target):
         raise ProductionStoreWriteAttempt(
             f"Test tried to open {target} for writing.\n"
-            f"That is under the real home {_REAL_HOME}.\n"
+            f"That is under a protected real store ({', '.join(map(str, _PROTECTED))}).\n"
             "Redirect HERMES_HOME to a tmp_path, bind the store explicitly, "
             "or open the source read-only with '?mode=ro'.\n"
             "This guard exists because after-the-fact hash bracketing missed "
