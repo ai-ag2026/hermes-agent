@@ -161,3 +161,4 @@ infographic/
 
 # Serena MCP local project cache (untracked)
 .serena/
+.hermetic-logs/
