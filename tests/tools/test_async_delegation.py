@@ -490,6 +490,67 @@ def _advance_module_time(monkeypatch, seconds: float) -> None:
     monkeypatch.setattr(ad, "time", fake)
 
 
+def test_c1_backoff_saturates_overflow_free():
+    """TARS-Review §3.4: the cap must bound the EXPONENT, not just the
+    product — ``2.0 ** 3572`` raises OverflowError, and 3573 is a real
+    legacy attempt count from the incident record deleg_b636ccbb."""
+    assert ad._delivery_backoff_seconds(0) == 1.0
+    assert ad._delivery_backoff_seconds(1) == 1.0
+    assert ad._delivery_backoff_seconds(2) == 2.0
+    assert ad._delivery_backoff_seconds(3) == 4.0
+    # Cap boundary: last uncapped step, first capped step.
+    assert ad._delivery_backoff_seconds(6) == 32.0
+    assert ad._delivery_backoff_seconds(7) == 60.0
+    # The incident's real legacy record and pathological integers.
+    assert ad._delivery_backoff_seconds(3573) == 60.0
+    assert ad._delivery_backoff_seconds(10**9) == 60.0
+    assert ad._delivery_backoff_seconds(2**80) == 60.0
+
+
+def test_c1_release_survives_legacy_attempt_count(tmp_path, monkeypatch):
+    """Releasing a pending record that already carries thousands of failed
+    attempts (the real post-incident data shape) must arm the cap, not
+    crash the delivery loop."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg_legacy", "session_key": "owner",
+        "origin_ui_session_id": "", "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(
+        {"delegation_id": "deleg_legacy", "status": "completed",
+         "completed_at": 2.0},
+        {"status": "completed", "summary": "done"},
+    )
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET delivery_attempts=? WHERE delegation_id=?",
+            (3573, "deleg_legacy"),
+        )
+
+    assert ad.claim_completion_delivery("deleg_legacy", "consumer")
+    before = ad.time.time()
+    assert ad.release_completion_delivery("deleg_legacy", "consumer")
+
+    with ad._DB_LOCK, ad._connect() as conn:
+        next_at = conn.execute(
+            "SELECT delivery_next_attempt_at FROM async_delegations "
+            "WHERE delegation_id=?", ("deleg_legacy",)).fetchone()[0]
+    assert next_at is not None
+    assert next_at - before <= ad._DELIVERY_BACKOFF_CAP_SECONDS + 1.0
+
+    # Success afterwards clears the backoff marker entirely.
+    _advance_module_time(monkeypatch, ad._DELIVERY_BACKOFF_CAP_SECONDS + 1)
+    assert ad.claim_completion_delivery("deleg_legacy", "consumer")
+    assert ad.complete_completion_delivery("deleg_legacy", "consumer")
+    with ad._DB_LOCK, ad._connect() as conn:
+        cleared = conn.execute(
+            "SELECT delivery_next_attempt_at FROM async_delegations "
+            "WHERE delegation_id=?", ("deleg_legacy",)).fetchone()[0]
+    assert cleared is None
+
+
 def test_c1_release_backoff_bounds_claim_rate(tmp_path, monkeypatch):
     """Befund C-1: N failing delivery cycles over T seconds must produce
     O(log T) claims, not T x loop-rate claims. Measured pre-fix: up to

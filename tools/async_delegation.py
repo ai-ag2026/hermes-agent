@@ -83,12 +83,25 @@ _MAX_DURABLE_PENDING = 1000
 # on successful delivery.
 _DELIVERY_BACKOFF_BASE_SECONDS = 1.0
 _DELIVERY_BACKOFF_CAP_SECONDS = 60.0
+# Smallest exponent at which base * 2**e is guaranteed >= cap. Legacy records
+# carry REAL attempt counts in the thousands (incident record deleg_b636ccbb:
+# 3573) and ``2.0 ** 3572`` raises OverflowError — the cap has to bound the
+# exponent before the power, not just the product after it.
+_DELIVERY_BACKOFF_CAP_EXPONENT = int(
+    _DELIVERY_BACKOFF_CAP_SECONDS / _DELIVERY_BACKOFF_BASE_SECONDS
+).bit_length()
 _DB_LOCK = threading.Lock()
 
 
 def _delivery_backoff_seconds(attempts: int) -> float:
-    """1 s, 2 s, 4 s, … capped at 60 s. ``attempts`` counts finished claims."""
+    """1 s, 2 s, 4 s, … capped at 60 s. ``attempts`` counts finished claims.
+
+    Saturating: any attempt count past the cap exponent IS the cap; the
+    power is only ever computed for small exponents.
+    """
     exponent = max(int(attempts) - 1, 0)
+    if exponent > _DELIVERY_BACKOFF_CAP_EXPONENT:
+        return _DELIVERY_BACKOFF_CAP_SECONDS
     return min(_DELIVERY_BACKOFF_CAP_SECONDS,
                _DELIVERY_BACKOFF_BASE_SECONDS * (2.0 ** exponent))
 
