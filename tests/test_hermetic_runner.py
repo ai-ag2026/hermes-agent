@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -94,20 +95,72 @@ def test_protected_roots_include_custom_hermes_home(tmp_path):
     assert custom.resolve() in roots
 
 
-def test_live_writable_roots_detect_only_writable_stores(tmp_path):
+def test_live_writable_roots_use_the_shared_policy(tmp_path):
+    """Same classification as the tripwire: canonical markers decide liveness,
+    and only a read-only MOUNT counts as protection — a 0555 directory on a
+    writable filesystem does not (TARS review §3.2)."""
     live = tmp_path / "live"
     live.mkdir()
     (live / "state.db").touch()
+    partial = tmp_path / "partial"      # no state.db, still live state
+    partial.mkdir()
+    (partial / "config.yaml").touch()
     empty = tmp_path / "empty"
     empty.mkdir()
-    ro = tmp_path / "ro"
-    ro.mkdir()
-    (ro / "state.db").touch()
-    ro.chmod(0o555)
+    chmod_only = tmp_path / "chmod-only"
+    chmod_only.mkdir()
+    (chmod_only / "state.db").touch()
+    chmod_only.chmod(0o555)
     try:
-        assert runner.live_writable_roots([live, empty, ro]) == [live]
+        exposed = runner.live_writable_roots([live, partial, empty, chmod_only])
+        assert exposed == [live, partial, chmod_only]
     finally:
-        ro.chmod(0o755)
+        chmod_only.chmod(0o755)
+
+
+# ---- CLI boundaries (TARS review §3.5: test them through main()) ----------
+
+
+def test_cli_refuses_no_sandbox_with_writable_live_root(tmp_path, monkeypatch, capsys):
+    store = tmp_path / "live-store"
+    store.mkdir()
+    (store / "state.db").touch()
+    monkeypatch.setenv("HERMES_HERMETIC_PROTECT", str(store))
+    monkeypatch.setattr(sys, "argv", ["run_tests_hermetic.py", "--no-sandbox"])
+    assert runner.main() == 2
+    assert "VERWEIGERT" in capsys.readouterr().err
+
+
+def test_cli_refuses_log_dir_inside_a_protected_root(tmp_path, monkeypatch, capsys):
+    protected = tmp_path / "store"
+    protected.mkdir()
+    (protected / "state.db").touch()
+    monkeypatch.setenv("HERMES_HERMETIC_PROTECT", str(protected))
+    monkeypatch.setattr(sys, "argv", [
+        "run_tests_hermetic.py", "--log-dir", str(protected / "logs")])
+    assert runner.main() == 2
+    err = capsys.readouterr().err
+    assert "VERWEIGERT" in err and "Bracket" in err
+
+
+def test_runner_identity_covers_the_whole_trust_set():
+    ident = runner.runner_identity()
+    assert set(ident) == set(runner.RUNNER_TRUST_SET)
+    for rel in ("tests/hermetic_policy.py", "tests/conftest.py",
+                "tests/store_guard.py"):
+        assert rel in ident, f"{rel} decides isolation and must be pinned"
+    assert all(len(h) == 64 for h in ident.values())
+
+
+def test_runner_identity_changes_with_content(tmp_path):
+    fake = tmp_path / "repo"
+    for rel in runner.RUNNER_TRUST_SET:
+        p = fake / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("v1")
+    before = runner.runner_identity(fake)
+    (fake / runner.RUNNER_TRUST_SET[0]).write_text("v2")
+    assert runner.runner_identity(fake) != before
 
 
 def test_bwrap_plan_is_default_deny(tmp_path):

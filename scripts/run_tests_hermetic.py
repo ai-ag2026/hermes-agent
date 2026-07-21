@@ -85,23 +85,15 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
 
+# The runner and the conftest tripwire MUST classify roots identically —
+# two copies of that rule would drift silently. Single source of truth:
+from tests.hermetic_policy import (  # noqa: E402
+    candidate_roots, is_live, is_readonly_mount, passwd_home,
+)
 
-def real_home() -> Path:
-    """The invoking user's home from the passwd database, NOT ``$HOME``.
-
-    ``$HOME`` is exactly the variable this runner redirects — and the one a
-    spoofing caller would redirect too. The passwd entry is the mechanical
-    ground truth the tripwire and the runner must agree on.
-    """
-    try:
-        import pwd
-        return Path(pwd.getpwuid(os.getuid()).pw_dir)
-    except (ImportError, KeyError):  # non-POSIX fallback
-        return Path.home()
-
-
-REAL_HOME = real_home()
+REAL_HOME = passwd_home()
 REAL_HERMES = REAL_HOME / ".hermes"
 
 # Known state-bearing roots beyond the store itself. Existing entries are
@@ -144,19 +136,15 @@ def protected_roots(environ: dict | None = None) -> list[Path]:
     """Every existing root the test process must never be able to write.
 
     Order matters downstream: these become the *last* (winning) bwrap binds.
-    Covers the real ``~/.hermes``, an original custom ``HERMES_HOME`` (which
-    ``Path.home()``-based code would miss), and known state-bearing mounts.
+    Covers the canonical ``~/.hermes``, an ambient custom ``HERMES_HOME``
+    (which ``Path.home()``-based code would miss) and known state-bearing
+    mounts. Root discovery is shared with the tripwire.
     """
     environ = os.environ if environ is None else environ
-    roots: list[Path] = []
-    candidates = [REAL_HERMES]
-    custom = environ.get("HERMES_HOME")
-    if custom:
-        candidates.append(Path(custom))
-    candidates.extend(STATE_BEARING_MOUNTS)
-    for cand in candidates:
+    roots = candidate_roots(environ, REAL_HOME)
+    for mount in STATE_BEARING_MOUNTS:
         try:
-            resolved = cand.resolve()
+            resolved = mount.resolve()
         except OSError:
             continue
         if resolved.exists() and resolved not in roots:
@@ -165,9 +153,13 @@ def protected_roots(environ: dict | None = None) -> list[Path]:
 
 
 def live_writable_roots(roots: list[Path]) -> list[Path]:
-    """Protected roots that hold a live store AND are writable right now."""
-    return [r for r in roots
-            if (r / "state.db").exists() and os.access(r, os.W_OK)]
+    """Roots holding live state that this process could still damage.
+
+    Same classification the tripwire applies: liveness by canonical markers
+    (not just ``state.db``), protection only by a read-only mount — never by
+    directory permissions.
+    """
+    return [r for r in roots if is_live(r) and not is_readonly_mount(r)]
 
 
 def build_child_env(sub: dict[str, Path], base_env: dict | None = None,
@@ -247,6 +239,24 @@ def _sha256_file(path: Path) -> str:
     except OSError:
         return "unlesbar"
     return h.hexdigest()
+
+
+#: The trust set whose content decides what a run actually enforced. Hashed
+#: into every log header SEPARATELY from the target SHA (TARS review §4): a
+#: run pins which code was under test *and* which runner enforced it — those
+#: are different questions, and a log that conflates them proves neither.
+RUNNER_TRUST_SET = (
+    "scripts/run_tests_hermetic.py",
+    "tests/hermetic_policy.py",
+    "tests/conftest.py",
+    "tests/store_guard.py",
+)
+
+
+def runner_identity(repo: Path | None = None) -> dict[str, str]:
+    """Content hashes of the runner's trust set as loaded for this run."""
+    repo = REPO if repo is None else repo
+    return {rel: _sha256_file(repo / rel) for rel in RUNNER_TRUST_SET}
 
 
 def inventory(root: Path) -> dict[str, tuple]:
@@ -355,13 +365,7 @@ def main() -> int:
     git_rev = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True,
         text=True).stdout.strip() or "unbekannt"
-    # Runner identity, SEPARATE from the target SHA (TARS review §4): the
-    # content hashes of the trust set actually loaded for this run.
-    runner_ident = {
-        rel: _sha256_file(REPO / rel)
-        for rel in ("scripts/run_tests_hermetic.py", "tests/conftest.py",
-                    "tests/store_guard.py")
-    }
+    runner_ident = runner_identity()
 
     manifest_before = cron_manifest()
     # Bracketed are the STORE roots only. The state-bearing mounts are

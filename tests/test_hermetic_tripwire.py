@@ -1,17 +1,13 @@
-"""The conftest tripwire (_refuse_unhermetic_run) must never regress.
+"""The conftest tripwire must never regress — end to end, in a real pytest.
 
-It is the last line of defence the 2026-07-20 incident demanded: a plain
-``pytest`` invocation on a machine with a live, writable store has to die in
-``pytest_configure`` — before a single test or fixture runs.
+``tests/test_hermetic_policy.py`` pins the decision rule. This file proves the
+rule is actually *wired into* ``pytest_configure``: a real pytest subprocess
+against a live-looking store has to die before collection (``UsageError`` →
+exit 4), and a protected one has to proceed.
 
-Hardened contract (2026-07-21 TARS review, P0): there is NO trusted
-environment flag. ``HERMES_HERMETIC=1`` is dead — the tripwire only accepts
-what it can mechanically observe: every live store non-writable for the test
-process. The subprocess tests below prove all four directions end-to-end by
-pointing ``HERMES_HERMETIC_PROTECT`` (additive-only) at a throwaway store,
-which works identically inside and outside the runner's bwrap sandbox. The
-unit tests pin the decision core, including that the passwd-derived real
-home — not a redirected ``$HOME`` — is what the wired-up hook checks.
+Every case injects its own throwaway store through the ambient
+``HERMES_HOME`` or the additive ``HERMES_HERMETIC_PROTECT``, so the verdict
+never depends on what this particular machine happens to have.
 """
 
 from __future__ import annotations
@@ -23,26 +19,37 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import _hermetic_refusal, _tripwire_real_home
+from tests import hermetic_policy as policy
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _TARGET = "tests/tools/test_store_guard.py"
 
 
-def _fake_store(tmp_path: Path) -> Path:
-    store = tmp_path / "fake-hermes"
-    store.mkdir()
-    (store / "state.db").touch()
-    return store
+@pytest.fixture(autouse=True)
+def _requires_protected_real_store():
+    """These tests need the canonical store to be protected already.
+
+    That is true under ``scripts/run_tests_hermetic.py`` (bwrap --ro-bind)
+    and on machines without a live store. Anywhere else the tripwire would
+    fire for the machine's own reasons and the assertions would be
+    meaningless — so skip rather than lie.
+    """
+    real = policy.passwd_home() / ".hermes"
+    if policy.is_live(real) and not policy.is_readonly_mount(real):
+        pytest.skip("canonical store is live and writable — not inside the runner")
 
 
-def _collect(store: Path, env_extra: dict) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
-           # Additive-only: our throwaway store is the ONLY extra root, so
-           # the verdict on it is isolated from whatever this host has.
-           "HERMES_HERMETIC_PROTECT": str(store)}
-    env.pop("HERMES_HERMETIC", None)
-    env.pop("HERMES_ALLOW_UNHERMETIC", None)
+def _live_store(tmp_path: Path, name: str, marker: str = "state.db") -> Path:
+    root = tmp_path / name
+    (root / marker).parent.mkdir(parents=True, exist_ok=True)
+    (root / marker).touch()
+    return root
+
+
+def _collect(env_extra: dict) -> subprocess.CompletedProcess:
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    for var in ("HERMES_HERMETIC", policy.OVERRIDE_ENV, policy.PROTECT_ENV):
+        env.pop(var, None)
     env.update(env_extra)
     return subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q",
@@ -51,74 +58,58 @@ def _collect(store: Path, env_extra: dict) -> subprocess.CompletedProcess:
     )
 
 
-def test_tripwire_refuses_writable_live_store(tmp_path):
-    proc = _collect(_fake_store(tmp_path), {})
+def _assert_refused(proc: subprocess.CompletedProcess) -> None:
     assert proc.returncode == 4, proc.stdout + proc.stderr
     assert "ABGEBROCHEN" in proc.stdout + proc.stderr
 
 
-def test_tripwire_ignores_spoofed_attestation(tmp_path):
-    """The exact P0 bypass from the TARS review: the flag must be dead."""
-    proc = _collect(_fake_store(tmp_path), {"HERMES_HERMETIC": "1"})
-    assert proc.returncode == 4, proc.stdout + proc.stderr
-    assert "ABGEBROCHEN" in proc.stdout + proc.stderr
+def test_refuses_writable_live_store(tmp_path):
+    _assert_refused(_collect({policy.PROTECT_ENV: str(_live_store(tmp_path, "s"))}))
 
 
-def test_tripwire_accepts_kernel_readonly_store(tmp_path):
-    """A store the process cannot write is the ONLY accepted normal state —
-    exactly what the runner's bwrap read-only bind produces."""
-    store = _fake_store(tmp_path)
+def test_refuses_ambient_custom_hermes_home(tmp_path):
+    """P0 §3.3: a direct run against a custom/profile store, with nobody
+    passing HERMES_HERMETIC_PROTECT, must still be caught."""
+    _assert_refused(_collect({"HERMES_HOME": str(_live_store(tmp_path, "custom"))}))
+
+
+def test_refuses_partial_store_without_state_db(tmp_path):
+    """P1 §3.4: after a partial loss the store keeps config/profiles and is
+    still worth protecting — state.db alone must not be the sentinel."""
+    store = _live_store(tmp_path, "damaged", "config.yaml")
+    assert not (store / "state.db").exists()
+    _assert_refused(_collect({"HERMES_HOME": str(store)}))
+
+
+def test_refuses_despite_spoofed_attestation_flag(tmp_path):
+    """The original P0: the environment flag must change nothing."""
+    _assert_refused(_collect({
+        "HERMES_HOME": str(_live_store(tmp_path, "spoof")),
+        "HERMES_HERMETIC": "1",
+    }))
+
+
+def test_refuses_chmod_only_directory(tmp_path):
+    """A 0555 directory is not protection — the database inside stays
+    writable, so the run must still be refused."""
+    store = _live_store(tmp_path, "chmod-only")
     store.chmod(0o555)
     try:
-        proc = _collect(store, {})
-        assert proc.returncode == 0, proc.stdout + proc.stderr
+        _assert_refused(_collect({policy.PROTECT_ENV: str(store)}))
     finally:
         store.chmod(0o755)
 
 
-def test_tripwire_accepts_explicit_override(tmp_path):
-    proc = _collect(_fake_store(tmp_path),
-                    {"HERMES_ALLOW_UNHERMETIC": "yes-i-accept-the-risk"})
+def test_accepts_when_nothing_live_is_exposed(tmp_path):
+    empty = tmp_path / "empty-sandbox"
+    empty.mkdir()
+    proc = _collect({"HERMES_HOME": str(empty)})
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-# ---- decision core, unit level -------------------------------------------
-
-
-def test_refusal_on_writable_home_store(tmp_path):
-    (tmp_path / ".hermes").mkdir()
-    (tmp_path / ".hermes" / "state.db").touch()
-    reason = _hermetic_refusal(tmp_path, {})
-    assert reason is not None and "ABGEBROCHEN" in reason
-
-
-def test_flag_does_not_soften_the_verdict(tmp_path):
-    (tmp_path / ".hermes").mkdir()
-    (tmp_path / ".hermes" / "state.db").touch()
-    assert _hermetic_refusal(tmp_path, {"HERMES_HERMETIC": "1"}) is not None
-
-
-def test_no_live_store_means_no_refusal(tmp_path):
-    assert _hermetic_refusal(tmp_path, {}) is None
-
-
-def test_protect_var_is_additive(tmp_path):
-    """A clean home does not excuse a writable custom store."""
-    custom = tmp_path / "custom-hermes"
-    custom.mkdir()
-    (custom / "state.db").touch()
-    reason = _hermetic_refusal(
-        tmp_path, {"HERMES_HERMETIC_PROTECT": str(custom)})
-    assert reason is not None and str(custom) in reason
-
-
-def test_real_home_comes_from_passwd_not_env(monkeypatch, tmp_path):
-    """Redirecting $HOME must not move what the tripwire protects."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    try:
-        import pwd
-        expected = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    except (ImportError, KeyError):
-        pytest.skip("no passwd database on this platform")
-    assert _tripwire_real_home() == expected
-    assert _tripwire_real_home() != tmp_path
+def test_accepts_spelled_out_human_override(tmp_path):
+    proc = _collect({
+        "HERMES_HOME": str(_live_store(tmp_path, "forensic")),
+        policy.OVERRIDE_ENV: policy.OVERRIDE_VALUE,
+    })
+    assert proc.returncode == 0, proc.stdout + proc.stderr
