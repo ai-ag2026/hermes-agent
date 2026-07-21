@@ -165,6 +165,10 @@ def main() -> int:
         "XDG_CACHE_HOME": str(sub["xdg-cache"]),
         "TMPDIR": str(sub["tmp"]),
         "PYTHONDONTWRITEBYTECODE": "1",
+        # Attestation for the conftest tripwire (_refuse_unhermetic_run):
+        # only this runner provides process-wide isolation, so only it may
+        # declare the run hermetic.
+        "HERMES_HERMETIC": "1",
     }
     env.update(overrides)
 

@@ -620,8 +620,54 @@ def _ensure_current_event_loop(request):
 _LIVE_SYSTEM_GUARD_BYPASS_MARK = "live_system_guard_bypass"
 
 
+def _refuse_unhermetic_run() -> None:
+    """Abort BEFORE collection if this process could write the real ~/.hermes.
+
+    2026-07-20 23:56: a review subagent ran ``python -m pytest -q tests/``
+    without process-wide isolation and most of the real ``~/.hermes`` was
+    deleted (state.db 7.7 GB, kanban.db, profiles, the repo itself). The
+    per-test fixtures below redirect ``HERMES_HOME`` but cannot cover
+    import-time binding, inherited subprocess environments, or surviving
+    threads — that gap is exactly what deleted the install. Details:
+    ``docs/hauptsession-umbau/VORFALL-20260720-WIEDERHERSTELLUNG.md``.
+
+    The only supported entry point on a machine with a live install is
+    ``scripts/run_tests_hermetic.py`` (process-wide HOME/HERMES_HOME/XDG/
+    TMPDIR redirection + kernel-enforced read-only ``~/.hermes`` via bwrap).
+    It sets ``HERMES_HERMETIC=1`` as its attestation. CI and dev machines
+    without a live store (no ``~/.hermes/state.db``) are unaffected.
+    """
+    if os.environ.get("HERMES_HERMETIC") == "1":
+        return
+    real_store = Path.home() / ".hermes"
+    if not (real_store / "state.db").exists():
+        return  # no live install in sight — nothing to protect
+    if not os.access(real_store, os.W_OK):
+        return  # read-only (e.g. sandboxed) — kernel already protects it
+    if os.environ.get("HERMES_ALLOW_UNHERMETIC") == "yes-i-accept-the-risk":
+        return  # deliberate, spelled-out override for forensic setups
+    raise pytest.UsageError(
+        "ABGEBROCHEN: Testlauf gegen ein beschreibbares echtes ~/.hermes "
+        f"({real_store}). Genau so wurde am 20.07.2026 die Installation "
+        "gelöscht. Nutze scripts/run_tests_hermetic.py — oder setze "
+        "HERMES_ALLOW_UNHERMETIC=yes-i-accept-the-risk, wenn du wirklich "
+        "weißt, was du tust."
+    )
+
+
 def pytest_configure(config):  # noqa: D401 — pytest hook
-    """Register markers used by hermetic conftest."""
+    """Single pytest_configure for the suite.
+
+    NOTE: this must remain the ONLY ``pytest_configure`` in this module — a
+    second definition silently shadows the first (that exact bug hid the
+    marker registration and the Windows timeout fallback until 2026-07-21).
+    """
+    _refuse_unhermetic_run()
+
+    # Store guard: session-wide SQLite-level protection (tests/store_guard.py).
+    from tests import store_guard as _store_guard
+    _store_guard.enable()
+
     config.addinivalue_line(
         "markers",
         f"{_LIVE_SYSTEM_GUARD_BYPASS_MARK}: bypass the live-system guard "
@@ -999,9 +1045,8 @@ def _live_system_guard(request, monkeypatch):
 # test scope happened to line up.
 from tests import store_guard as _store_guard
 
-
-def pytest_configure(config):  # noqa: D103 - pytest hook
-    _store_guard.enable()
+# ``pytest_configure`` lives further up in this module (single definition —
+# see the note there); it calls ``_store_guard.enable()``.
 
 
 def pytest_unconfigure(config):  # noqa: D103 - pytest hook
