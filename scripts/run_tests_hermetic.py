@@ -77,6 +77,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -270,16 +271,87 @@ _UNHASHED_IGNORED_PREFIXES = (
 #: Ignored files that ARE hashed: anything Python can import or execute.
 _HASHED_IGNORED_SUFFIXES = (".py", ".pth", ".so", ".sh")
 
+#: …and anything that *configures* the run. TARS review R10, P1-RUN-6: an ignored
+#: ``pytest.ini`` containing ``addopts=-p no:tests.hermetic_guard`` changes which plugins
+#: load — it decides whether the tripwire runs at all — yet it matched none of the
+#: suffixes above, so the attestation did not move. Effective configuration is executable
+#: in every sense that matters here.
+_HASHED_IGNORED_NAMES = (
+    "pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml",
+    "conftest.py", "sitecustomize.py", "usercustomize.py",
+)
 
-def _hash_paths(repo: Path, paths: list[str]) -> str:
-    """Stable digest over ``path\\0sha256`` for a sorted path list."""
-    h = hashlib.sha256()
+
+class SpecialFileInAttestation(RuntimeError):
+    """A FIFO/socket/device sits in the attested set — refuse, never guess."""
+
+
+def _attest_records(repo: Path, paths: list[str]) -> list[tuple[str, str, str]]:
+    """``(path, kind, digest)`` per path, typed via ``lstat`` — never followed.
+
+    P1-RUN-6 (R10): hashing through ``open()`` bound neither the file *type* nor a
+    symlink's *target*, and a FIFO could block the runner forever. Symlinks are attested
+    by their target string, regular files by content, and anything else is fail-closed.
+    """
+    records: list[tuple[str, str, str]] = []
     for rel in sorted(paths):
+        p = repo / rel
+        try:
+            st = p.lstat()
+        except OSError:
+            records.append((rel, "missing", ""))
+            continue
+        mode = st.st_mode
+        if stat.S_ISLNK(mode):
+            target = os.readlink(p)
+            digest = hashlib.sha256(target.encode("utf-8", "surrogateescape")).hexdigest()
+            records.append((rel, "symlink", digest))
+        elif stat.S_ISREG(mode):
+            records.append((rel, "file", _sha256_file(p)))
+        elif stat.S_ISDIR(mode):
+            records.append((rel, "dir", ""))
+        else:
+            raise SpecialFileInAttestation(
+                f"{rel} ist eine Sonderdatei (FIFO/Socket/Device) im attestierten Satz — "
+                "ihr Inhalt ist nicht reproduzierbar messbar; Lauf abgebrochen"
+            )
+    return records
+
+
+def _hash_records(records: list[tuple[str, str, str]]) -> str:
+    """Stable digest over ``path\\0kind\\0digest`` for typed records."""
+    h = hashlib.sha256()
+    for rel, kind, digest in records:
         h.update(rel.encode("utf-8", "surrogateescape"))
-        h.update(b"\0")
-        h.update(_sha256_file(repo / rel).encode())
-        h.update(b"\n")
+        h.update(b"\0" + kind.encode() + b"\0" + digest.encode() + b"\n")
     return h.hexdigest()
+
+
+def _special_files(repo: Path) -> list[str]:
+    """Non-regular, non-symlink entries in the repo — outside git's view.
+
+    ``git ls-files --others`` does not list FIFOs, sockets or devices at all, so a
+    ``pipe.py`` sitting in the tree was neither hashed nor refused: it was simply
+    invisible to the attestation. Since importing one would block the interpreter
+    rather than fail, the walk finds them directly and the run is refused.
+    """
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(repo, onerror=lambda e: None):
+        rel_dir = os.path.relpath(dirpath, repo)
+        rel_dir = "" if rel_dir == "." else rel_dir + "/"
+        if rel_dir.startswith(_UNHASHED_IGNORED_PREFIXES):
+            dirnames[:] = []
+            continue
+        dirnames[:] = [d for d in dirnames
+                       if not (rel_dir + d + "/").startswith(_UNHASHED_IGNORED_PREFIXES)]
+        for name in filenames:
+            try:
+                mode = os.lstat(os.path.join(dirpath, name)).st_mode
+            except OSError:
+                continue
+            if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                found.append(rel_dir + name)
+    return found
 
 
 def _untracked(repo: Path, ignored: bool) -> list[str]:
@@ -291,7 +363,8 @@ def _untracked(repo: Path, ignored: bool) -> list[str]:
     if not ignored:
         return paths
     return [p for p in paths
-            if p.endswith(_HASHED_IGNORED_SUFFIXES)
+            if (p.endswith(_HASHED_IGNORED_SUFFIXES)
+                or os.path.basename(p) in _HASHED_IGNORED_NAMES)
             and not p.startswith(_UNHASHED_IGNORED_PREFIXES)]
 
 
@@ -332,10 +405,19 @@ def worktree_state(repo: Path | None = None) -> dict:
         ["git", "status", "--porcelain"], cwd=repo,
         capture_output=True, text=True).stdout.rstrip("\n")
 
+    special = _special_files(repo)
+    if special:
+        raise SpecialFileInAttestation(
+            "Sonderdateien (FIFO/Socket/Device) im Repo-Baum: "
+            f"{', '.join(special[:10])} — nicht reproduzierbar messbar, Lauf abgebrochen"
+        )
+
     untracked = _untracked(repo, ignored=False)
     ignored_code = _untracked(repo, ignored=True)
-    untracked_hash = _hash_paths(repo, untracked)
-    ignored_hash = _hash_paths(repo, ignored_code)
+    untracked_records = _attest_records(repo, untracked)
+    ignored_records = _attest_records(repo, ignored_code)
+    untracked_hash = _hash_records(untracked_records)
+    ignored_hash = _hash_records(ignored_records)
 
     if not porcelain:
         tree = _git("rev-parse", "HEAD^{tree}") or "unbekannt"
@@ -359,6 +441,9 @@ def worktree_state(repo: Path | None = None) -> dict:
         "untracked": untracked, "untracked_hash": untracked_hash,
         "ignored_code": ignored_code, "ignored_hash": ignored_hash,
         "attest_hash": attest,
+        # Full typed inventory — the header prints a summary, the log carries every
+        # single record (R10: "höchstens acht Pfade" was not an inventory).
+        "records": untracked_records + ignored_records,
     }
 
 
@@ -503,6 +588,10 @@ def main() -> int:
         f"(nicht gehasht: {', '.join(_UNHASHED_IGNORED_PREFIXES)})",
         f"Attest-Hash: {worktree['attest_hash']}  "
         "(tracked+untracked+ignored-code)",
+        # Full typed inventory: every attested path with its kind and digest. The
+        # summary lines above are for reading; this is the evidence (R10 P1-RUN-6).
+        *[f"Attest-Record: {kind:<7} {digest[:16] or '-':<16} {rel}"
+          for rel, kind, digest in worktree["records"]],
         f"Python:     {sys.version.split()[0]} ({sys.executable})",
         *[f"Runner-Blob: {rel} sha256={digest}"
           for rel, digest in runner_ident.items()],
@@ -551,6 +640,14 @@ def main() -> int:
     else:
         isolation_ok = not violations
 
+    # P1-RUN-6 (R10), TOCTOU: the attestation above was taken BEFORE the suite ran.
+    # Anything that changed the attested set during the run — a test dropping a
+    # conftest, an ignored pytest.ini appearing mid-run — would have gone unrecorded.
+    # Re-attest and treat any drift as fail-closed: the header's Attest-Hash must
+    # describe the bytes that actually ran, start to finish.
+    worktree_after = worktree_state()
+    attest_drift = worktree_after["attest_hash"] != worktree["attest_hash"]
+
     drift_label = ("extern:    " if sandboxed and not args.strict
                    else "VERLETZUNG:")
     footer = [
@@ -570,6 +667,18 @@ def main() -> int:
         footer.append(f"  rauschen:   {kind} {path}")
     if len(noise) > 20:
         footer.append(f"  … {len(noise) - 20} weitere Rausch-Pfade")
+
+    footer.append(
+        f"Attest-Hash nach Lauf: {worktree_after['attest_hash']}"
+        + ("  — UNVERÄNDERT" if not attest_drift else
+           "  — ABWEICHUNG! Der attestierte Satz hat sich WÄHREND des Laufs geändert"))
+    if attest_drift:
+        before = {(r, k): d for r, k, d in worktree["records"]}
+        after = {(r, k): d for r, k, d in worktree_after["records"]}
+        for key in sorted(set(before) | set(after)):
+            if before.get(key) != after.get(key):
+                footer.append(f"  ATTEST-DRIFT: {key[1]} {key[0]}")
+        isolation_ok = False
 
     footer.append(f"ISOLATION:  {'OK' if isolation_ok else 'VERLETZT'}"
                   + (" (kernel-RO erzwungen; Drift = Live-Betrieb)"

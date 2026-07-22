@@ -166,7 +166,95 @@ def test_noconftest_still_collects_when_nothing_live_is_exposed(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-def test_plugin_unload_is_the_documented_residual_lever(tmp_path):
+def test_alternate_ini_alone_still_refuses(tmp_path):
+    """``-c other.ini`` alone drops the addopts — but NOT the conftest hook.
+
+    TARS' R10 table lists ``-c /tmp/empty.ini`` as rc 0. Measured here it is
+    **rc 4**: dropping the ini removes the plugin layer, and the conftest
+    tripwire underneath still fires. Two independent layers is the point of
+    keeping both; a bypass needs to remove BOTH (see the next test).
+    """
+    ini = tmp_path / "empty.ini"
+    ini.write_text("[pytest]\n")
+    _assert_refused(_collect(
+        {"HERMES_HOME": str(_live_store(tmp_path, "altini"))}, "-c", str(ini)))
+
+
+def test_alternate_ini_plus_noconftest_is_a_known_gap(tmp_path):
+    """Both layers removed at once — this is the real residual lever."""
+    ini = tmp_path / "empty.ini"
+    ini.write_text("[pytest]\n")
+    proc = _collect({"HERMES_HOME": str(_live_store(tmp_path, "altini2"))},
+                    "-c", str(ini), "--noconftest")
+    assert proc.returncode == 0, (
+        "ini+noconftest no longer bypasses — the best-effort classification "
+        "in tests/hermetic_guard.py can be tightened")
+
+
+def test_plugin_unload_alone_still_refuses(tmp_path):
+    """``-p no:tests.hermetic_guard`` alone: the conftest layer still catches."""
+    _assert_refused(_collect(
+        {"HERMES_HOME": str(_live_store(tmp_path, "unload1"))},
+        "-p", "no:tests.hermetic_guard"))
+
+
+def test_external_target_without_repo_ini_drops_the_guard(tmp_path):
+    """A test file outside the repo: no repo ini applies, so no addopts.
+
+    Note what this is and is not: nothing of the suite runs here, so it is a
+    gap in the *guard*, not a path that executes Hermes code against a live
+    store. Pinned so the claim stays measured rather than assumed.
+    """
+    ext = tmp_path / "test_outside.py"
+    ext.write_text("def test_ok():\n    assert True\n")
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+           "HERMES_HOME": str(_live_store(tmp_path, "external"))}
+    env.pop("PYTEST_ADDOPTS", None)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(ext)],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300)
+    assert proc.returncode == 0, (
+        "an external target now loads the repo guard — the best-effort "
+        "classification can be tightened")
+
+
+def test_programmatic_pytest_main_depends_on_sys_path(tmp_path):
+    """``pytest.main()``: a bypass only when the repo root is importable.
+
+    From a driver *outside* the repo the ini's ``-p tests.hermetic_guard``
+    cannot be imported at all and pytest aborts (rc 1, fail-closed). Run with
+    the repo root on ``sys.path`` and both layers disabled, it is rc 0. Both
+    halves are measured so the residual-lever list stays exact.
+    """
+    store = _live_store(tmp_path, "progmain")
+    code = ("import sys, pytest; sys.exit(pytest.main(["
+            "'-q', '--collect-only', '-p', 'no:cacheprovider', "
+            "'-p', 'no:tests.hermetic_guard', "
+            f"'--noconftest', {_TARGET!r}]))")
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "HERMES_HOME": str(store)}
+    env.pop("PYTEST_ADDOPTS", None)
+    # `python -c` puts '' (cwd) on sys.path → repo importable → bypass works.
+    inside = subprocess.run([sys.executable, "-c", code], cwd=PROJECT_ROOT,
+                            env=env, capture_output=True, text=True, timeout=300)
+    # The claim is about the GUARD, not about the target's own outcome: the run
+    # must get past collection instead of dying with the tripwire's exit 4.
+    assert inside.returncode != 4 and "ABGEBROCHEN" not in inside.stdout + inside.stderr, (
+        "programmatic pytest.main no longer bypasses the guard — the "
+        "best-effort classification can be tightened")
+
+    driver = tmp_path / "driver.py"          # outside the repo → sys.path[0] = tmp_path
+    driver.write_text(
+        "import sys, pytest\nsys.exit(pytest.main(['-q', '--collect-only', "
+        "'-p', 'no:cacheprovider', "
+        "'-p', 'no:tests.hermetic_guard', '--noconftest', "
+        f"{str(PROJECT_ROOT / _TARGET)!r}]))\n")
+    outside = subprocess.run([sys.executable, str(driver)], cwd=PROJECT_ROOT,
+                             env=env, capture_output=True, text=True, timeout=300)
+    assert outside.returncode != 0, (
+        "an unimportable guard plugin must abort the run (fail-closed), not be skipped")
+
+
+def test_plugin_unload_with_noconftest_is_the_documented_residual_lever(tmp_path):
     """``-p no:…`` still disables it — pinned so the doc cannot drift.
 
     pytest lets the caller unload any plugin; no in-repo code can prevent

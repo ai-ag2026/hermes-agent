@@ -16,6 +16,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 _spec = importlib.util.spec_from_file_location(
@@ -261,6 +263,82 @@ def test_ignored_executable_code_is_hashed_but_venvs_are_not(tmp_path):
     assert not any(p.startswith(".venv/") for p in with_venv["ignored_code"])
     assert with_venv["attest_hash"] == with_ignored["attest_hash"]
     assert ".venv/" in runner._UNHASHED_IGNORED_PREFIXES
+
+
+# ---- effective config + typed records (TARS R10, P1-RUN-6 reopened) ------
+
+
+def _commit_gitignore(repo: Path, body: str) -> None:
+    import subprocess as sp
+    (repo / ".gitignore").write_text(body)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    sp.run(["git", "add", ".gitignore"], cwd=repo, env=env, check=True)
+    sp.run(["git", "commit", "-qm", "ignore"], cwd=repo, env=env, check=True)
+
+
+def test_ignored_pytest_ini_moves_the_attestation(tmp_path):
+    """TARS' R10 counter-proof: an ignored ``pytest.ini`` decides which plugins
+    load — including whether the tripwire loads at all — but matched none of the
+    hashed suffixes, so the attestation stayed identical."""
+    repo = _git_repo(tmp_path)
+    _commit_gitignore(repo, "pytest.ini\n")
+    before = runner.worktree_state(repo)
+
+    (repo / "pytest.ini").write_text(
+        "[pytest]\naddopts=-p no:tests.hermetic_guard\n")
+    after = runner.worktree_state(repo)
+
+    assert "pytest.ini" in after["ignored_code"]
+    assert after["attest_hash"] != before["attest_hash"]
+
+
+def test_other_effective_config_is_attested_too(tmp_path):
+    repo = _git_repo(tmp_path)
+    _commit_gitignore(repo, "tox.ini\nsetup.cfg\nsitecustomize.py\n")
+    seen = []
+    prev = runner.worktree_state(repo)["attest_hash"]
+    for name in ("tox.ini", "setup.cfg", "sitecustomize.py"):
+        (repo / name).write_text("x = 1\n")
+        cur = runner.worktree_state(repo)
+        assert name in cur["ignored_code"], name
+        assert cur["attest_hash"] != prev, name
+        seen.append(name)
+        prev = cur["attest_hash"]
+    assert len(seen) == 3
+
+
+def test_symlink_is_attested_by_target_not_followed(tmp_path):
+    """A symlink's *target* is the fact that matters; following it hid a swap."""
+    repo = _git_repo(tmp_path)
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "b.py").write_text("x = 1\n")   # identical content, other path
+    link = repo / "link.py"
+    link.symlink_to(tmp_path / "a.py")
+    first = runner.worktree_state(repo)
+    link.unlink()
+    link.symlink_to(tmp_path / "b.py")
+    second = runner.worktree_state(repo)
+
+    kinds = {rel: kind for rel, kind, _ in second["records"]}
+    assert kinds.get("link.py") == "symlink"
+    # Content-identical targets: only binding the target string catches this.
+    assert second["attest_hash"] != first["attest_hash"]
+
+
+def test_special_file_in_attested_set_is_refused(tmp_path):
+    """A FIFO can block the hasher forever — refuse rather than guess or hang."""
+    repo = _git_repo(tmp_path)
+    os.mkfifo(repo / "pipe.py")
+    with pytest.raises(runner.SpecialFileInAttestation):
+        runner.worktree_state(repo)
+
+
+def test_attestation_is_deterministic_across_repeats(tmp_path):
+    repo = _git_repo(tmp_path)
+    (repo / "untracked.py").write_text("x = 1\n")
+    hashes = {runner.worktree_state(repo)["attest_hash"] for _ in range(3)}
+    assert len(hashes) == 1
 
 
 def test_bwrap_plan_is_default_deny(tmp_path):
