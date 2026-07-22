@@ -201,6 +201,68 @@ def test_worktree_state_flags_dirty_and_changes_tree_hash(tmp_path):
     assert dirty["tree_hash"] != "unbekannt (stash create fehlgeschlagen)"
 
 
+# ---- untracked/ignored attestation (TARS R9, P1-RUN-6) -------------------
+
+
+def test_untracked_file_changes_the_attestation(tmp_path):
+    """An untracked test file runs, but was invisible in the tracked tree.
+
+    ``git stash create`` builds its tree from the index — a dropped-in
+    ``tests/test_evil.py`` left ``Tree-Hash`` looking like a clean checkout.
+    """
+    repo = _git_repo(tmp_path)
+    clean = runner.worktree_state(repo)
+    assert clean["state"] == "clean"
+
+    evil = repo / "test_evil.py"
+    evil.write_text("def test_x():\n    assert True\n")
+    evil.chmod(0o755)
+    with_evil = runner.worktree_state(repo)
+
+    assert "test_evil.py" in with_evil["untracked"]
+    assert with_evil["untracked_hash"] != clean["untracked_hash"]
+    # The load-bearing property: the combined attestation must move.
+    assert with_evil["attest_hash"] != clean["attest_hash"]
+
+
+def test_untracked_content_change_changes_the_attestation(tmp_path):
+    """Same path, different bytes — the hash is over content, not names."""
+    repo = _git_repo(tmp_path)
+    (repo / "test_evil.py").write_text("def test_x():\n    assert True\n")
+    first = runner.worktree_state(repo)
+    (repo / "test_evil.py").write_text("def test_x():\n    raise SystemExit\n")
+    second = runner.worktree_state(repo)
+    assert second["untracked"] == first["untracked"]  # identical name set
+    assert second["attest_hash"] != first["attest_hash"]
+
+
+def test_ignored_executable_code_is_hashed_but_venvs_are_not(tmp_path):
+    """Ignored ``.py`` is attested; an ignored venv is excluded *visibly*."""
+    repo = _git_repo(tmp_path)
+    (repo / ".gitignore").write_text("ignored_tool.py\n.venv/\n")
+    import subprocess as sp
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    sp.run(["git", "add", ".gitignore"], cwd=repo, env=env, check=True)
+    sp.run(["git", "commit", "-qm", "ignore"], cwd=repo, env=env, check=True)
+
+    base = runner.worktree_state(repo)
+    (repo / "ignored_tool.py").write_text("import os\n")
+    with_ignored = runner.worktree_state(repo)
+    assert "ignored_tool.py" in with_ignored["ignored_code"]
+    assert with_ignored["attest_hash"] != base["attest_hash"]
+
+    # A venv full of .py files must NOT be walked — that is the documented
+    # blind spot, and it must stay a *named* exclusion, not a silent one.
+    venv = repo / ".venv" / "lib"
+    venv.mkdir(parents=True)
+    (venv / "whatever.py").write_text("x = 1\n")
+    with_venv = runner.worktree_state(repo)
+    assert not any(p.startswith(".venv/") for p in with_venv["ignored_code"])
+    assert with_venv["attest_hash"] == with_ignored["attest_hash"]
+    assert ".venv/" in runner._UNHASHED_IGNORED_PREFIXES
+
+
 def test_bwrap_plan_is_default_deny(tmp_path):
     sandbox = tmp_path / "sb"
     sandbox.mkdir()

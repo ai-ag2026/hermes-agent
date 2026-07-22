@@ -46,14 +46,15 @@ def _live_store(tmp_path: Path, name: str, marker: str = "state.db") -> Path:
     return root
 
 
-def _collect(env_extra: dict) -> subprocess.CompletedProcess:
+def _collect(env_extra: dict, *extra_args: str) -> subprocess.CompletedProcess:
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
-    for var in ("HERMES_HERMETIC", "HERMES_ALLOW_UNHERMETIC", policy.PROTECT_ENV):
+    for var in ("HERMES_HERMETIC", "HERMES_ALLOW_UNHERMETIC", policy.PROTECT_ENV,
+                "PYTEST_ADDOPTS"):
         env.pop(var, None)
     env.update(env_extra)
     return subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q",
-         "-p", "no:cacheprovider", _TARGET],
+         "-p", "no:cacheprovider", *extra_args, _TARGET],
         cwd=PROJECT_ROOT, env=env, capture_output=True, text=True, timeout=300,
     )
 
@@ -114,3 +115,68 @@ def test_legacy_override_flag_no_longer_excuses_a_live_store(tmp_path):
         "HERMES_HOME": str(_live_store(tmp_path, "forensic")),
         "HERMES_ALLOW_UNHERMETIC": "yes-i-accept-the-risk",
     }))
+
+
+# ---- conftest cannot defend itself (TARS R9, P0-RUN-5) -------------------
+#
+# TARS' counter-proof: with the guard living only in ``tests/conftest.py``,
+# ``--noconftest`` collected and ran the suite against a writable fake live
+# store with exit 0. The guard now also loads as a plugin through the ini
+# ``addopts``, which none of these levers disables.
+
+
+def test_noconftest_does_not_disable_the_tripwire(tmp_path):
+    """``pytest --noconftest`` — TARS' exact reproduction, now refused."""
+    _assert_refused(_collect(
+        {"HERMES_HOME": str(_live_store(tmp_path, "noconftest"))},
+        "--noconftest"))
+
+
+def test_pytest_addopts_noconftest_does_not_disable_the_tripwire(tmp_path):
+    """Same lever through the environment, where no command line shows it."""
+    _assert_refused(_collect({
+        "HERMES_HOME": str(_live_store(tmp_path, "addopts")),
+        "PYTEST_ADDOPTS": "--noconftest",
+    }))
+
+
+def test_confcutdir_does_not_disable_the_tripwire(tmp_path):
+    """Conftest discovery cut above the suite must not lose the guard."""
+    _assert_refused(_collect(
+        {"HERMES_HOME": str(_live_store(tmp_path, "confcut"))},
+        f"--confcutdir={tmp_path}"))
+
+
+def test_all_conftest_levers_combined_still_refuse(tmp_path):
+    _assert_refused(_collect({
+        "HERMES_HOME": str(_live_store(tmp_path, "combined")),
+        "PYTEST_ADDOPTS": "--noconftest",
+    }, "--noconftest", f"--confcutdir={tmp_path}"))
+
+
+def test_noconftest_still_collects_when_nothing_live_is_exposed(tmp_path):
+    """The guard must refuse the *store*, not the flag: no live root, no veto.
+
+    Without this, ``--noconftest`` would look "fixed" simply because every
+    run died — and the official runner path would die with it.
+    """
+    empty = tmp_path / "empty-sandbox"
+    empty.mkdir()
+    proc = _collect({"HERMES_HOME": str(empty)}, "--noconftest")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_plugin_unload_is_the_documented_residual_lever(tmp_path):
+    """``-p no:…`` still disables it — pinned so the doc cannot drift.
+
+    pytest lets the caller unload any plugin; no in-repo code can prevent
+    that. ``tests/hermetic_guard.py`` says so explicitly, and this test is
+    what keeps that statement true (or fails loudly if pytest ever changes).
+    The kernel-enforced guarantee lives in the bwrap runner, not here.
+    """
+    proc = _collect(
+        {"HERMES_HOME": str(_live_store(tmp_path, "unloaded"))},
+        "--noconftest", "-p", "no:tests.hermetic_guard")
+    assert proc.returncode == 0, (
+        "pytest no longer honours -p no:… — the residual-lever documentation "
+        "in tests/hermetic_guard.py needs revisiting")

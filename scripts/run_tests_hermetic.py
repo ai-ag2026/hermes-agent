@@ -247,8 +247,10 @@ def _sha256_file(path: Path) -> str:
 RUNNER_TRUST_SET = (
     "scripts/run_tests_hermetic.py",
     "tests/hermetic_policy.py",
+    "tests/hermetic_guard.py",  # P0-RUN-5: the guard that --noconftest can't skip
     "tests/conftest.py",
     "tests/store_guard.py",
+    "pyproject.toml",  # carries the addopts that load the guard at all
 )
 
 
@@ -256,6 +258,41 @@ def runner_identity(repo: Path | None = None) -> dict[str, str]:
     """Content hashes of the runner's trust set as loaded for this run."""
     repo = REPO if repo is None else repo
     return {rel: _sha256_file(repo / rel) for rel in RUNNER_TRUST_SET}
+
+
+#: Ignored paths that can hold *executable* code but are never the code under
+#: test — hashing them would mean walking a venv or node_modules on every run.
+_UNHASHED_IGNORED_PREFIXES = (
+    ".venv/", "venv/", "node_modules/", ".git/", ".worktrees/",
+    "__pycache__/", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/",
+)
+
+#: Ignored files that ARE hashed: anything Python can import or execute.
+_HASHED_IGNORED_SUFFIXES = (".py", ".pth", ".so", ".sh")
+
+
+def _hash_paths(repo: Path, paths: list[str]) -> str:
+    """Stable digest over ``path\\0sha256`` for a sorted path list."""
+    h = hashlib.sha256()
+    for rel in sorted(paths):
+        h.update(rel.encode("utf-8", "surrogateescape"))
+        h.update(b"\0")
+        h.update(_sha256_file(repo / rel).encode())
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _untracked(repo: Path, ignored: bool) -> list[str]:
+    """Untracked paths, either the normal ones or the *relevant* ignored ones."""
+    cmd = ["git", "ls-files", "--others", "-z"]
+    cmd += ["--ignored", "--exclude-standard"] if ignored else ["--exclude-standard"]
+    out = subprocess.run(cmd, cwd=repo, capture_output=True, text=True).stdout
+    paths = [p for p in out.split("\0") if p]
+    if not ignored:
+        return paths
+    return [p for p in paths
+            if p.endswith(_HASHED_IGNORED_SUFFIXES)
+            and not p.startswith(_UNHASHED_IGNORED_PREFIXES)]
 
 
 def worktree_state(repo: Path | None = None) -> dict:
@@ -266,6 +303,21 @@ def worktree_state(repo: Path | None = None) -> dict:
     dirty file list) and a content hash of the tracked tree WITH those
     modifications applied (``git stash create`` when dirty, else the HEAD
     tree), so the log attests the bytes that ran — clean or not.
+
+    TARS review R9, **P1-RUN-6**: ``git stash create`` builds its tree from
+    the *index* — untracked and ignored files are not in it. A run could
+    therefore execute an untracked ``tests/test_evil.py`` or an ignored
+    ``sitecustomize.py`` while ``Tree-Hash`` looked exactly like a clean
+    checkout. So the attestation now has three parts, combined into one
+    ``attest_hash``:
+
+    * the tracked tree (stash tree when dirty, HEAD tree when clean);
+    * every untracked non-ignored file, hashed individually;
+    * every ignored file that Python can import or execute
+      (``.py/.pth/.so/.sh``), except the ones under a venv, ``node_modules``
+      or a cache — those are hashed by *name set* would be meaningless and
+      walking them costs minutes. That exclusion is listed in the header, so
+      what is NOT covered stays visible instead of being implied clean.
     """
     repo = REPO if repo is None else repo
 
@@ -279,18 +331,35 @@ def worktree_state(repo: Path | None = None) -> dict:
     porcelain = subprocess.run(
         ["git", "status", "--porcelain"], cwd=repo,
         capture_output=True, text=True).stdout.rstrip("\n")
+
+    untracked = _untracked(repo, ignored=False)
+    ignored_code = _untracked(repo, ignored=True)
+    untracked_hash = _hash_paths(repo, untracked)
+    ignored_hash = _hash_paths(repo, ignored_code)
+
     if not porcelain:
-        return {"state": "clean", "porcelain": "", "dirty": "",
-                "tree_hash": _git("rev-parse", "HEAD^{tree}") or "unbekannt"}
-    # Porcelain v1: two status columns, a space, then the path (index 3);
-    # renames appear as "orig -> new" — keep the whole thing.
-    dirty_files = " ".join(line[3:] for line in porcelain.splitlines())
-    # ``git stash create`` builds a commit object capturing the dirty state
-    # without touching the worktree; its tree is the exact content that ran.
-    stash = _git("stash", "create")
-    tree = _git("rev-parse", f"{stash}^{{tree}}") if stash else ""
-    return {"state": "DIRTY", "porcelain": porcelain, "dirty": dirty_files,
-            "tree_hash": tree or "unbekannt (stash create fehlgeschlagen)"}
+        tree = _git("rev-parse", "HEAD^{tree}") or "unbekannt"
+        state, dirty = "clean", ""
+    else:
+        # Porcelain v1: two status columns, a space, then the path (index 3);
+        # renames appear as "orig -> new" — keep the whole thing.
+        dirty = " ".join(line[3:] for line in porcelain.splitlines())
+        # ``git stash create`` builds a commit object capturing the dirty
+        # state without touching the worktree.
+        stash = _git("stash", "create")
+        tree = (_git("rev-parse", f"{stash}^{{tree}}") if stash else "") \
+            or "unbekannt (stash create fehlgeschlagen)"
+        state = "DIRTY"
+
+    attest = hashlib.sha256(
+        f"{tree}\n{untracked_hash}\n{ignored_hash}\n".encode()).hexdigest()
+    return {
+        "state": state, "porcelain": porcelain, "dirty": dirty,
+        "tree_hash": tree,
+        "untracked": untracked, "untracked_hash": untracked_hash,
+        "ignored_code": ignored_code, "ignored_hash": ignored_hash,
+        "attest_hash": attest,
+    }
 
 
 def inventory(root: Path) -> dict[str, tuple]:
@@ -420,7 +489,20 @@ def main() -> int:
         # under an unchanged SHA. Record the exact working-tree state.
         f"Worktree:   {worktree['state']}"
         + (f" — dirty: {worktree['dirty']}" if worktree['porcelain'] else ""),
-        f"Tree-Hash:  {worktree['tree_hash']}",
+        f"Tree-Hash:  {worktree['tree_hash']}  (tracked)",
+        # P1-RUN-6: the tracked tree says nothing about untracked/ignored code
+        # that the run can still import. Inventory both, and name the
+        # deliberate blind spot instead of implying full coverage.
+        f"Untracked:  {len(worktree['untracked'])} Datei(en) "
+        f"sha256={worktree['untracked_hash'][:16]}…"
+        + (f" — {' '.join(worktree['untracked'][:8])}"
+           + (" …" if len(worktree['untracked']) > 8 else "")
+           if worktree['untracked'] else ""),
+        f"Ignored-Code: {len(worktree['ignored_code'])} ausführbare Datei(en) "
+        f"sha256={worktree['ignored_hash'][:16]}…  "
+        f"(nicht gehasht: {', '.join(_UNHASHED_IGNORED_PREFIXES)})",
+        f"Attest-Hash: {worktree['attest_hash']}  "
+        "(tracked+untracked+ignored-code)",
         f"Python:     {sys.version.split()[0]} ({sys.executable})",
         *[f"Runner-Blob: {rel} sha256={digest}"
           for rel, digest in runner_ident.items()],
