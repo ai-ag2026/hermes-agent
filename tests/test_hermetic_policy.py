@@ -120,6 +120,30 @@ def test_readonly_mount_is_the_accepted_protection():
     assert policy.refusal_reason({}, home=policy.passwd_home()) is None
 
 
+def test_readonly_mount_actually_rejects_writes_with_erofs():
+    """P1-RUN-2: prove the accepted protection is REAL kernel read-only, not
+    just a flag reading True. Under the runner's bwrap --ro-bind, an append
+    to an existing file in the canonical store must fail with EROFS.
+
+    This targets the live store on purpose: the write is guaranteed to fail
+    (that is the whole point), so it cannot damage anything. Outside the
+    runner (store writable) it skips — it must never run against a writable
+    real store."""
+    import errno
+    real = policy.passwd_home() / ".hermes"
+    if not policy.is_readonly_mount(real):
+        pytest.skip("not under a read-only bind — nothing to prove here")
+    victim = real / "config.yaml"
+    if not victim.exists():
+        pytest.skip("no existing file to attempt a write against")
+    with pytest.raises(OSError) as ei:
+        with victim.open("ab") as fh:
+            fh.write(b"\0")
+            fh.flush()
+    assert ei.value.errno == errno.EROFS, (
+        f"expected EROFS, got {errno.errorcode.get(ei.value.errno)}")
+
+
 # ---- refusal decision ----------------------------------------------------
 
 
@@ -146,12 +170,47 @@ def test_attestation_flag_is_dead(tmp_path):
     assert policy.refusal_reason({"HERMES_HERMETIC": "1"}, home=tmp_path) is not None
 
 
-def test_spelled_out_human_override_still_works(tmp_path):
+def test_legacy_allow_unhermetic_override_is_dead(tmp_path):
+    """P0-RUN-1: the free-settable escape hatch is gone. The old magic string
+    must NOT excuse a writable live store — it is no different from the
+    abolished HERMES_HERMETIC=1."""
     _store(tmp_path / ".hermes")
-    env = {policy.OVERRIDE_ENV: policy.OVERRIDE_VALUE}
-    assert policy.refusal_reason(env, home=tmp_path) is None
+    env = {"HERMES_ALLOW_UNHERMETIC": "yes-i-accept-the-risk"}
+    reason = policy.refusal_reason(env, home=tmp_path)
+    assert reason is not None and "ABGEBROCHEN" in reason
 
 
-def test_override_needs_the_exact_phrase(tmp_path):
-    _store(tmp_path / ".hermes")
-    assert policy.refusal_reason({policy.OVERRIDE_ENV: "yes"}, home=tmp_path) is not None
+def test_no_override_env_names_remain_in_the_module():
+    """Guard against a quiet reintroduction of any override constant."""
+    assert not hasattr(policy, "OVERRIDE_ENV")
+    assert not hasattr(policy, "OVERRIDE_VALUE")
+
+
+# ---- symlink / unresolvable roots (P2-RUN-4) -----------------------------
+
+
+def test_symlink_to_live_root_is_still_protected(tmp_path):
+    real = _store(tmp_path / "real-store")
+    link = tmp_path / "link-store"
+    link.symlink_to(real)
+    reason = policy.refusal_reason({"HERMES_HOME": str(link)},
+                                   home=tmp_path / "empty")
+    assert reason is not None and "ABGEBROCHEN" in reason
+
+
+def test_dangling_root_is_simply_absent_not_a_refusal(tmp_path):
+    missing = tmp_path / "does-not-exist"
+    assert policy.refusal_reason({"HERMES_HOME": str(missing)},
+                                 home=tmp_path / "empty") is None
+
+
+def test_symlink_cycle_is_rejected_deterministically(tmp_path):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.symlink_to(b)
+    b.symlink_to(a)
+    assert policy.unresolvable_candidates({"HERMES_HOME": str(a)},
+                                          home=tmp_path / "empty")
+    reason = policy.refusal_reason({"HERMES_HOME": str(a)},
+                                   home=tmp_path / "empty")
+    assert reason is not None and "nicht auflösbar" in reason

@@ -163,6 +163,44 @@ def test_runner_identity_changes_with_content(tmp_path):
     assert runner.runner_identity(fake) != before
 
 
+# ---- worktree attestation (TARS P1-RUN-3) --------------------------------
+
+
+def _git_repo(tmp_path: Path) -> Path:
+    import subprocess as sp
+    repo = tmp_path / "wt"
+    repo.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    for args in (["init", "-q"], ["add", "."], ):
+        sp.run(["git", *args], cwd=repo, env=env, check=True)
+    (repo / "f.txt").write_text("v1")
+    sp.run(["git", "add", "."], cwd=repo, env=env, check=True)
+    sp.run(["git", "commit", "-qm", "init"], cwd=repo, env=env, check=True)
+    return repo
+
+
+def test_worktree_state_reports_clean(tmp_path):
+    repo = _git_repo(tmp_path)
+    st = runner.worktree_state(repo)
+    assert st["state"] == "clean"
+    assert st["porcelain"] == ""
+    assert len(st["tree_hash"]) == 40
+
+
+def test_worktree_state_flags_dirty_and_changes_tree_hash(tmp_path):
+    repo = _git_repo(tmp_path)
+    clean = runner.worktree_state(repo)
+    (repo / "f.txt").write_text("v2-uncommitted")
+    dirty = runner.worktree_state(repo)
+    assert dirty["state"] == "DIRTY"
+    assert "f.txt" in dirty["dirty"]
+    # The dirty tree hash must differ from the clean one: an uncommitted
+    # change under the same HEAD is exactly what P1-RUN-3 is about.
+    assert dirty["tree_hash"] != clean["tree_hash"]
+    assert dirty["tree_hash"] != "unbekannt (stash create fehlgeschlagen)"
+
+
 def test_bwrap_plan_is_default_deny(tmp_path):
     sandbox = tmp_path / "sb"
     sandbox.mkdir()

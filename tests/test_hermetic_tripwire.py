@@ -48,7 +48,7 @@ def _live_store(tmp_path: Path, name: str, marker: str = "state.db") -> Path:
 
 def _collect(env_extra: dict) -> subprocess.CompletedProcess:
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
-    for var in ("HERMES_HERMETIC", policy.OVERRIDE_ENV, policy.PROTECT_ENV):
+    for var in ("HERMES_HERMETIC", "HERMES_ALLOW_UNHERMETIC", policy.PROTECT_ENV):
         env.pop(var, None)
     env.update(env_extra)
     return subprocess.run(
@@ -107,9 +107,10 @@ def test_accepts_when_nothing_live_is_exposed(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-def test_accepts_spelled_out_human_override(tmp_path):
-    proc = _collect({
+def test_legacy_override_flag_no_longer_excuses_a_live_store(tmp_path):
+    """P0-RUN-1 end to end: the abolished escape hatch must not bring a
+    writable live store back to green."""
+    _assert_refused(_collect({
         "HERMES_HOME": str(_live_store(tmp_path, "forensic")),
-        policy.OVERRIDE_ENV: policy.OVERRIDE_VALUE,
-    })
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+        "HERMES_ALLOW_UNHERMETIC": "yes-i-accept-the-risk",
+    }))

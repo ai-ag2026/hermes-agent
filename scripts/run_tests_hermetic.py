@@ -42,11 +42,10 @@ What it does
    stays read-only even if it overlaps one of them. A repeat of the
    incident becomes ``EROFS`` against any of those targets, not just the
    one path the incident happened to hit.
-3. **Refuses** ``--no-sandbox`` when any live store is writable. The only
-   unhermetic path is the human-set, spelled-out
-   ``HERMES_ALLOW_UNHERMETIC=yes-i-accept-the-risk`` directly against
-   pytest — a deliberate forensic escape hatch that this runner never
-   attests and never takes itself.
+3. **Refuses** ``--no-sandbox`` when any live store is writable, with no
+   escape hatch: there is no env override anywhere in this path. Forensics
+   that must run unhermetically belong on a disposable VM with no live
+   store, where the tripwire does not fire in the first place.
 4. **Brackets** the run: records an inventory (size, ``st_mtime_ns``, and a
    content sha256 for critical manifests) of every protected root before and
    after, and reports every drifted path. With ``--strict`` any drift fails
@@ -259,6 +258,41 @@ def runner_identity(repo: Path | None = None) -> dict[str, str]:
     return {rel: _sha256_file(repo / rel) for rel in RUNNER_TRUST_SET}
 
 
+def worktree_state(repo: Path | None = None) -> dict:
+    """What the repo tree actually looked like at run time, not just its SHA.
+
+    ``git rev-parse HEAD`` pins the commit; a dirty worktree runs *other*
+    code under that same SHA. This records ``git status --porcelain`` (the
+    dirty file list) and a content hash of the tracked tree WITH those
+    modifications applied (``git stash create`` when dirty, else the HEAD
+    tree), so the log attests the bytes that ran — clean or not.
+    """
+    repo = REPO if repo is None else repo
+
+    def _git(*args: str) -> str:
+        return subprocess.run(["git", *args], cwd=repo, capture_output=True,
+                              text=True).stdout.strip()
+
+    # NB: do NOT strip() porcelain — its leading column is significant
+    # (" M path" for a worktree modification); stripping it shifts every
+    # path left by one and corrupts the dirty-file list.
+    porcelain = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo,
+        capture_output=True, text=True).stdout.rstrip("\n")
+    if not porcelain:
+        return {"state": "clean", "porcelain": "", "dirty": "",
+                "tree_hash": _git("rev-parse", "HEAD^{tree}") or "unbekannt"}
+    # Porcelain v1: two status columns, a space, then the path (index 3);
+    # renames appear as "orig -> new" — keep the whole thing.
+    dirty_files = " ".join(line[3:] for line in porcelain.splitlines())
+    # ``git stash create`` builds a commit object capturing the dirty state
+    # without touching the worktree; its tree is the exact content that ran.
+    stash = _git("stash", "create")
+    tree = _git("rev-parse", f"{stash}^{{tree}}") if stash else ""
+    return {"state": "DIRTY", "porcelain": porcelain, "dirty": dirty_files,
+            "tree_hash": tree or "unbekannt (stash create fehlgeschlagen)"}
+
+
 def inventory(root: Path) -> dict[str, tuple]:
     """Path → (size, mtime_ns[, content-sha256]) for every file under root.
 
@@ -320,10 +354,9 @@ def main() -> int:
     if args.no_sandbox and live:
         print("VERWEIGERT: --no-sandbox bei beschreibbarem Live-Store "
               f"({', '.join(str(p) for p in live)}). Dieser Runner attestiert "
-              "keinen unhermetischen Lauf. Forensik läuft — wenn überhaupt — "
-              "nur bewusst und menschlich freigegeben direkt gegen pytest mit "
-              "HERMES_ALLOW_UNHERMETIC=yes-i-accept-the-risk, besser auf "
-              "einer Wegwerf-VM.", file=sys.stderr)
+              "keinen unhermetischen Lauf und kennt keinen Env-Override. "
+              "Forensik läuft auf einer Wegwerf-VM ohne Live-Store.",
+              file=sys.stderr)
         return 2
 
     log_dir = args.log_dir.resolve()
@@ -365,6 +398,7 @@ def main() -> int:
     git_rev = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True,
         text=True).stdout.strip() or "unbekannt"
+    worktree = worktree_state(REPO)
     runner_ident = runner_identity()
 
     manifest_before = cron_manifest()
@@ -381,6 +415,12 @@ def main() -> int:
         f"Start:      {time.strftime('%Y-%m-%d %H:%M:%S %z')}",
         f"Repo:       {REPO}",
         f"Target-SHA: {git_rev}",
+        # The SHA alone attests the commit, not the tree that actually ran
+        # (TARS review P1-RUN-3): a dirty worktree tests uncommitted code
+        # under an unchanged SHA. Record the exact working-tree state.
+        f"Worktree:   {worktree['state']}"
+        + (f" — dirty: {worktree['dirty']}" if worktree['porcelain'] else ""),
+        f"Tree-Hash:  {worktree['tree_hash']}",
         f"Python:     {sys.version.split()[0]} ({sys.executable})",
         *[f"Runner-Blob: {rel} sha256={digest}"
           for rel, digest in runner_ident.items()],

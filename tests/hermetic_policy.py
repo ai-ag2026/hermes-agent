@@ -7,11 +7,16 @@ invisible until it mattered. So the rule lives here, once.
 
 Contract (hardened 2026-07-21 after two TARS reviews):
 
-* **Nothing is trusted from the environment.** There is no attestation flag.
-  Protection is *observed*: the filesystem carrying a live root must be
-  mounted read-only (``statvfs().f_flag & ST_RDONLY``) — what the runner's
-  bubblewrap ``--ro-bind`` produces and what makes a repeat of the
-  2026-07-20 deletion an ``EROFS`` instead of data loss.
+* **Nothing is trusted from the environment.** There is no attestation flag
+  and no free-settable override. Protection is *observed*: the filesystem
+  carrying a live root must be mounted read-only
+  (``statvfs().f_flag & ST_RDONLY``) — what the runner's bubblewrap
+  ``--ro-bind`` produces and what makes a repeat of the 2026-07-20 deletion
+  an ``EROFS`` instead of data loss. An escape hatch that any agent,
+  subagent, CI job or test process could set (like the abolished
+  ``HERMES_HERMETIC=1`` — or a longer magic string) is not attestation and
+  is deliberately absent: forensics that must run unhermetically belong on a
+  disposable VM with no live store, where nothing here fires anyway.
 * **Directory permissions are NOT protection.** A ``0555`` directory still
   allows an existing ``state.db`` inside it to be opened, written and
   truncated; only new entries and unlinks are blocked. The earlier check
@@ -46,10 +51,6 @@ LIVE_MARKERS = (
     "hermes-agent",
 )
 
-#: Spelled-out human override for forensic setups on a disposable machine.
-OVERRIDE_ENV = "HERMES_ALLOW_UNHERMETIC"
-OVERRIDE_VALUE = "yes-i-accept-the-risk"
-
 #: Additive-only list of extra roots to protect (the runner passes what it
 #: found so a redirected child still guards the original store).
 PROTECT_ENV = "HERMES_HERMETIC_PROTECT"
@@ -73,6 +74,21 @@ def candidate_roots(environ=None, home: Path | None = None) -> list[Path]:
     environ = os.environ if environ is None else environ
     home = passwd_home() if home is None else home
 
+    roots: list[Path] = []
+    for cand in _raw_candidates(environ, home):
+        try:
+            resolved = cand.resolve()
+        except (OSError, RuntimeError):
+            # Unresolvable (e.g. symlink loop) — handled explicitly by
+            # ``unresolvable_candidates``/``refusal_reason`` as a hard reject,
+            # not silently dropped into "safe".
+            continue
+        if resolved.exists() and resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+def _raw_candidates(environ, home: Path) -> list[Path]:
     raw = [home / ".hermes"]
     ambient = environ.get("HERMES_HOME")
     if ambient:
@@ -80,16 +96,25 @@ def candidate_roots(environ=None, home: Path | None = None) -> list[Path]:
     for extra in environ.get(PROTECT_ENV, "").split(os.pathsep):
         if extra:
             raw.append(Path(extra))
+    return raw
 
-    roots: list[Path] = []
-    for cand in raw:
+
+def unresolvable_candidates(environ=None, home: Path | None = None) -> list[Path]:
+    """Candidate roots whose path cannot be resolved (symlink loop, ELOOP).
+
+    A cyclic ``HERMES_HOME`` is neither clearly safe nor clearly a live store,
+    so it is rejected deterministically rather than silently dropped (a
+    dangling/missing root, by contrast, resolves fine and is simply absent).
+    """
+    environ = os.environ if environ is None else environ
+    home = passwd_home() if home is None else home
+    bad = []
+    for cand in _raw_candidates(environ, home):
         try:
-            resolved = cand.resolve()
-        except OSError:
-            continue
-        if resolved.exists() and resolved not in roots:
-            roots.append(resolved)
-    return roots
+            cand.resolve()
+        except (OSError, RuntimeError):
+            bad.append(cand)
+    return bad
 
 
 def is_live(root: Path) -> bool:
@@ -122,14 +147,22 @@ def unprotected_live_roots(environ=None, home: Path | None = None) -> list[Path]
 def refusal_reason(environ=None, home: Path | None = None) -> str | None:
     """Why this process must not run tests here, or None if it may.
 
-    The human override is honoured last: it can only excuse roots that were
-    already identified, never hide them.
+    There is NO override: the only ways to pass are a genuinely absent live
+    store (disposable VM / CI) or a read-only mount produced by the runner.
     """
     environ = os.environ if environ is None else environ
+
+    cyclic = unresolvable_candidates(environ, home)
+    if cyclic:
+        return (
+            "ABGEBROCHEN: nicht auflösbarer Store-Pfad "
+            f"({', '.join(str(s) for s in cyclic)}) — Symlink-Schleife o. Ä. "
+            "Ein Pfad, dessen Schutzstatus nicht mechanisch bestimmbar ist, "
+            "wird nicht als sicher behandelt."
+        )
+
     exposed = unprotected_live_roots(environ, home)
     if not exposed:
-        return None
-    if environ.get(OVERRIDE_ENV) == OVERRIDE_VALUE:
         return None
     return (
         "ABGEBROCHEN: Testlauf mit beschreibbarem echten Live-Store "
@@ -137,7 +170,6 @@ def refusal_reason(environ=None, home: Path | None = None) -> str | None:
         "20.07.2026 die Installation gelöscht. Diese Roots liegen NICHT auf "
         "einem read-only gemounteten Dateisystem — Verzeichnisrechte zählen "
         "nicht als Schutz. Nutze scripts/run_tests_hermetic.py (bwrap "
-        "--ro-bind, kernel-erzwungen; ein Attestierungs-Flag gibt es nicht) "
-        f"— oder setze {OVERRIDE_ENV}={OVERRIDE_VALUE}, wenn du wirklich "
-        "weißt, was du tust."
+        "--ro-bind, kernel-erzwungen). Es gibt keinen Env-Override; Forensik "
+        "läuft auf einer Wegwerf-VM ohne Live-Store."
     )
