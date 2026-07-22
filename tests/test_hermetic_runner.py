@@ -356,14 +356,40 @@ def test_external_symlink_target_bytes_are_bound(tmp_path):
     assert after["attest_hash"] != before["attest_hash"]
 
 
-def test_external_pytest_ini_is_refused(tmp_path, monkeypatch, capsys):
-    """P1-R11-2A: eine repo-fremde ``-c``-Ini wird gar nicht erst gefahren."""
+@pytest.mark.parametrize("form", ["-c {ini}", "-c{ini}", "-c={ini}",
+                                  "--config-file {ini}", "--config-file={ini}"])
+def test_external_pytest_ini_is_refused(tmp_path, monkeypatch, capsys, form):
+    """P1-R11-2A / TARS R12: JEDE Ini-Schreibweise muss denselben Grenzcheck sehen.
+
+    ``-c=/tmp/x.ini`` löste in der ersten Fassung zu ``=/tmp/x.ini`` auf — ein
+    relativer Pfad unterhalb des Repos, der damit als "innerhalb" durchging,
+    während pytest ihn als externe Datei liest.
+    """
     ini = tmp_path / "external.ini"
     ini.write_text("[pytest]\naddopts=-p no:tests.hermetic_guard\n")
-    monkeypatch.setattr(sys, "argv", [
-        "run_tests_hermetic.py", "-c", str(ini), "tests/"])
-    assert runner.main() == 2
+    argv = ["run_tests_hermetic.py", *form.format(ini=ini).split(), "tests/"]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert runner.main() == 2, f"{form} kam durch"
     assert "VERWEIGERT" in capsys.readouterr().err
+
+
+def test_repo_internal_ini_passes_the_preflight(tmp_path, monkeypatch, capsys):
+    """Die Grenze ist repo-FREMD, nicht ``-c`` an sich.
+
+    Geprüft wird genau das: der Ini-Preflight darf bei einer repo-internen
+    Datei nicht anschlagen. Dass der Lauf danach aus einem anderen Grund
+    abbricht (hier: ``--no-sandbox`` bei beschreibbarem Live-Store), ist für
+    diese Aussage egal — deshalb wird auf die MELDUNG geprüft, nicht auf rc.
+    """
+    store = tmp_path / "live-store"
+    store.mkdir()
+    (store / "state.db").touch()
+    monkeypatch.setenv("HERMES_HERMETIC_PROTECT", str(store))
+    monkeypatch.setattr(sys, "argv", [
+        "run_tests_hermetic.py", "-c", str(PROJECT_ROOT / "pyproject.toml"),
+        "--no-sandbox"])
+    runner.main()
+    assert "externe pytest-Konfiguration" not in capsys.readouterr().err
 
 
 def test_attestation_is_deterministic_across_repeats(tmp_path):

@@ -527,14 +527,23 @@ def main() -> int:
     # argparse reißt ``-c pfad`` auseinander: ``-c`` landet als unbekannte Option im
     # passthrough, der Pfad wird als Positional geschluckt — in der rekonstruierten
     # Liste stehen sie nicht mehr nebeneinander, und die Prüfung liefe ins Leere.
+    # TARS R12: die erste Fassung deckte ``-c pfad`` und ``-cpfad`` ab, aber
+    # ``-c=/tmp/x.ini`` löste zu ``=/tmp/x.ini`` auf — ein relativer Pfad, der
+    # unter dem Repo landete und damit als "innerhalb" durchging, während pytest
+    # ihn als externe ``/tmp/x.ini`` liest. Alle Schreibweisen, die pytest
+    # akzeptiert, müssen durch denselben Grenzcheck.
     requested_args = sys.argv[1:]
     for i, arg in enumerate(requested_args):
         cfg = None
-        if arg == "-c" and i + 1 < len(requested_args):
+        if arg in ("-c", "--config-file") and i + 1 < len(requested_args):
             cfg = requested_args[i + 1]
+        elif arg.startswith("--config-file="):
+            cfg = arg[len("--config-file="):]
         elif arg.startswith("-c") and len(arg) > 2:
             cfg = arg[2:]
-        if cfg is None:
+            if cfg.startswith("="):      # ``-c=pfad``
+                cfg = cfg[1:]
+        if not cfg:
             continue
         resolved = Path(cfg).expanduser().resolve()
         if not str(resolved).startswith(str(REPO) + os.sep):
