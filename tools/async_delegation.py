@@ -77,7 +77,33 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
+# Befund C-1: without a wait between release and the next claim, a record
+# whose injection keeps failing is re-claimed at loop speed (measured up to
+# ~5 claims/s over 11 minutes). Exponential per-record backoff, capped, reset
+# on successful delivery.
+_DELIVERY_BACKOFF_BASE_SECONDS = 1.0
+_DELIVERY_BACKOFF_CAP_SECONDS = 60.0
+# Smallest exponent at which base * 2**e is guaranteed >= cap. Legacy records
+# carry REAL attempt counts in the thousands (incident record deleg_b636ccbb:
+# 3573) and ``2.0 ** 3572`` raises OverflowError — the cap has to bound the
+# exponent before the power, not just the product after it.
+_DELIVERY_BACKOFF_CAP_EXPONENT = int(
+    _DELIVERY_BACKOFF_CAP_SECONDS / _DELIVERY_BACKOFF_BASE_SECONDS
+).bit_length()
 _DB_LOCK = threading.Lock()
+
+
+def _delivery_backoff_seconds(attempts: int) -> float:
+    """1 s, 2 s, 4 s, … capped at 60 s. ``attempts`` counts finished claims.
+
+    Saturating: any attempt count past the cap exponent IS the cap; the
+    power is only ever computed for small exponents.
+    """
+    exponent = max(int(attempts) - 1, 0)
+    if exponent > _DELIVERY_BACKOFF_CAP_EXPONENT:
+        return _DELIVERY_BACKOFF_CAP_SECONDS
+    return min(_DELIVERY_BACKOFF_CAP_SECONDS,
+               _DELIVERY_BACKOFF_BASE_SECONDS * (2.0 ** exponent))
 
 
 def _db_path():
@@ -108,7 +134,8 @@ def _connect() -> sqlite3.Connection:
             owner_started_at INTEGER,
             task_json TEXT,
             delivery_claim TEXT,
-            delivery_claimed_at REAL
+            delivery_claimed_at REAL,
+            delivery_next_attempt_at REAL
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -118,6 +145,7 @@ def _connect() -> sqlite3.Connection:
         ("task_json", "TEXT"),
         ("delivery_claim", "TEXT"),
         ("delivery_claimed_at", "REAL"),
+        ("delivery_next_attempt_at", "REAL"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -305,7 +333,8 @@ def mark_completion_delivered(delegation_id: str) -> bool:
     now = time.time()
     with _DB_LOCK, _connect() as conn:
         cur = conn.execute(
-            """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
+            """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?,
+                      updated_at=?, delivery_next_attempt_at=NULL
                WHERE delegation_id=? AND delivery_state!='delivered'""",
             (now, now, delegation_id),
         )
@@ -326,8 +355,9 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
-                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - 300),
+                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)
+                 AND (delivery_next_attempt_at IS NULL OR delivery_next_attempt_at <= ?)""",
+            (claim_id, now, now, delegation_id, now - 300, now),
         )
         return cur.rowcount == 1
 
@@ -344,14 +374,30 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Release a failed delivery claim so another consumer may retry."""
+    """Release a failed delivery claim so another consumer may retry.
+
+    Befund C-1: the release also arms the per-record backoff. The next claim
+    is only allowed once ``delivery_next_attempt_at`` has passed; before, the
+    claim/fail/release cycle ran at loop speed against the same record.
+    """
+    now = time.time()
     with _DB_LOCK, _connect() as conn:
-        cur = conn.execute(
-            """UPDATE async_delegations SET delivery_claim=NULL,
-                      delivery_claimed_at=NULL, updated_at=?
+        row = conn.execute(
+            """SELECT delivery_attempts FROM async_delegations
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=?""",
-            (time.time(), delegation_id, claim_id),
+            (delegation_id, claim_id),
+        ).fetchone()
+        if row is None:
+            return False
+        next_attempt = now + _delivery_backoff_seconds(row[0])
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_claim=NULL,
+                      delivery_claimed_at=NULL, delivery_next_attempt_at=?,
+                      updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (next_attempt, now, delegation_id, claim_id),
         )
         return cur.rowcount == 1
 
@@ -363,7 +409,7 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
                       delivered_at=?, updated_at=?, delivery_claim=NULL,
-                      delivery_claimed_at=NULL
+                      delivery_claimed_at=NULL, delivery_next_attempt_at=NULL
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=?""",
             (now, now, delegation_id, claim_id),
