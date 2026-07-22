@@ -1286,6 +1286,14 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     jobs = [_normalize_job_record(j) for j in load_jobs()]
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
+    try:
+        from cron.executions import latest_executions
+
+        latest = latest_executions([job.get("id", "") for job in jobs])
+    except Exception:
+        latest = {}
+    for job in jobs:
+        job["latest_execution"] = latest.get(job.get("id", ""))
     return jobs
 
 
