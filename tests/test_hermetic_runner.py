@@ -321,7 +321,8 @@ def test_symlink_is_attested_by_target_not_followed(tmp_path):
     second = runner.worktree_state(repo)
 
     kinds = {rel: kind for rel, kind, _ in second["records"]}
-    assert kinds.get("link.py") == "symlink"
+    # extern vs. intern unterscheidet der Record-Typ; beides ist ein Symlink-Record
+    assert kinds.get("link.py") in ("symlink", "symlink-extern")
     # Content-identical targets: only binding the target string catches this.
     assert second["attest_hash"] != first["attest_hash"]
 
@@ -332,6 +333,37 @@ def test_special_file_in_attested_set_is_refused(tmp_path):
     os.mkfifo(repo / "pipe.py")
     with pytest.raises(runner.SpecialFileInAttestation):
         runner.worktree_state(repo)
+
+
+def test_external_symlink_target_bytes_are_bound(tmp_path):
+    """TARS R11, P1-R11-2B: der Zielstring allein reichte nicht.
+
+    Ein untracked ``link.py`` zeigt aus dem Repo hinaus; der Zielinhalt ändert
+    sich, der Pfad bleibt. Python importiert die neuen Bytes — die Attestierung
+    muss sich bewegen.
+    """
+    repo = _git_repo(tmp_path)
+    external = tmp_path / "outside.py"
+    external.write_text("VALUE = 1\n")
+    (repo / "link.py").symlink_to(external)
+
+    before = runner.worktree_state(repo)
+    external.write_text("VALUE = 2\n")
+    after = runner.worktree_state(repo)
+
+    kinds = {rel: kind for rel, kind, _ in after["records"]}
+    assert kinds.get("link.py") == "symlink-extern"
+    assert after["attest_hash"] != before["attest_hash"]
+
+
+def test_external_pytest_ini_is_refused(tmp_path, monkeypatch, capsys):
+    """P1-R11-2A: eine repo-fremde ``-c``-Ini wird gar nicht erst gefahren."""
+    ini = tmp_path / "external.ini"
+    ini.write_text("[pytest]\naddopts=-p no:tests.hermetic_guard\n")
+    monkeypatch.setattr(sys, "argv", [
+        "run_tests_hermetic.py", "-c", str(ini), "tests/"])
+    assert runner.main() == 2
+    assert "VERWEIGERT" in capsys.readouterr().err
 
 
 def test_attestation_is_deterministic_across_repeats(tmp_path):

@@ -303,9 +303,25 @@ def _attest_records(repo: Path, paths: list[str]) -> list[tuple[str, str, str]]:
             continue
         mode = st.st_mode
         if stat.S_ISLNK(mode):
+            # P1-R11-2B: der ZielsTRING allein genügt nicht — zeigt der Link aus
+            # dem Repo hinaus, importiert Python die dortigen BYTES, und die
+            # ändern sich, ohne dass der Pfad sich ändert (TARS' Gegenbeleg:
+            # VALUE=1 → VALUE=2, Attest unverändert). Repo-interne Ziele deckt
+            # der Tree-Hash bereits ab; externe werden hier mitgehasht.
             target = os.readlink(p)
-            digest = hashlib.sha256(target.encode("utf-8", "surrogateescape")).hexdigest()
-            records.append((rel, "symlink", digest))
+            h = hashlib.sha256(target.encode("utf-8", "surrogateescape"))
+            resolved = os.path.realpath(p)
+            kind = "symlink"
+            if not resolved.startswith(str(repo) + os.sep):
+                kind = "symlink-extern"
+                try:
+                    if stat.S_ISREG(os.stat(resolved).st_mode):
+                        h.update(b"\0" + _sha256_file(Path(resolved)).encode())
+                    else:
+                        h.update(b"\0unlesbar")
+                except OSError:
+                    h.update(b"\0unlesbar")
+            records.append((rel, kind, h.hexdigest()))
         elif stat.S_ISREG(mode):
             records.append((rel, "file", _sha256_file(p)))
         elif stat.S_ISDIR(mode):
@@ -502,6 +518,33 @@ def main() -> int:
                         help="Argumente für pytest (Default: -q tests/)")
     args, passthrough = parser.parse_known_args()
 
+    # P1-R11-2A: eine externe Ini (``-c /tmp/x.ini``) entscheidet, welche Plugins
+    # laden — sie kann den Guard abwählen — liegt aber außerhalb des Repos und
+    # damit außerhalb der Attestierung. TARS' Gegenbeleg: Ini geändert,
+    # Attest-Hash identisch. Es gibt keinen Grund, eine repo-fremde Testkonfig
+    # durch den offiziellen Runner zu erlauben, also: fail-closed abweisen.
+    # NB: gegen das ROHE argv prüfen, nicht gegen ``args.pytest_args + passthrough``.
+    # argparse reißt ``-c pfad`` auseinander: ``-c`` landet als unbekannte Option im
+    # passthrough, der Pfad wird als Positional geschluckt — in der rekonstruierten
+    # Liste stehen sie nicht mehr nebeneinander, und die Prüfung liefe ins Leere.
+    requested_args = sys.argv[1:]
+    for i, arg in enumerate(requested_args):
+        cfg = None
+        if arg == "-c" and i + 1 < len(requested_args):
+            cfg = requested_args[i + 1]
+        elif arg.startswith("-c") and len(arg) > 2:
+            cfg = arg[2:]
+        if cfg is None:
+            continue
+        resolved = Path(cfg).expanduser().resolve()
+        if not str(resolved).startswith(str(REPO) + os.sep):
+            print(f"VERWEIGERT: externe pytest-Konfiguration {resolved} liegt außerhalb "
+                  f"des Repos ({REPO}) und wäre nicht attestiert. Eine Ini entscheidet, "
+                  "welche Plugins laden — sie muss versioniert im Repo liegen.",
+                  file=sys.stderr)
+            return 2
+
+
     protected = protected_roots()
     live = live_writable_roots(protected)
 
@@ -522,6 +565,7 @@ def main() -> int:
             return 2
 
     pytest_args = [*args.pytest_args, *passthrough] or ["-q", "tests/"]
+
     stamp = time.strftime("%Y%m%dT%H%M%S")
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"hermetic-{stamp}.log"
@@ -590,8 +634,12 @@ def main() -> int:
         "(tracked+untracked+ignored-code)",
         # Full typed inventory: every attested path with its kind and digest. The
         # summary lines above are for reading; this is the evidence (R10 P1-RUN-6).
-        *[f"Attest-Record: {kind:<7} {digest[:16] or '-':<16} {rel}"
+        # P2-R11-2C: volle 64-Hex-Digests — mit 16 Hex war die "vollständige
+        # Inventaranlage" aus dem Log heraus nicht nachrechenbar.
+        *[f"Attest-Record: {kind:<15} {digest or '-':<64} {rel}"
           for rel, kind, digest in worktree["records"]],
+        "Attest-Ausschluss: " + ", ".join(_UNHASHED_IGNORED_PREFIXES)
+        + "  (NICHT abgedeckt — weder gehasht noch auf Sonderdateien geprüft)",
         f"Python:     {sys.version.split()[0]} ({sys.executable})",
         *[f"Runner-Blob: {rel} sha256={digest}"
           for rel, digest in runner_ident.items()],
