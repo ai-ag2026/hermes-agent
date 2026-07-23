@@ -1078,3 +1078,28 @@ from tests import store_guard as _store_guard
 
 def pytest_unconfigure(config):  # noqa: D103 - pytest hook
     _store_guard.disable()
+
+
+@pytest.fixture(autouse=True)
+def _no_silent_gateway_hard_exit(monkeypatch):
+    """Fork-Guard (Rehearsal 23.07.2026, Upstream-PR-Kandidat).
+
+    Upstream fd96e138b routet JEDEN ``hermes gateway run``-Ausgang durch
+    ``gateway.run._exit_after_graceful_shutdown`` → ``os._exit``. Ein Test,
+    der diesen Pfad ungestubbt erreicht (z.B. über den Foreground-Fallback
+    des Restart-Flows), beendet damit den GESAMTEN pytest-Prozess mit dem
+    Gateway-Exit-Code — bei Code 0 ein lautloser Suite-Suizid ohne Summary
+    (belegt: Paargate-Kandidat starb reproduzierbar bei 48%%; upstream-CI
+    maskiert das vermutlich via xdist-Worker-Crash-Reporting). Dieser Guard
+    macht den Ausgang LAUT statt tödlich. Tests, die den Hard-Exit-Vertrag
+    selbst prüfen (test_gateway_run_hard_exit.py), überschreiben den Attribut
+    per eigenem monkeypatch und sind unberührt.
+    """
+    def _loud_guard(exit_code):
+        raise RuntimeError(
+            f"gateway hard-exit({exit_code}) reached test context — "
+            "stub gateway.run._exit_after_graceful_shutdown in this test"
+        )
+    monkeypatch.setattr(
+        "gateway.run._exit_after_graceful_shutdown", _loud_guard, raising=False,
+    )
