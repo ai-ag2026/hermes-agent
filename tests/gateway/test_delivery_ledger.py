@@ -9,6 +9,7 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -402,3 +403,51 @@ class TestUnconnectedPlatformKeepsItsBudget:
 
         assert await runner._redeliver_pending_obligations() == 1
         assert _row("ob-1")["state"] == "delivered"
+
+
+class TestRetentionNeverDropsOpenObligations:
+    """Fork hardening 2026-07-20: an unsettled obligation is un-prunable.
+
+    The upstream cap sorted delivered/abandoned rows first but still deleted
+    open ones once the settled rows ran out — the same class of loss the
+    ledger is meant to prevent.
+    """
+
+    def test_row_cap_keeps_undelivered_rows(self, monkeypatch, caplog):
+        monkeypatch.setattr(dl, "_MAX_ROWS", 2)
+        for index in range(4):
+            _record(oid=f"open-{index}")
+
+        with caplog.at_level(logging.WARNING, logger=dl.logger.name):
+            dl._prune()
+
+        for index in range(4):
+            assert _row(f"open-{index}") is not None, f"open-{index} was pruned"
+        assert any("backpressure" in record.message for record in caplog.records)
+
+    def test_row_cap_still_prunes_settled_rows(self, monkeypatch):
+        monkeypatch.setattr(dl, "_MAX_ROWS", 1)
+        _record(oid="settled-old")
+        _record(oid="open-keep")
+        dl.mark_delivered("settled-old")
+
+        dl._prune()
+
+        assert _row("settled-old") is None
+        assert _row("open-keep") is not None
+
+    def test_abandoning_an_obligation_is_logged(self, monkeypatch, caplog):
+        _record(oid="doomed")
+        _orphan("doomed")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET attempts=? WHERE obligation_id=?",
+                (dl.MAX_ATTEMPTS, "doomed"),
+            )
+
+        with caplog.at_level(logging.WARNING, logger=dl.logger.name):
+            claimed = dl.sweep_recoverable()
+
+        assert claimed == []
+        assert _row("doomed")["state"] == "abandoned"
+        assert any("abandoning obligation" in r.message for r in caplog.records)

@@ -239,6 +239,17 @@ def sweep_recoverable(
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+                # Giving up on a turn's output is a real loss for the user, so
+                # it is recorded visibly rather than transitioned in silence.
+                logger.warning(
+                    "delivery ledger abandoning obligation %s for %s after "
+                    "%d attempts (age %.0fs) — the response was never confirmed "
+                    "delivered",
+                    oid,
+                    platform,
+                    attempts,
+                    now - created_at,
+                )
                 conn.execute(
                     """UPDATE delivery_obligations
                        SET state='abandoned', updated_at=? WHERE obligation_id=?""",
@@ -290,17 +301,34 @@ def _prune(now: Optional[float] = None) -> None:
             ).fetchone()[0]
             excess = max(0, total - _MAX_ROWS)
             if excess:
+                # Only settled rows are deletable. An obligation that is still
+                # pending/attempting/failed is output nobody has received yet:
+                # dropping it to honor a row cap would lose exactly what the
+                # ledger exists to protect, so the cap may be exceeded instead
+                # (see the backpressure warning below).
                 conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
+                         WHERE state IN ('delivered', 'abandoned')
                          ORDER BY CASE state
                                     WHEN 'delivered' THEN 0
-                                    WHEN 'abandoned' THEN 1
-                                    ELSE 2
+                                    ELSE 1
                                   END, updated_at ASC
                          LIMIT ?)""",
                     (excess,),
                 )
+            open_rows = conn.execute(
+                """SELECT COUNT(*) FROM delivery_obligations
+                   WHERE state IN ('pending', 'attempting', 'failed')"""
+            ).fetchone()[0]
+        if open_rows > _MAX_ROWS:
+            logger.warning(
+                "delivery ledger backpressure: %d undelivered obligations exceed "
+                "the row cap of %d; rows are retained -- investigate stalled "
+                "delivery instead of expecting retention to clear them",
+                open_rows,
+                _MAX_ROWS,
+            )
     except Exception:
         logger.debug("delivery ledger prune failed", exc_info=True)
 
