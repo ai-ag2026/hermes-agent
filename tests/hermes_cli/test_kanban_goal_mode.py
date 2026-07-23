@@ -432,8 +432,8 @@ def test_wait_parks_without_spending_a_turn_then_resumes(monkeypatch):
             _fake_judge.n = 0
         _fake_judge.n += 1
         if _fake_judge.n == 1:
-            return "wait", "waiting on background build", False, {"pid": 4242}
-        return "continue", "resumed", False, None
+            return "wait", "waiting on background build", False, {"pid": 4242}, False
+        return "continue", "resumed", False, None, False
 
     monkeypatch.setattr(goals, "judge_goal", _fake_judge)
 
@@ -486,8 +486,8 @@ def test_wait_barrier_gives_up_after_max_wait_seconds(monkeypatch):
             _fake_judge.n = 0
         _fake_judge.n += 1
         if _fake_judge.n == 1:
-            return "wait", "waiting forever", False, {"pid": 999}
-        return "continue", "gave up waiting", False, None
+            return "wait", "waiting forever", False, {"pid": 999}, False
+        return "continue", "gave up waiting", False, None, False
 
     monkeypatch.setattr(goals, "judge_goal", _fake_judge)
     monkeypatch.setattr(goals, "_pid_alive", lambda pid: True)  # never dies
@@ -528,8 +528,8 @@ def test_invalid_wait_directive_degrades_to_continue_without_hanging(monkeypatch
             _fake_judge.n = 0
         _fake_judge.n += 1
         if _fake_judge.n == 1:
-            return "wait", "no target given", False, {}
-        return "continue", "ok", False, None
+            return "wait", "no target given", False, {}, False
+        return "continue", "ok", False, None, False
 
     monkeypatch.setattr(goals, "judge_goal", _fake_judge)
 
