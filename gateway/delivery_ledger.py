@@ -200,7 +200,11 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
         )
 
 
-def sweep_recoverable(now: Optional[float] = None) -> List[Dict[str, Any]]:
+def sweep_recoverable(
+    now: Optional[float] = None,
+    *,
+    deliverable_platforms: Optional[set] = None,
+) -> List[Dict[str, Any]]:
     """Claim undelivered rows owned by dead processes; return them for
     redelivery.
 
@@ -209,6 +213,13 @@ def sweep_recoverable(now: Optional[float] = None) -> List[Dict[str, Any]]:
     double-claim (the UPDATE is guarded on the previous owner stamp).
     Rows over the attempts cap or older than the stale cutoff transition to
     'abandoned' instead of being returned.
+
+    ``deliverable_platforms`` (platform value strings) restricts claiming to
+    platforms the caller can actually send on this boot.  ``attempts`` is the
+    redelivery budget, so it must only be spent on a real send: a platform
+    that failed to connect would otherwise burn one attempt per boot and hit
+    the cap having never been sent once.  Rows for absent platforms are left
+    untouched for a later boot; the stale cutoff still bounds them.
     """
     now = now if now is not None else time.time()
     pid, started = _owner_stamp()
@@ -228,6 +239,7 @@ def sweep_recoverable(now: Optional[float] = None) -> List[Dict[str, Any]]:
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
                 # Giving up on a turn's output is a real loss for the user, so
                 # it is recorded visibly rather than transitioned in silence.
+                # (Fork-Haertung 887583a18, im Merge 23.07. erhalten.)
                 logger.warning(
                     "delivery ledger abandoning obligation %s for %s after "
                     "%d attempts (age %.0fs) — the response was never confirmed "
@@ -242,6 +254,13 @@ def sweep_recoverable(now: Optional[float] = None) -> List[Dict[str, Any]]:
                        SET state='abandoned', updated_at=? WHERE obligation_id=?""",
                     (now, oid),
                 )
+                continue
+            if (
+                deliverable_platforms is not None
+                and platform not in deliverable_platforms
+            ):
+                # No adapter for this platform this boot — the caller cannot
+                # send, so claiming would spend an attempt on a no-op.
                 continue
             cursor = conn.execute(
                 """UPDATE delivery_obligations
@@ -281,11 +300,11 @@ def _prune(now: Optional[float] = None) -> None:
             ).fetchone()[0]
             excess = max(0, total - _MAX_ROWS)
             if excess:
-                # Only settled rows are deletable. An obligation that is still
-                # pending/attempting/failed is output nobody has received yet:
-                # dropping it to honor a row cap would lose exactly what the
-                # ledger exists to protect, so the cap may be exceeded instead
-                # (see the backpressure warning below).
+                # Only settled rows are deletable (Fork-Haertung 887583a18).
+                # An obligation that is still pending/attempting/failed is
+                # output nobody has received yet: dropping it to honor a row
+                # cap would lose exactly what the ledger exists to protect,
+                # so the cap may be exceeded instead (backpressure below).
                 conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
