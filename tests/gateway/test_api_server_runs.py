@@ -211,6 +211,83 @@ class TestStartRun:
                 assert resp.status == 202
 
 
+class TestStartRunIdempotency:
+    """A timed-out client retry must not buy a second privileged run (#1925 S2a)."""
+
+    @staticmethod
+    def _mock_agent():
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "done"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        return mock_agent
+
+    @pytest.mark.asyncio
+    async def test_same_key_and_body_replays_the_same_run(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = self._mock_agent()
+                headers = {"Idempotency-Key": "retry-me"}
+
+                first = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+                second = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+
+                assert first.status == 202
+                assert second.status == 200
+                first_data, second_data = await first.json(), await second.json()
+                assert second_data["run_id"] == first_data["run_id"]
+                assert second_data["idempotent_replay"] is True
+                # Exactly one run was ever started under this key.
+                assert mock_create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_same_key_with_different_body_is_a_conflict(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = self._mock_agent()
+                headers = {"Idempotency-Key": "reused-key"}
+
+                first = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+                clash = await cli.post("/v1/runs", json={"input": "something else"}, headers=headers)
+
+                assert first.status == 202
+                assert clash.status == 409
+                assert mock_create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_distinct_keys_start_distinct_runs(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = self._mock_agent()
+
+                first = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers={"Idempotency-Key": "a"}
+                )
+                second = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers={"Idempotency-Key": "b"}
+                )
+
+                assert first.status == 202 and second.status == 202
+                assert (await first.json())["run_id"] != (await second.json())["run_id"]
+
+    @pytest.mark.asyncio
+    async def test_requests_without_key_are_unaffected(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = self._mock_agent()
+
+                first = await cli.post("/v1/runs", json={"input": "hello"})
+                second = await cli.post("/v1/runs", json={"input": "hello"})
+
+                assert first.status == 202 and second.status == 202
+                assert (await first.json())["run_id"] != (await second.json())["run_id"]
+
+
 # ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id} — poll run status
 # ---------------------------------------------------------------------------
