@@ -1063,8 +1063,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_audit.add_argument("--json", action="store_true", help="Emit a JSON report")
 
-    p_repair = sub.add_parser(
-        "repair",
+    p_reconcile = sub.add_parser(
+        "reconcile",
         help="Reconcile mechanically-unambiguous invariant violations (dry-run by default)",
         description=(
             "Re-audits the board and applies ONLY the strict allowlist of "
@@ -1076,25 +1076,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "fabricated completion."
         ),
     )
-    p_repair.add_argument(
+    p_reconcile.add_argument(
         "--apply", action="store_true",
         help="Actually apply safe repairs (default: dry-run, no writes)",
     )
-    p_repair.add_argument(
+    p_reconcile.add_argument(
         "--actor", default=None,
         help="Required with --apply: who authorized this repair",
     )
-    p_repair.add_argument(
+    p_reconcile.add_argument(
         "--reason", default=None,
         help="Required with --apply: why this repair is being applied",
     )
-    p_repair.add_argument("--json", action="store_true", help="Emit a JSON report")
+    p_reconcile.add_argument("--json", action="store_true", help="Emit a JSON report")
 
-    # Upstream-REINDEX-Repair, fork-lokal umbenannt: 'repair' ist bei uns
-    # der Invarianten-Reconciler (TARS-Review-Referenz), Kollision im Merge 23.07.
     # --- repair ---
     p_repair = sub.add_parser(
-        "repair-db",
+        "repair",
         help="Check kanban.db integrity and auto-repair index-only corruption",
         description=(
             "Runs PRAGMA integrity_check on the board's DB and reports the "
@@ -1181,15 +1179,14 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
-        # `repair-db` (Upstream-REINDEX-Recovery, fork-lokal umbenannt) must
-        # dispatch BEFORE the auto-init below: on a corrupt DB init_db()
-        # itself raises KanbanDbCorruptError, which would turn every
-        # `hermes kanban repair-db` into "could not initialize database"
-        # without ever reaching the repair path. The fork's own `repair`
-        # (invariant reconciler) deliberately goes THROUGH init like every
-        # other command.
-        if action == "repair-db":
-            return _cmd_repair_db(args)
+        # `repair` must dispatch BEFORE the auto-init below: on a corrupt DB
+        # init_db() itself raises KanbanDbCorruptError, which would turn
+        # every `hermes kanban repair` into "could not initialize database"
+        # without ever reaching the repair path.  (Fork note: the invariant
+        # reconciler lives under `reconcile` and deliberately goes THROUGH
+        # init like every other command.)
+        if action == "repair":
+            return _cmd_repair(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -1206,7 +1203,6 @@ def kanban_command(args: argparse.Namespace) -> int:
             "assign":   _cmd_assign,
             "reclassify": _cmd_reclassify,
             "set-model": _cmd_set_model,
-            "repair-db": _cmd_repair_db,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1247,7 +1243,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
             "audit":    _cmd_audit,
-            "repair":   _cmd_repair,
+            "reconcile": _cmd_reconcile,
         }
         handler = handlers.get(action)
         if not handler:
@@ -3486,7 +3482,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_repair(args: argparse.Namespace) -> int:
+def _cmd_reconcile(args: argparse.Namespace) -> int:
     """Dry-run by default; ``--apply`` requires ``--actor`` and ``--reason``."""
     from hermes_cli import kanban_repair as kr
 
@@ -3521,7 +3517,7 @@ def _cmd_repair(args: argparse.Namespace) -> int:
         print(f"  {f.task_id}  [{f.kind}]  {outcome}")
     return 0
 
-def _cmd_repair_db(args: argparse.Namespace) -> int:
+def _cmd_repair(args: argparse.Namespace) -> int:
     """Check DB integrity and apply the narrow index-REINDEX auto-repair.
 
     Dispatched BEFORE the auto ``kb.init_db()`` in :func:`kanban_command`
@@ -3533,7 +3529,7 @@ def _cmd_repair_db(args: argparse.Namespace) -> int:
     try:
         report = kb.repair_db()
     except Exception as exc:  # locked/busy probe, unexpected I/O
-        print(f"kanban repair-db: {exc}", file=sys.stderr)
+        print(f"kanban repair: {exc}", file=sys.stderr)
         return 1
 
     if getattr(args, "json", False):

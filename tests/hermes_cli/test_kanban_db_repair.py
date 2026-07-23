@@ -456,7 +456,7 @@ def test_repair_db_fail_closed_on_page_corruption(tmp_path):
 
 def test_cli_repair_ok_exit_zero(cli_home, capsys):
     kb.init_db()
-    rc = _run_kanban_cli(["repair-db"])
+    rc = _run_kanban_cli(["repair"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "integrity_check ok" in out
@@ -467,7 +467,7 @@ def test_cli_repair_repairs_and_exits_zero(cli_home, capsys):
     _build_board_db(db_path)
     _corrupt_index(db_path, "idx_tasks_status")
 
-    rc = _run_kanban_cli(["repair-db"])
+    rc = _run_kanban_cli(["repair"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "repaired" in out
@@ -481,7 +481,7 @@ def test_cli_repair_still_corrupt_exits_nonzero(cli_home, capsys):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     _write_page_corrupt_db(db_path)
 
-    rc = _run_kanban_cli(["repair-db"])
+    rc = _run_kanban_cli(["repair"])
     err = capsys.readouterr().err
     assert rc != 0
     assert "CORRUPT" in err
@@ -493,7 +493,7 @@ def test_cli_repair_json_shape(cli_home, capsys):
     _build_board_db(db_path)
     _corrupt_index(db_path, "idx_tasks_status")
 
-    rc = _run_kanban_cli(["repair-db", "--json"])
+    rc = _run_kanban_cli(["repair", "--json"])
     payload = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert payload["status"] == "repaired"
@@ -503,21 +503,24 @@ def test_cli_repair_json_shape(cli_home, capsys):
 
 
 def test_cli_repair_missing_db_exits_zero(cli_home, capsys):
-    rc = _run_kanban_cli(["repair-db"])
+    rc = _run_kanban_cli(["repair"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "nothing to repair" in out
 
 
 # ---------------------------------------------------------------------------
-# Fork-Separation (Merge-Rehearsal 23.07.2026): zwei verschiedene Kommandos.
-# `repair`    = Fork-Invarianten-Reconciler (dry-run per Default, via init).
-# `repair-db` = Upstream-REINDEX-Recovery (VOR init dispatcht, JSON-Vertrag).
-# Der Dispatch-Fehler, den dieser Test pinnt, war real: der Pre-Init-Zweig
-# rief nach der Umbenennung die falsche Funktion (TARS-Review B1).
+# Fork-Separation (Merge-Rehearsal 23.07., final nach Manfreds Upstream-
+# Anpassungs-Direktive): `repair` gehoert UPSTREAM (REINDEX-Recovery, VOR
+# init dispatcht, JSON-Vertrag) — wortgleich deren Original. UNSER
+# Invarianten-Reconciler heisst jetzt `reconcile` (dry-run Default, via
+# init). Kein Uebergangs-Alias: der alte Fork-Name war `repair` und gehoert
+# jetzt Upstream; ein Alias wuerde exakt die Verwechslung stiften, die
+# dieser Test verhindert. Der Dispatch-Fehler, den dieser Test urspruenglich
+# pinnte (Pre-Init-Zweig rief die falsche Funktion), bleibt abgedeckt.
 # ---------------------------------------------------------------------------
 
-def test_repair_and_repair_db_route_to_different_implementations(cli_home, capsys):
+def test_reconcile_and_repair_route_to_different_implementations(cli_home, capsys):
     kb.init_db()
 
     rc = _run_kanban_cli(["repair"])
@@ -525,10 +528,10 @@ def test_repair_and_repair_db_route_to_different_implementations(cli_home, capsy
     assert rc == 0
     assert "DRY-RUN" in out_reconciler, "fork `repair` must stay the dry-run invariant reconciler"
 
-    rc = _run_kanban_cli(["repair-db", "--json"])
+    rc = _run_kanban_cli(["repair", "--json"])
     out_db = capsys.readouterr().out
     assert rc == 0
     import json as _json
     report = _json.loads(out_db)
     assert report["status"] in {"ok", "repaired", "missing"}, report
-    assert "DRY-RUN" not in out_db, "`repair-db` must reach kb.repair_db(), not the reconciler"
+    assert "DRY-RUN" not in out_db, "upstream `repair` must reach kb.repair_db(), not the reconciler"
