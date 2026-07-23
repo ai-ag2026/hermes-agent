@@ -165,7 +165,16 @@ def _delete_durable_delegation(delegation_id: str) -> None:
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history, preferring delivered records for deletion."""
+    """Bound terminal history without ever dropping an open obligation.
+
+    Retention deletes acknowledged history only. A record whose result was
+    never handed to its requester (``delivery_state='pending'``) is an open
+    obligation: it survives the age cutoff, the terminal cap and the pending
+    overflow guard alike. When pending work exceeds the soft cap we apply
+    backpressure (log + counter) instead of silently discarding results the
+    requester is still waiting for -- losing them is exactly the failure the
+    durable ledger exists to prevent.
+    """
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _connect() as conn:
@@ -178,12 +187,14 @@ def _prune_durable_records() -> None:
         ).fetchone()[0]
         excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
+            # Only acknowledged history is deletable; undelivered records are
+            # skipped even when that leaves the table above the cap.
             conn.execute(
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                              updated_at ASC LIMIT ?
+                       AND delivery_state='delivered'
+                     ORDER BY updated_at ASC LIMIT ?
                    )""",
                 (excess,),
             )
@@ -191,16 +202,15 @@ def _prune_durable_records() -> None:
             """SELECT COUNT(*) FROM async_delegations
                WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'"""
         ).fetchone()[0]
-        overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
-        if overflow:
-            conn.execute(
-                """DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
-                     ORDER BY updated_at ASC LIMIT ?
-                   )""",
-                (overflow,),
-            )
+    overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
+    if overflow:
+        logger.warning(
+            "async delegation backpressure: %d undelivered completions exceed "
+            "the soft cap of %d; records are retained -- drain the requester "
+            "queue or investigate stalled delivery",
+            pending_count,
+            _MAX_DURABLE_PENDING,
+        )
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
