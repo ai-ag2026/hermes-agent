@@ -1181,12 +1181,15 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
-        # `repair` must dispatch BEFORE the auto-init below: on a corrupt DB
-        # init_db() itself raises KanbanDbCorruptError, which would turn
-        # every `hermes kanban repair` into "could not initialize database"
-        # without ever reaching the repair path.
+        # `repair-db` (Upstream-REINDEX-Recovery, fork-lokal umbenannt) must
+        # dispatch BEFORE the auto-init below: on a corrupt DB init_db()
+        # itself raises KanbanDbCorruptError, which would turn every
+        # `hermes kanban repair-db` into "could not initialize database"
+        # without ever reaching the repair path. The fork's own `repair`
+        # (invariant reconciler) deliberately goes THROUGH init like every
+        # other command.
         if action == "repair-db":
-            return _cmd_repair(args)
+            return _cmd_repair_db(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -3530,7 +3533,7 @@ def _cmd_repair_db(args: argparse.Namespace) -> int:
     try:
         report = kb.repair_db()
     except Exception as exc:  # locked/busy probe, unexpected I/O
-        print(f"kanban repair: {exc}", file=sys.stderr)
+        print(f"kanban repair-db: {exc}", file=sys.stderr)
         return 1
 
     if getattr(args, "json", False):
