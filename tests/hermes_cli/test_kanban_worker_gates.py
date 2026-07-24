@@ -132,7 +132,11 @@ def test_goal_judge_gates_worker_completion(kb_env, monkeypatch):
         import hermes_cli.goals as goals
         monkeypatch.setattr(
             goals, "judge_goal",
-            lambda goal, last_response: ("continue", "no acceptance evidence", None),
+            # Voller judge_goal-Vertrag: (verdict, reason, parse_failed,
+            # wait_directive, transport_failed) — ein kürzerer Mock löst im
+            # Gate ValueError aus, der defensiv geschluckt wird und die
+            # Sperrsemantik still deaktiviert (TARS-Zweitreview, Stopplinie 1).
+            lambda goal, last_response: ("continue", "no acceptance evidence", False, None, False),
         )
         with pytest.raises(kb.WorkerGateError) as exc:
             kb.complete_task(conn, tid, summary="trust me it's done")
@@ -141,7 +145,7 @@ def test_goal_judge_gates_worker_completion(kb_env, monkeypatch):
         # Judge satisfied → completes.
         monkeypatch.setattr(
             goals, "judge_goal",
-            lambda goal, last_response: ("done", "", None),
+            lambda goal, last_response: ("done", "", False, None, False),
         )
         assert kb.complete_task(conn, tid, summary="evidence attached")
 
