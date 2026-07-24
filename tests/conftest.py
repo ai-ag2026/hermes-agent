@@ -1081,7 +1081,7 @@ def pytest_unconfigure(config):  # noqa: D103 - pytest hook
 
 
 @pytest.fixture(autouse=True)
-def _no_silent_gateway_hard_exit(monkeypatch):
+def _no_silent_gateway_hard_exit(monkeypatch, request):
     """Fork-Guard (Rehearsal 23.07.2026, Upstream-PR-Kandidat).
 
     Upstream fd96e138b routet JEDEN ``hermes gateway run``-Ausgang durch
@@ -1095,11 +1095,25 @@ def _no_silent_gateway_hard_exit(monkeypatch):
     selbst prüfen (test_gateway_run_hard_exit.py), überschreiben den Attribut
     per eigenem monkeypatch und sind unberührt.
     """
-    def _loud_guard(exit_code):
-        raise RuntimeError(
-            f"gateway hard-exit({exit_code}) reached test context — "
-            "stub gateway.run._exit_after_graceful_shutdown in this test"
-        )
-    monkeypatch.setattr(
-        "gateway.run._exit_after_graceful_shutdown", _loud_guard, raising=False,
+    # No-op, nicht raise: hermes_cli.gateway.run_gateway() hat direkt nach dem
+    # Hard-Exit-Aufruf ein explizites ``return  # guard for test stubs`` —
+    # Upstreams Testvertrag ist also "gestubbt = kehrt zurück". Ein raisender
+    # Guard ließe deren eigene run_gateway-Tests (z.B.
+    # test_run_gateway_refreshes_outdated_unit_on_boot) fälschlich scheitern.
+    # Exit-CONTRACT tests verify the os._exit routing itself (they patch
+    # os._exit / install recording stubs and expect main()/run_gateway() to
+    # REACH the seam) -- the no-op stub must not blind them (Paargate R1:
+    # 7 DID-NOT-RAISE failures in test_gateway_process_exit).
+    _exit_contract_modules = (
+        "test_gateway_process_exit",
+        "test_gateway_run_hard_exit",
     )
+    if any(name in str(request.fspath) for name in _exit_contract_modules):
+        yield
+        return
+    monkeypatch.setattr(
+        "gateway.run._exit_after_graceful_shutdown",
+        lambda exit_code: None,
+        raising=False,
+    )
+    yield
