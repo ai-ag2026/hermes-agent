@@ -7314,7 +7314,12 @@ def _enforce_worker_complete_gates(
         verdict, reason = "done", ""
         try:
             from hermes_cli.goals import judge_goal
-            verdict, reason, _ = judge_goal(
+            # judge_goal returns (verdict, reason, parse_failed,
+            # wait_directive, transport_failed). Unpacking fewer raises
+            # ValueError, which the defensive handler below swallows --
+            # leaving verdict="done" and SILENTLY DISABLING this gate
+            # (Paargate R5: fail-open completions).
+            verdict, reason, _, _, _ = judge_goal(
                 goal=f"{task.title}\n\n{task.body or ''}".strip(),
                 last_response=(summary or result or "").strip(),
             )

@@ -1217,7 +1217,7 @@ def test_pending_action_goal_finalizer_keeps_single_current_operator_attention(
     # verdict produces the finalizer prompt; the second detects no lifecycle
     # call and invokes the real _block closure.
     monkeypatch.setattr(
-        goals, "judge_goal", lambda *_args, **_kwargs: ("done", "ready to finalize", False, None),
+        goals, "judge_goal", lambda *_args, **_kwargs: ("done", "ready to finalize", False, None, False),
     )
     fake_cli = SimpleNamespace(
         agent=SimpleNamespace(
