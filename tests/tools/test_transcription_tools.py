@@ -1404,6 +1404,7 @@ class TestTranscribeXAI:
 
         assert result["success"] is False
         assert "empty transcript" in result["error"]
+        assert result["no_speech"] is True  # live voice loops treat this as silence
 
     def test_permission_error(self, monkeypatch, sample_ogg, mock_xai_http_module):
         monkeypatch.setenv("XAI_API_KEY", "xai-test-key")
@@ -1648,6 +1649,7 @@ class TestTranscribeElevenLabs:
 
         assert result["success"] is False
         assert "empty transcript" in result["error"]
+        assert result["no_speech"] is True  # live voice loops treat this as silence
 
 
 # ============================================================================

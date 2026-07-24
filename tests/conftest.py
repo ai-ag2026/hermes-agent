@@ -214,6 +214,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
     "HERMES_TENANT",
+    # Honcho host selection changes which nested config block wins. A local
+    # shell override leaked "myhost" into the full suite and flipped 20
+    # otherwise-unrelated config tests away from the default "hermes" host.
+    "HERMES_HONCHO_HOST",
     # Dashboard OAuth auth gate (PR #30156). When set, the bundled
     # dashboard-auth `nous` plugin auto-registers itself on plugin discovery,
     # which is triggered by any `/api/status` call. That leaks a provider
@@ -313,6 +317,9 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # Force-clear on every test setup so the leak can't happen.
     "SLACK_REQUIRE_MENTION",
     "SLACK_STRICT_MENTION",
+    "SLACK_THREAD_REQUIRE_MENTION",
+    "SLACK_IGNORE_OTHER_USER_MENTIONS",
+    "SLACK_REQUIRE_MENTION_CHANNELS",
     "SLACK_FREE_RESPONSE_CHANNELS",
     "SLACK_ALLOW_BOTS",
     "SLACK_REACTIONS",
@@ -341,6 +348,13 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # 2. Blank behavioral HERMES_* vars that could change test semantics.
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
+
+    # Honcho's fallback host/config resolution legitimately reads the user's
+    # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
+    # on it), but pin the host so ordinary tests cannot inherit a developer's
+    # defaultHost and silently select the wrong nested config block. Tests of
+    # custom host resolution override/delete this explicitly.
+    monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes")
 
     # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
     #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
@@ -1064,3 +1078,42 @@ from tests import store_guard as _store_guard
 
 def pytest_unconfigure(config):  # noqa: D103 - pytest hook
     _store_guard.disable()
+
+
+@pytest.fixture(autouse=True)
+def _no_silent_gateway_hard_exit(monkeypatch, request):
+    """Fork-Guard (Rehearsal 23.07.2026, Upstream-PR-Kandidat).
+
+    Upstream fd96e138b routet JEDEN ``hermes gateway run``-Ausgang durch
+    ``gateway.run._exit_after_graceful_shutdown`` → ``os._exit``. Ein Test,
+    der diesen Pfad ungestubbt erreicht (z.B. über den Foreground-Fallback
+    des Restart-Flows), beendet damit den GESAMTEN pytest-Prozess mit dem
+    Gateway-Exit-Code — bei Code 0 ein lautloser Suite-Suizid ohne Summary
+    (belegt: Paargate-Kandidat starb reproduzierbar bei 48%%; upstream-CI
+    maskiert das vermutlich via xdist-Worker-Crash-Reporting). Dieser Guard
+    macht den Ausgang LAUT statt tödlich. Tests, die den Hard-Exit-Vertrag
+    selbst prüfen (test_gateway_run_hard_exit.py), überschreiben den Attribut
+    per eigenem monkeypatch und sind unberührt.
+    """
+    # No-op, nicht raise: hermes_cli.gateway.run_gateway() hat direkt nach dem
+    # Hard-Exit-Aufruf ein explizites ``return  # guard for test stubs`` —
+    # Upstreams Testvertrag ist also "gestubbt = kehrt zurück". Ein raisender
+    # Guard ließe deren eigene run_gateway-Tests (z.B.
+    # test_run_gateway_refreshes_outdated_unit_on_boot) fälschlich scheitern.
+    # Exit-CONTRACT tests verify the os._exit routing itself (they patch
+    # os._exit / install recording stubs and expect main()/run_gateway() to
+    # REACH the seam) -- the no-op stub must not blind them (Paargate R1:
+    # 7 DID-NOT-RAISE failures in test_gateway_process_exit).
+    _exit_contract_modules = (
+        "test_gateway_process_exit",
+        "test_gateway_run_hard_exit",
+    )
+    if any(name in str(request.fspath) for name in _exit_contract_modules):
+        yield
+        return
+    monkeypatch.setattr(
+        "gateway.run._exit_after_graceful_shutdown",
+        lambda exit_code: None,
+        raising=False,
+    )
+    yield

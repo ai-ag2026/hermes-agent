@@ -530,20 +530,24 @@ def test_c1_release_survives_legacy_attempt_count(tmp_path, monkeypatch):
         )
 
     assert ad.claim_completion_delivery("deleg_legacy", "consumer")
-    before = ad.time.time()
+    # MERGE-SEMANTIK (23.07.): mit der Upstream-Kappe (8) konvergiert ein
+    # Legacy-Record mit 3573 Versuchen beim Release TERMINAL nach 'dropped',
+    # statt ewig gedeckelt weiterzulaufen. Der Kern des Tests bleibt: kein
+    # OverflowError, kein Crash der Delivery-Schleife — nur ist das Ziel
+    # jetzt ein ehrlicher Endzustand statt einer Endlosbremse. Das
+    # Backoff-Verhalten UNTER der Kappe deckt
+    # test_c1_release_backoff_bounds_claim_rate ab.
     assert ad.release_completion_delivery("deleg_legacy", "consumer")
 
     with ad._DB_LOCK, ad._connect() as conn:
-        next_at = conn.execute(
-            "SELECT delivery_next_attempt_at FROM async_delegations "
-            "WHERE delegation_id=?", ("deleg_legacy",)).fetchone()[0]
-    assert next_at is not None
-    assert next_at - before <= ad._DELIVERY_BACKOFF_CAP_SECONDS + 1.0
+        state, next_at = conn.execute(
+            "SELECT delivery_state, delivery_next_attempt_at FROM async_delegations "
+            "WHERE delegation_id=?", ("deleg_legacy",)).fetchone()
+    assert state == "dropped"
+    assert next_at is None
 
-    # Success afterwards clears the backoff marker entirely.
-    _advance_module_time(monkeypatch, ad._DELIVERY_BACKOFF_CAP_SECONDS + 1)
-    assert ad.claim_completion_delivery("deleg_legacy", "consumer")
-    assert ad.complete_completion_delivery("deleg_legacy", "consumer")
+    # Terminal heißt terminal: kein weiterer Claim, Ergebnis bleibt abfragbar.
+    assert not ad.claim_completion_delivery("deleg_legacy", "consumer")
     with ad._DB_LOCK, ad._connect() as conn:
         cleared = conn.execute(
             "SELECT delivery_next_attempt_at FROM async_delegations "

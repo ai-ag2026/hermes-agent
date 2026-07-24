@@ -90,6 +90,12 @@ _DELIVERY_BACKOFF_CAP_SECONDS = 60.0
 _DELIVERY_BACKOFF_CAP_EXPONENT = int(
     _DELIVERY_BACKOFF_CAP_SECONDS / _DELIVERY_BACKOFF_BASE_SECONDS
 ).bit_length()
+
+# A pending completion whose delivery keeps failing is retried across claim
+# cycles (and across restarts via restore_undelivered_completions). Cap the
+# attempts so an unroutable row converges to a terminal 'dropped' state
+# instead of replaying on every restart forever.
+_MAX_DELIVERY_ATTEMPTS = 8
 _DB_LOCK = threading.Lock()
 
 
@@ -376,12 +382,28 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Release a failed delivery claim so another consumer may retry.
 
-    Befund C-1: the release also arms the per-record backoff. The next claim
-    is only allowed once ``delivery_next_attempt_at`` has passed; before, the
-    claim/fail/release cycle ran at loop speed against the same record.
+    Befund C-1 + Upstream-Kappe (Merge 23.07.): zwei komplementäre Bremsen.
+    Der per-Record-Backoff (C-1) verhindert Claim/Fail/Release in Loop-
+    Geschwindigkeit; die Versuchs-Kappe (Upstream) konvergiert unzustellbare
+    Records terminal nach ``dropped``, statt sie bei jedem Restart erneut
+    zu replayen. Reihenfolge: erst Kappe prüfen, sonst Backoff-Release.
     """
     now = time.time()
     with _DB_LOCK, _connect() as conn:
+        capped = conn.execute(
+            """UPDATE async_delegations SET delivery_state='dropped',
+                      delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=? AND delivery_attempts>=?""",
+            (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS),
+        )
+        if capped.rowcount == 1:
+            logger.warning(
+                "Async delegation %s exhausted its %d delivery attempts; "
+                "marking terminally dropped (result remains queryable).",
+                delegation_id, _MAX_DELIVERY_ATTEMPTS,
+            )
+            return True
         row = conn.execute(
             """SELECT delivery_attempts FROM async_delegations
                WHERE delegation_id=? AND delivery_state='pending'
@@ -398,6 +420,28 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=?""",
             (next_attempt, now, delegation_id, claim_id),
+        )
+        return cur.rowcount == 1
+
+
+def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Terminally drop a claimed completion that can never be delivered.
+
+    Used when the delivery target is permanently gone — the spawning session
+    ended at an explicit user boundary (/new, reset) rather than a compression
+    rotation. Marking the row ``dropped`` (not ``delivered``) keeps the ack
+    honest, and (not ``pending``) keeps restart recovery from replaying a
+    completion that will be fail-closed dropped again every time.
+    """
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_state='dropped',
+                      updated_at=?, delivery_claim=NULL,
+                      delivery_claimed_at=NULL
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (now, delegation_id, claim_id),
         )
         return cur.rowcount == 1
 
@@ -711,6 +755,7 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    delegation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -732,7 +777,7 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
-    delegation_id = _new_delegation_id()
+    delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
     # A combined goal label for status listings / the completion header.
@@ -861,6 +906,10 @@ def _finalize_batch(
         # The full per-task results list — the formatter renders a
         # consolidated multi-task block from this.
         "results": combined.get("results") or [],
+        # Per-task live transcript log paths (cache/delegation/live/...).
+        # They persist after completion and double as the full-fidelity
+        # operational record of each child's run.
+        "live_transcripts": combined.get("live_transcripts"),
         "error": combined.get("error"),
         "total_duration_seconds": combined.get("total_duration_seconds"),
         "dispatched_at": dispatched_at,

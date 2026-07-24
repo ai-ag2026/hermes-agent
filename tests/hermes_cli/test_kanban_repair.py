@@ -701,17 +701,17 @@ def test_cli_repair_dry_run_then_apply_requires_actor_and_reason(kanban_home):
             (int(time.time()), run_id),
         )
 
-    dry = kc.run_slash("repair --json")
+    dry = kc.run_slash("reconcile --json")
     dry_payload = json.loads(dry)
     assert dry_payload["dry_run"] is True
     assert dry_payload["applied_count"] == 0
     with kb.connect() as conn:
         assert kb.get_task(conn, task_id).status == "running"
 
-    usage_error = kc.run_slash("repair --apply")
+    usage_error = kc.run_slash("reconcile --apply")
     assert "usage error" in usage_error or "actor" in usage_error
 
-    applied = kc.run_slash("repair --apply --actor tester --reason fix --json")
+    applied = kc.run_slash("reconcile --apply --actor tester --reason fix --json")
     applied_payload = json.loads(applied)
     assert applied_payload["dry_run"] is False
     assert applied_payload["applied_count"] == 1
