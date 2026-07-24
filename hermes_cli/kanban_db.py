@@ -4609,6 +4609,9 @@ def set_task_class(
             "UPDATE tasks SET task_class = ? WHERE id = ?", (task_class, task_id)
         )
         _append_event(conn, task_id, "reclassified", {"task_class": task_class})
+        return True
+
+
 def set_model_override(
     conn: sqlite3.Connection,
     task_id: str,
