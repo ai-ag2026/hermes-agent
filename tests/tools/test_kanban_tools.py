@@ -704,7 +704,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     # runs in the KERNEL (kanban_db), so patch it there; the tool-layer
     # patches stay for the orchestrator-surface variant of the gate.
     def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
-        return "continue", "missing verification evidence", False
+        return "continue", "missing verification evidence", False, None
 
     monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
     monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)

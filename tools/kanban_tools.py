@@ -831,7 +831,11 @@ def _handle_complete(args: dict, **kw) -> str:
                 verdict = "done"
                 reason = ""
                 try:
-                    verdict, reason, _ = judge_goal(
+                    # judge_goal returns (verdict, reason, parse_failed, wait_directive).
+                    # A shorter unpack raises ValueError, which the defensive handler
+                    # below swallows -- silently DISABLING this gate (hotfix 24.07.2026,
+                    # Paargate-R5-Befund; Rehearsal-Branch fixt dasselbe 5-stellig).
+                    verdict, reason, _, _ = judge_goal(
                         goal=f"{task.title}\n\n{task.body or ''}".strip(),
                         last_response=(summary or result or "").strip(),
                     )
