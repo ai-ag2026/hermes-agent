@@ -726,6 +726,28 @@ def completion_artifacts_root(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "artifacts"
 
 
+def list_task_artifacts(conn: sqlite3.Connection, task_id: str) -> list[dict]:
+    """Durable completion artifacts recorded for a task, oldest first.
+
+    Until 2026-07-27 ``task_artifacts`` had writers and a scavenger but no
+    reader anywhere — the durable artifacts were the only reliable
+    worker→orchestrator handoff channel, yet tools and orchestrators could
+    neither list nor read them and had to guess paths from the storage
+    convention. This is the reader.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT id, producer_run_id, original_path, durable_path, "
+            "sha256, size, content_type, validated_at, retention_class "
+            "FROM task_artifacts WHERE task_id = ? ORDER BY id ASC",
+            (task_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Pre-artifact schema: no table, no artifacts.
+        return []
+    return [dict(r) for r in rows]
+
+
 def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
     """Return the per-task attachment directory ``<root>/<task_id>/``."""
     return attachments_root(board=board) / task_id

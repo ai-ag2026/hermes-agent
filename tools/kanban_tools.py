@@ -29,9 +29,11 @@ through the board.
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -523,10 +525,18 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
 
 
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
-    """Compact task shape for board-listing tools."""
+    """Compact task shape for board-listing tools.
+
+    Carries the outcome-bearing fields — trimmed ``result``, ``block_kind``
+    and the last review decision — so an orchestrator can read the state of
+    N cards from ONE listing. Without them the list said only "done"/"blocked"
+    and every card needed a full ``kanban_show`` (26–36k chars each) just to
+    learn what happened; that per-card round-trip is how orchestrators lost
+    the thread mid-mission (incident + audit 2026-07-27).
+    """
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
-    return {
+    summary = {
         "id": task.id,
         "title": task.title,
         "assignee": task.assignee,
@@ -548,30 +558,80 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "parent_count": len(parents),
         "child_count": len(children),
     }
+    result = (getattr(task, "result", None) or "").strip()
+    if result:
+        summary["result"] = result.splitlines()[0][:200]
+    if getattr(task, "block_kind", None):
+        summary["block_kind"] = task.block_kind
+    try:
+        row = conn.execute(
+            "SELECT json_extract(payload, '$.decision') FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_decided' "
+            "ORDER BY id DESC LIMIT 1",
+            (task.id,),
+        ).fetchone()
+        if row is not None and row[0]:
+            summary["last_review_decision"] = row[0]
+    except Exception:
+        pass
+    return summary
 
 
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 
+_SHOW_SECTIONS = ("comments", "events", "runs", "worker_context")
+# Compact-mode caps. The old unconditional dump (full body, ALL comments, 50
+# events with full payloads, ALL runs with metadata, plus worker_context) was
+# 26-36k chars per call; over the persistence threshold the generic result
+# store cut it into an unparseable fragment mid-JSON. The default answer must
+# fit an orchestrator's working set; anything deeper is one include= away.
+_SHOW_COMPACT_EVENTS = 5
+_SHOW_COMPACT_COMMENTS = 5
+_SHOW_COMPACT_RUNS = 1
+_SHOW_COMPACT_TEXT = 500
+
+
 def _handle_show(args: dict, **kw) -> str:
-    """Read a task's full state: task row, parents, children, comments,
-    runs (attempt history), and the last N events."""
+    """Read a task's state: compact by default, deep sections on request."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
+    include_raw = args.get("include")
+    compact = include_raw is None
+    if compact:
+        include = set(_SHOW_SECTIONS)
+    else:
+        if not isinstance(include_raw, (list, tuple)):
+            return tool_error("include must be an array of section names")
+        include = {str(s).strip().lower() for s in include_raw}
+        if "all" in include:
+            include = set(_SHOW_SECTIONS)
+            compact = False
+        else:
+            unknown = include - set(_SHOW_SECTIONS)
+            if unknown:
+                return tool_error(
+                    f"unknown include section(s) {sorted(unknown)}; "
+                    f"valid: {list(_SHOW_SECTIONS)} or ['all']"
+                )
     board = args.get("board")
+
+    def _trim(text, limit=_SHOW_COMPACT_TEXT):
+        if not compact or text is None:
+            return text
+        s = str(text)
+        return s if len(s) <= limit else s[:limit] + "…"
+
     try:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
-            comments = kb.list_comments(conn, tid)
-            events = kb.list_events(conn, tid)
-            runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
 
@@ -595,32 +655,59 @@ def _handle_show(args: dict, **kw) -> str:
                 return {
                     "id": r.id, "profile": r.profile,
                     "status": r.status, "outcome": r.outcome,
-                    "summary": r.summary, "error": r.error,
-                    "metadata": r.metadata,
+                    "summary": _trim(r.summary), "error": _trim(r.error),
+                    "metadata": None if compact else r.metadata,
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
-            return json.dumps({
+            payload: dict[str, Any] = {
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
-                "comments": [
-                    {"author": c.author, "body": c.body,
+            }
+            if "comments" in include:
+                comments = kb.list_comments(conn, tid)
+                total = len(comments)
+                if compact:
+                    comments = comments[-_SHOW_COMPACT_COMMENTS:]
+                payload["comments"] = [
+                    {"author": c.author, "body": _trim(c.body),
                      "created_at": c.created_at}
                     for c in comments
-                ],
-                "events": [
+                ]
+                payload["comments_total"] = total
+            if "events" in include:
+                events = kb.list_events(conn, tid)
+                total = len(events)
+                cap = _SHOW_COMPACT_EVENTS if compact else 50
+                payload["events"] = [
                     {"kind": e.kind, "payload": e.payload,
                      "created_at": e.created_at, "run_id": e.run_id}
-                    for e in events[-50:]   # cap; full log via CLI
-                ],
-                "runs": [_run_dict(r) for r in runs],
-                # Also surface the worker's own context block so the
-                # agent can include it directly if it wants. This is
-                # the same string build_worker_context returns to the
-                # dispatcher at spawn time.
-                "worker_context": kb.build_worker_context(conn, tid),
-            })
+                    for e in events[-cap:]
+                ]
+                payload["events_total"] = total
+            if "runs" in include:
+                runs = kb.list_runs(conn, tid)
+                total = len(runs)
+                if compact:
+                    runs = runs[-_SHOW_COMPACT_RUNS:]
+                payload["runs"] = [_run_dict(r) for r in runs]
+                payload["runs_total"] = total
+            if "worker_context" in include and not compact:
+                # The pre-formatted spawn-context block is large and mostly
+                # duplicates the sections above; it ships only on request.
+                payload["worker_context"] = kb.build_worker_context(conn, tid)
+            if compact:
+                payload["compact"] = True
+                payload["hint"] = (
+                    "Trimmed view (last "
+                    f"{_SHOW_COMPACT_EVENTS} events/"
+                    f"{_SHOW_COMPACT_COMMENTS} comments/"
+                    f"{_SHOW_COMPACT_RUNS} run). Pass include=['all'] or a "
+                    "subset of "
+                    f"{list(_SHOW_SECTIONS)} for full sections."
+                )
+            return json.dumps(payload, indent=1)
         finally:
             conn.close()
     except ValueError as e:
@@ -672,6 +759,9 @@ def _handle_list(args: dict, **kw) -> str:
             )
             truncated = len(rows) > limit
             tasks = rows[:limit]
+            # indent=1: if the generic result store ever has to preview this,
+            # it cuts at a newline boundary (an object edge) instead of raw-
+            # slicing one endless JSON line mid-field (incident 2026-07-27).
             return json.dumps({
                 "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
                 "count": len(tasks),
@@ -682,7 +772,7 @@ def _handle_list(args: dict, **kw) -> str:
                     if truncated and limit < KANBAN_LIST_MAX_LIMIT else None
                 ),
                 "promoted": promoted,
-            })
+            }, indent=1)
         finally:
             conn.close()
     except ValueError as e:
@@ -1251,6 +1341,14 @@ def _handle_attach(args: dict, **kw) -> str:
     attachments dir, and record the metadata row — all via
     ``kanban_db.store_attachment_bytes`` so the three surfaces stay in lockstep.
     """
+    # Required BEFORE the ownership check: a delegated subagent runs with a
+    # stripped env, which the ownership helper reads as "orchestrator, no
+    # restriction" — without this reject a subagent could attach bytes to ANY
+    # card (documented invariant in _enforce_worker_task_ownership; gap found
+    # in audit 2026-07-27).
+    guard = _reject_if_delegated_subagent("kanban_attach")
+    if guard:
+        return guard
     from hermes_cli import kanban_db as kb
 
     tid = _default_task_id(args.get("task_id"))
@@ -1370,6 +1468,11 @@ def _handle_attach_url(args: dict, **kw) -> str:
     and stores it as a real attachment. Useful when the agent has a link
     rather than the bytes. Only http/https URLs are accepted.
     """
+    # Same reasoning as kanban_attach — and stricter here, because this
+    # variant performs a server-side download on the agent's behalf.
+    guard = _reject_if_delegated_subagent("kanban_attach_url")
+    if guard:
+        return guard
     from hermes_cli import kanban_db as kb
 
     tid = _default_task_id(args.get("task_id"))
@@ -1452,7 +1555,7 @@ def _handle_attachments(args: dict, **kw) -> str:
                     }
                     for a in atts
                 ],
-            })
+            }, indent=1)
         finally:
             conn.close()
     except ValueError as e:
@@ -1462,12 +1565,141 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(f"kanban_attachments: {e}")
 
 
+_ARTIFACT_READ_DEFAULT_CHARS = 20_000
+_ARTIFACT_READ_MAX_CHARS = 60_000
+
+
+def _handle_artifacts(args: dict, **kw) -> str:
+    """List a task's durable completion artifacts; optionally read one.
+
+    Closes the biggest orchestration gap from the 2026-07-27 audit: durable
+    artifacts are the reliable worker→orchestrator handoff channel, but the
+    tool surface could neither list nor read them — callers had to guess
+    storage paths and use read_file. Listing returns the recorded manifest
+    (path, sha256, size); ``read`` returns an artifact's text content with
+    integrity verdict, so a lost or tampered file is reported instead of
+    silently served.
+    """
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    board = args.get("board")
+    read_id = args.get("read")
+    max_chars = args.get("max_chars")
+    try:
+        max_chars = int(max_chars) if max_chars is not None else _ARTIFACT_READ_DEFAULT_CHARS
+    except (TypeError, ValueError):
+        return tool_error("max_chars must be an integer")
+    max_chars = max(1, min(max_chars, _ARTIFACT_READ_MAX_CHARS))
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            if kb.get_task(conn, tid) is None:
+                return tool_error(f"task {tid} not found")
+            artifacts = kb.list_task_artifacts(conn, tid)
+            listing = [
+                {
+                    "id": a["id"],
+                    "name": Path(a["durable_path"]).name,
+                    "durable_path": a["durable_path"],
+                    "sha256": a["sha256"],
+                    "size": a["size"],
+                    "content_type": a["content_type"],
+                    "producer_run_id": a["producer_run_id"],
+                }
+                for a in artifacts
+            ]
+            if read_id is None:
+                return json.dumps({
+                    "ok": True,
+                    "task_id": tid,
+                    "artifacts": listing,
+                    "hint": (
+                        "Pass read=<id> to fetch an artifact's content "
+                        "(integrity-checked against the recorded sha256)."
+                    ) if listing else None,
+                }, indent=1)
+
+            try:
+                read_id = int(read_id)
+            except (TypeError, ValueError):
+                return tool_error("read must be an artifact id from the listing")
+            match = next((a for a in artifacts if int(a["id"]) == read_id), None)
+            if match is None:
+                return tool_error(
+                    f"artifact {read_id} not found on task {tid}; call "
+                    "kanban_artifacts without 'read' to list valid ids"
+                )
+            path = Path(match["durable_path"])
+            # Defense in depth: durable paths are written by the trusted
+            # completion pipeline and always live under the board's artifact
+            # root. A row edited to point elsewhere (e.g. at ~/.hermes/.env)
+            # must not turn this reader into an arbitrary-file oracle that
+            # bypasses the live-config path guard.
+            try:
+                root = Path(kb.completion_artifacts_root(board)).resolve()
+                inside = str(path.resolve()).startswith(str(root) + os.sep)
+            except Exception:
+                inside = False
+            if not inside:
+                return tool_error(
+                    f"artifact {read_id} path is outside the board's durable "
+                    "artifact store; refusing to read"
+                )
+            if not path.is_file():
+                return json.dumps({
+                    "ok": False,
+                    "task_id": tid,
+                    "artifact_id": read_id,
+                    "integrity": "missing",
+                    "error": (
+                        "durable file is gone from disk — the recorded bytes "
+                        "cannot be recovered from the kanban store"
+                    ),
+                }, indent=1)
+            data = path.read_bytes()
+            digest = hashlib.sha256(data).hexdigest()
+            integrity = "ok" if digest == match["sha256"] else "sha256_mismatch"
+            text = data.decode("utf-8", errors="replace")
+            truncated = len(text) > max_chars
+            return json.dumps({
+                "ok": True,
+                "task_id": tid,
+                "artifact_id": read_id,
+                "name": Path(match["durable_path"]).name,
+                "integrity": integrity,
+                "size": match["size"],
+                "truncated": truncated,
+                "content": text[:max_chars],
+                "next_max_chars": (
+                    min(max_chars * 2, _ARTIFACT_READ_MAX_CHARS)
+                    if truncated and max_chars < _ARTIFACT_READ_MAX_CHARS
+                    else None
+                ),
+            }, indent=1)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_artifacts: {e}")
+    except Exception as e:
+        logger.exception("kanban_artifacts failed")
+        return tool_error(f"kanban_artifacts: {e}")
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
     ``parents`` can be a list of task ids; dependency-gated promotion
     works as usual.
     """
+    # Board mutation stays with workers/orchestrators; a delegated subagent
+    # hands results back to its parent, it does not spawn board work itself
+    # (same gap family as attach/link, audit 2026-07-27).
+    guard = _reject_if_delegated_subagent("kanban_create")
+    if guard:
+        return guard
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -1653,9 +1885,11 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     live consumer, False otherwise (no session context, config gate disabled,
     no consumer for the platform, or best-effort failure). The caller surfaces
     this in the ``subscribed`` field of the kanban_create response so an
-    orchestrator can decide whether to fall back to an explicit
-    ``kanban_notify-subscribe`` or to polling — which is why the value must
-    mean "someone will deliver", not merely "a row was written".
+    orchestrator can decide whether to fall back to polling (kanban_list /
+    kanban_show; subscription management exists only on the CLI as
+    ``hermes kanban notify-subscribe``, there is NO tool for it) — which is
+    why the value must mean "someone will deliver", not merely "a row was
+    written".
 
     Gated by ``kanban.auto_subscribe_on_create`` in config.yaml (default
     True). Disable to mirror pre-feature behaviour, e.g. when the
@@ -1816,10 +2050,26 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
+    guard = _reject_if_delegated_subagent("kanban_link")
+    if guard:
+        return guard
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
+    # Worker scope: a dispatcher-spawned worker may rewire the dependency
+    # graph only where its own task is one endpoint (linking its card under a
+    # parent, or a follow-up card under its own). Mutating edges between two
+    # FOREIGN tasks can promote/hold arbitrary cards — the graph equivalent
+    # of the foreign-mutation problem _enforce_worker_task_ownership exists
+    # for. Orchestrators (no HERMES_KANBAN_TASK) stay unrestricted.
+    env_tid = _board_env("HERMES_KANBAN_TASK")
+    if env_tid and env_tid not in (parent_id, child_id):
+        return tool_error(
+            f"worker is scoped to task {env_tid}; refusing to link foreign "
+            f"tasks {parent_id} -> {child_id}. Link edges that include your "
+            "own task, or hand off via kanban_comment."
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1866,12 +2116,13 @@ def _board_schema_prop() -> dict[str, str]:
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
-        "Read a task's full state — title, body, assignee, parent task "
-        "handoffs, your prior attempts on this task if any, comments, "
-        "and recent events. Use this to (re)orient yourself before "
-        "starting work, especially on retries. The response includes a "
-        "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning."
+        "Read a task's state — title, body, result, assignee, parent/child "
+        "ids, recent events, comments and the latest run. COMPACT by "
+        "default (last 5 events, 5 comments, 1 run, long texts trimmed) so "
+        "the answer fits your working set; totals and a hint tell you when "
+        "more exists. Pass include=['all'] (or a subset of comments/events/"
+        "runs/worker_context) for full sections — 'worker_context' is the "
+        "pre-formatted spawn-context block, only shipped on request."
     ),
     "parameters": {
         "type": "object",
@@ -1879,6 +2130,53 @@ KANBAN_SHOW_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "include": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "all", "comments", "events", "runs", "worker_context",
+                    ],
+                },
+                "description": (
+                    "Sections to include IN FULL (uncapped). Omit for the "
+                    "compact default view."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
+KANBAN_ARTIFACTS_SCHEMA = {
+    "name": "kanban_artifacts",
+    "description": (
+        "List a task's durable completion artifacts (the validated files a "
+        "worker promoted on completion — the reliable handoff channel), or "
+        "read one with read=<id>. Reading verifies the recorded sha256 and "
+        "reports integrity: ok / sha256_mismatch / missing, so you never "
+        "act on silently lost or altered evidence. Content is returned as "
+        "text (max_chars, default 20000)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "read": {
+                "type": "integer",
+                "description": "Artifact id from the listing to read.",
+            },
+            "max_chars": {
+                "type": "integer",
+                "description": (
+                    "Character budget for read content (default 20000, "
+                    "max 60000). Truncation is flagged with next_max_chars."
+                ),
             },
             "board": _board_schema_prop(),
         },
@@ -1892,11 +2190,13 @@ KANBAN_LIST_SCHEMA = {
         "List Kanban task summaries so an orchestrator profile can discover "
         "work to route. Supports the same core filters as the CLI: assignee, "
         "status, tenant, include_archived, and limit. Returns compact rows "
-        "with ids, title, status, assignee, priority, parent/child ids, and "
-        "counts. Bounded to 50 rows by default, 200 max, with truncation "
-        "metadata. Also recomputes ready tasks before listing, matching the "
-        "CLI. Orchestrator-only — dispatcher-spawned task workers never see "
-        "this tool."
+        "with ids, title, status, assignee, priority, parent/child ids, "
+        "counts — plus the outcome fields (trimmed result, block_kind, "
+        "last_review_decision), so one listing tells you what happened to N "
+        "cards without per-card kanban_show calls. Bounded to 50 rows by "
+        "default, 200 max, with truncation metadata. Also recomputes ready "
+        "tasks before listing, matching the CLI. Orchestrator-only — "
+        "dispatcher-spawned task workers never see this tool."
     ),
     "parameters": {
         "type": "object",
@@ -2609,6 +2909,15 @@ registry.register(
     schema=KANBAN_LIST_SCHEMA,
     handler=_handle_list,
     check_fn=_check_kanban_orchestrator_mode,
+    emoji="📋",
+)
+
+registry.register(
+    name="kanban_artifacts",
+    toolset="kanban",
+    schema=KANBAN_ARTIFACTS_SCHEMA,
+    handler=_handle_artifacts,
+    check_fn=_check_kanban_mode,
     emoji="📋",
 )
 

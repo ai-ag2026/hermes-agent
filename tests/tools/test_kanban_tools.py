@@ -193,8 +193,16 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "task" in d
     assert d["task"]["id"] == worker_env
     assert d["task"]["status"] == "running"
-    assert "worker_context" in d
-    assert "runs" in d
+    # Compact default (audit 2026-07-27): trimmed sections with totals and a
+    # hint; the bulky worker_context block ships only via include.
+    assert d["compact"] is True
+    assert "hint" in d
+    assert "worker_context" not in d
+    assert "runs" in d and "runs_total" in d
+
+    full = json.loads(kt._handle_show({"include": ["all"]}))
+    assert "worker_context" in full
+    assert "compact" not in full
 
 
 def test_show_explicit_task_id(worker_env):
@@ -345,7 +353,13 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     })
     assert json.loads(complete_out)["ok"] is True
 
-    show_out = kt._handle_show({"task_id": worker_env})
+    # Run metadata is deep detail: the compact default omits it (None), the
+    # full view carries it — downstream agents ask for what they need.
+    compact = json.loads(kt._handle_show({"task_id": worker_env}))
+    assert compact["task"]["status"] == "done"
+    assert compact["runs"][-1]["metadata"] is None
+
+    show_out = kt._handle_show({"task_id": worker_env, "include": ["runs"]})
     shown = json.loads(show_out)
     assert shown["task"]["status"] == "done"
     assert shown["runs"][-1]["summary"] == "finished with structured evidence"
@@ -1358,7 +1372,41 @@ def test_create_rejects_non_list_skills(worker_env):
     assert json.loads(out).get("error")
 
 
-def test_link_happy_path(worker_env):
+def test_link_happy_path_worker_own_task_endpoint(worker_env):
+    """A worker may link edges that include its OWN task."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        a = kb.create_task(conn, title="A", assignee="x")
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_link({"parent_id": worker_env, "child_id": a})
+    d = json.loads(out)
+    assert d["ok"] is True
+
+
+def test_link_rejects_foreign_edge_for_worker(worker_env):
+    """A worker rewiring two FOREIGN tasks is the graph equivalent of the
+    foreign-mutation problem — refused since audit 2026-07-27."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        a = kb.create_task(conn, title="A", assignee="x")
+        b = kb.create_task(conn, title="B", assignee="x")
+    finally:
+        conn.close()
+    from tools import kanban_tools as kt
+    out = kt._handle_link({"parent_id": a, "child_id": b})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "scoped to task" in d.get("error", "")
+
+
+def test_link_happy_path_orchestrator(worker_env, monkeypatch):
+    """Orchestrators (no HERMES_KANBAN_TASK) link foreign tasks freely."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -3311,3 +3359,140 @@ def test_create_tool_passes_task_class_and_max_retries(monkeypatch, worker_env):
         assert int(row["max_retries"]) == 4
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Welle 4 (Audit 2026-07-27): outcome fields in list, artifacts reader,
+# subagent guard gaps
+# ---------------------------------------------------------------------------
+
+def test_list_carries_outcome_fields(worker_env, monkeypatch):
+    """One listing must answer "what happened?" — trimmed result, block_kind
+    and the last review decision ride along, so orchestrators don't need a
+    full kanban_show per card."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    from hermes_cli import kanban_db as kb
+    import json as _json
+    conn = kb.connect()
+    try:
+        done_t = kb.create_task(conn, title="done card", assignee="x")
+        kb.claim_task(conn, done_t)
+        assert kb.complete_task(
+            conn, done_t, summary="ok",
+            result="Erste Ergebniszeile\nDetails folgen",
+        ) is True
+        blocked_t = kb.create_task(conn, title="blocked card", assignee="x")
+        kb.claim_task(conn, blocked_t)
+        kb.block_task(conn, blocked_t, reason="needs human", kind="needs_input")
+        reviewed_t = kb.create_task(conn, title="reviewed card", assignee="x")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'review_decided', ?, strftime('%s','now'))",
+                (reviewed_t, _json.dumps({"decision": "NEEDS_REPAIR"})),
+            )
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    rows = json.loads(kt._handle_list({"limit": 50}))["tasks"]
+    by_id = {r["id"]: r for r in rows}
+    assert by_id[done_t]["result"] == "Erste Ergebniszeile"
+    assert by_id[blocked_t]["block_kind"] == "needs_input"
+    assert by_id[reviewed_t]["last_review_decision"] == "NEEDS_REPAIR"
+
+
+def _plant_artifact(kb, tid, *, content=b"artifact body", sha=None):
+    import hashlib as _hashlib
+    root = kb.completion_artifacts_root(None)
+    dest = root / tid / "0" / "test"
+    dest.mkdir(parents=True, exist_ok=True)
+    path = dest / "report.md"
+    path.write_bytes(content)
+    digest = sha or _hashlib.sha256(content).hexdigest()
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            cur = conn.execute(
+                "INSERT INTO task_artifacts (task_id, producer_run_id, "
+                "original_path, durable_path, sha256, size, content_type, "
+                "validated_at, retention_class) "
+                "VALUES (?, 0, ?, ?, ?, ?, 'text/markdown', "
+                "strftime('%s','now'), 'default')",
+                (tid, str(path), str(path), digest, len(content)),
+            )
+            return int(cur.lastrowid), path
+    finally:
+        conn.close()
+
+
+def test_artifacts_list_and_read_with_integrity(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    art_id, _path = _plant_artifact(kb, worker_env, content=b"# Report\nAll good.")
+
+    listing = json.loads(kt._handle_artifacts({"task_id": worker_env}))
+    assert listing["ok"] is True
+    assert [a["id"] for a in listing["artifacts"]] == [art_id]
+    assert listing["artifacts"][0]["name"] == "report.md"
+
+    read = json.loads(kt._handle_artifacts({"task_id": worker_env, "read": art_id}))
+    assert read["ok"] is True
+    assert read["integrity"] == "ok"
+    assert "All good." in read["content"]
+
+
+def test_artifacts_read_reports_sha_mismatch_and_missing(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    art_id, path = _plant_artifact(
+        kb, worker_env, content=b"tampered later", sha="0" * 64,
+    )
+    read = json.loads(kt._handle_artifacts({"task_id": worker_env, "read": art_id}))
+    assert read["integrity"] == "sha256_mismatch"
+
+    path.unlink()
+    read = json.loads(kt._handle_artifacts({"task_id": worker_env, "read": art_id}))
+    assert read["ok"] is False
+    assert read["integrity"] == "missing"
+
+
+def test_artifacts_read_refuses_paths_outside_store(worker_env, tmp_path):
+    """A forged durable_path must not turn the reader into a file oracle."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    secret = tmp_path / "secret.txt"
+    secret.write_text("credentials")
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            cur = conn.execute(
+                "INSERT INTO task_artifacts (task_id, producer_run_id, "
+                "original_path, durable_path, sha256, size, content_type, "
+                "validated_at, retention_class) "
+                "VALUES (?, 0, ?, ?, ?, ?, 'text/plain', "
+                "strftime('%s','now'), 'default')",
+                (worker_env, str(secret), str(secret), "f" * 64, 11),
+            )
+            forged = int(cur.lastrowid)
+    finally:
+        conn.close()
+    read = json.loads(kt._handle_artifacts({"task_id": worker_env, "read": forged}))
+    assert read.get("ok") is not True
+    assert "outside" in read.get("error", "")
+
+
+def test_delegated_subagent_cannot_create_link_or_attach(worker_env, delegated_subagent_ctx):
+    from tools import kanban_tools as kt
+    for out in (
+        kt._handle_create({"title": "sneaky card"}),
+        kt._handle_link({"parent_id": worker_env, "child_id": worker_env}),
+        kt._handle_attach({"task_id": worker_env, "filename": "x",
+                           "content_base64": "aGk="}),
+        kt._handle_attach_url({"task_id": worker_env,
+                               "url": "https://example.com/x"}),
+    ):
+        d = json.loads(out)
+        assert d.get("ok") is not True
+        assert "delegated subagent" in d.get("error", "")
