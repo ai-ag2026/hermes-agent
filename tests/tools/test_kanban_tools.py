@@ -2264,11 +2264,12 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["user_id"] == "user-9"
 
 
-def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
-    """TUI / desktop sessions don't have a platform/chat_id (single
-    local channel), but the parent process exports HERMES_SESSION_KEY.
-    We should still auto-subscribe, with platform='tui' and
-    chat_id=<key>."""
+def test_create_does_not_subscribe_tui_session_without_consumer(monkeypatch, worker_env):
+    """TUI / desktop sessions derive platform='tui' via HERMES_SESSION_KEY,
+    but NO TUI notify consumer exists — the old behaviour wrote a row nobody
+    would ever drain and reported subscribed=True, so orchestrators skipped
+    their polling fallback (the 2026-07-27 webui incident, same mechanism).
+    The honest contract: subscribed=False and no dead-letter row."""
     from tools import kanban_tools as kt
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
@@ -2283,13 +2284,52 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True
-    new_tid = d["task_id"]
+    assert d["subscribed"] is False, d
+    assert _list_subs_for_task(d["task_id"]) == []
+
+
+def test_create_subscribes_webui_session(monkeypatch, worker_env):
+    """WebUI sessions (platform='webui', chat_id=session id) are served by
+    the WebUI's in-process poller, so the subscription is real and
+    subscribed=True is the truth."""
+    from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "webui")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "74513eaa6e33")
+    monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
+
+    out = kt._handle_create({
+        "title": "auto-sub webui",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
     assert d["subscribed"] is True, d
 
-    subs = _sub_index(_list_subs_for_task(new_tid))
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
     assert len(subs) == 1
-    assert subs[0]["platform"] == "tui"
-    assert subs[0]["chat_id"] == "tui-session-abc"
+    assert subs[0]["platform"] == "webui"
+    assert subs[0]["chat_id"] == "74513eaa6e33"
+
+
+def test_create_honors_declared_extra_consumer_platform(monkeypatch, worker_env):
+    """An out-of-tree consumer can declare its platform via
+    HERMES_KANBAN_NOTIFY_CONSUMER_PLATFORMS without a code change; undeclared
+    platforms without a Platform-enum consumer stay unsubscribed."""
+    from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "myconsumer")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chan-1")
+
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_CONSUMER_PLATFORMS", "webui,myconsumer")
+    out = kt._handle_create({"title": "declared consumer", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["subscribed"] is True, d
+
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_CONSUMER_PLATFORMS", "webui")
+    out = kt._handle_create({"title": "undeclared consumer", "assignee": "peer"})
+    d = json.loads(out)
+    assert d["subscribed"] is False, d
+    assert _list_subs_for_task(d["task_id"]) == []
 
 
 def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):

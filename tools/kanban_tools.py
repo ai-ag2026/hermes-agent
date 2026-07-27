@@ -1604,14 +1604,54 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
+def _notify_platform_has_consumer(platform: str) -> bool:
+    """True only if some notifier actually drains subscriptions for ``platform``.
+
+    ``subscribed: true`` is a promise that a consumer will deliver the task's
+    terminal events. Writing a row for a platform nobody polls keeps that
+    promise for nobody: the gateway notifier skips unknown platforms *before*
+    the event claim, so the cursor stays at 0 forever and the orchestrator —
+    trusting ``subscribed: true`` — never falls back to polling. That exact
+    gap left 155 dead ``webui`` subscriptions with 372 undelivered events
+    (incident 2026-07-27).
+
+    Known consumers:
+    - the gateway notifier serves every platform the ``Platform`` enum
+      resolves (built-ins, bundled plugins, runtime-registered plugins);
+    - ``webui`` is served by the WebUI's in-process poller
+      (hermes-webui ``api/kanban_notify_poller.py``);
+    - additional out-of-tree consumers can declare themselves via
+      ``HERMES_KANBAN_NOTIFY_CONSUMER_PLATFORMS`` (comma-separated), so a
+      custom poller does not need a code change here.
+
+    ``tui`` deliberately resolves to False: no TUI consumer exists (the
+    docstring that used to claim ``tui_gateway/server.py`` polls these rows
+    was wrong — it never did).
+    """
+    p = (platform or "").strip().lower()
+    if not p:
+        return False
+    extra = os.environ.get("HERMES_KANBAN_NOTIFY_CONSUMER_PLATFORMS", "webui")
+    if p in {tok.strip().lower() for tok in extra.split(",") if tok.strip()}:
+        return True
+    try:
+        from gateway.config import Platform
+        Platform(p)
+        return True
+    except Exception:
+        return False
+
+
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
-    Returns True if a subscription row was written, False otherwise (no
-    session context, config gate disabled, or best-effort failure). The
-    caller surfaces this in the ``subscribed`` field of the kanban_create
-    response so an orchestrator can decide whether to fall back to an
-    explicit ``kanban_notify-subscribe`` or to polling.
+    Returns True if a subscription row was written for a platform that has a
+    live consumer, False otherwise (no session context, config gate disabled,
+    no consumer for the platform, or best-effort failure). The caller surfaces
+    this in the ``subscribed`` field of the kanban_create response so an
+    orchestrator can decide whether to fall back to an explicit
+    ``kanban_notify-subscribe`` or to polling — which is why the value must
+    mean "someone will deliver", not merely "a row was written".
 
     Gated by ``kanban.auto_subscribe_on_create`` in config.yaml (default
     True). Disable to mirror pre-feature behaviour, e.g. when the
@@ -1622,17 +1662,19 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
     - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``
       and ``HERMES_SESSION_CHAT_ID`` are set in ContextVars by the
-      messaging gateway before agent dispatch. The notification poller
+      messaging gateway before agent dispatch. The gateway notifier
       already keys off these, so we just register a row.
 
-    - **TUI** (herm desktop / herm TUI): the platform/chat_id ContextVars
-      are intentionally cleared (TUI is a single-channel local UI, not
-      a multi-tenant chat surface), but the agent subprocess inherits
-      ``HERMES_SESSION_KEY`` from the parent session. We subscribe with
-      ``platform="tui"`` and ``chat_id=<key>``; the TUI notification
-      poller (``tui_gateway/server.py``) reads ``kanban_notify_subs``
-      for these rows and posts the completion message into the running
-      session.
+    - **WebUI**: sessions run with ``HERMES_SESSION_PLATFORM=webui`` and the
+      session id as chat_id; the WebUI's in-process poller
+      (hermes-webui ``api/kanban_notify_poller.py``) drains these rows.
+
+    - **TUI** (herm desktop / herm TUI): the platform/chat_id ContextVars are
+      intentionally cleared, but ``HERMES_SESSION_KEY`` identifies the parent
+      session, so the fallback below still derives ``platform="tui"``. There
+      is currently NO TUI consumer, so the consumer gate returns False and no
+      row is written; the fallback is kept so a future TUI poller only has to
+      add its platform to the consumer set.
 
     - **CLI / cron / test / unattached**: no persistent delivery channel,
       no-op.
@@ -1660,9 +1702,9 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         if not platform or not chat_id:
             # TUI / desktop fallback: platform/chat_id ContextVars are
             # cleared for TUI sessions, but the parent process exports
-            # HERMES_SESSION_KEY into the subprocess env. Treat that
-            # as a "tui" subscription so the TUI notification poller
-            # (tui_gateway/server.py) can pick it up.
+            # HERMES_SESSION_KEY into the subprocess env. Derive a "tui"
+            # subscription target; whether a row is actually written is
+            # decided by the consumer gate below.
             #
             # HERMES_SESSION_ID is intentionally NOT a fallback here:
             # it is set by ACP / the agent subprocess for telemetry
@@ -1679,6 +1721,15 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 return False  # CLI / cron / test — no persistent channel
             platform = "tui"
             chat_id = session_key
+        if not _notify_platform_has_consumer(platform):
+            # Honest answer instead of a dead-letter row: without a consumer
+            # the subscription would sit at cursor 0 forever while the caller
+            # believes delivery is arranged.
+            logger.info(
+                "_maybe_auto_subscribe: no notify consumer for platform=%r; "
+                "not subscribing (caller should poll)", platform,
+            )
+            return False
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         notifier_profile = (
