@@ -3537,3 +3537,25 @@ def test_delegated_subagent_cannot_create_link_or_attach(worker_env, delegated_s
         d = json.loads(out)
         assert d.get("ok") is not True
         assert "delegated subagent" in d.get("error", "")
+
+
+def test_consumer_check_fails_closed_on_config_error(monkeypatch, worker_env):
+    """An unreadable gateway config is not evidence of a consumer.
+
+    Returning True here reopened the original false delivery promise through
+    a side door (TARS re-review 2026-07-27).
+    """
+    from tools import kanban_tools as kt
+    import gateway.config as gwcfg
+
+    def broken_config():
+        raise RuntimeError("gateway config unreadable")
+    monkeypatch.setattr(gwcfg, "load_gateway_config", broken_config)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-7")
+
+    assert kt._notify_platform_has_consumer("telegram") is False
+    d = json.loads(kt._handle_create({"title": "broken cfg", "assignee": "peer"}))
+    assert d["ok"] is True
+    assert d["subscribed"] is False, d
+    assert _list_subs_for_task(d["task_id"]) == []

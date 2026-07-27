@@ -426,3 +426,44 @@ def test_gc_protection_spans_all_boards(kanban_home):
     ))
     assert rc == 0
     assert (root / host).exists(), "cross-board last-copy reference must protect"
+
+
+def test_gc_protection_ignores_db_env_override(kanban_home, monkeypatch):
+    """HERMES_KANBAN_DB must not collapse the cross-board protection set.
+
+    kanban_db_path() honours the override regardless of the board argument,
+    so resolving board DBs through it made every slug dedupe to one file and
+    silently dropped the other boards' last-copy references. Dispatcher
+    workers carry this variable, so it is the normal case (TARS re-review).
+    """
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    root = kb.workspaces_root()
+    with kb.connect() as conn:
+        host = kb.create_task(conn, title="hosts file", assignee="w")
+        ws = _plant_done_ws(conn, root, host)
+
+    kb.create_board("other")
+    with kb.connect(board="other") as other:
+        owner = kb.create_task(other, title="owns artifact", assignee="w")
+        with kb.write_txn(other):
+            other.execute(
+                "INSERT INTO task_artifacts (task_id, producer_run_id, "
+                "original_path, durable_path, sha256, size, content_type, "
+                "validated_at, retention_class) VALUES (?, 0, ?, ?, 'q', 8, "
+                "'text/markdown', strftime('%s','now'), 'default')",
+                (owner, str(ws / "evidence.md"), str(kanban_home / "gone.md")),
+            )
+
+    # Pin the DEFAULT board's DB via the override, exactly like a worker env.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_home() / "kanban.db"))
+
+    rc = kanban_cli._cmd_gc(argparse.Namespace(
+        event_retention_days=30, log_retention_days=30,
+        workspace_retention_days=7,
+    ))
+    assert rc == 0
+    assert (root / host).exists(), (
+        "the other board's last-copy reference must still protect this "
+        "workspace even with HERMES_KANBAN_DB pinned"
+    )

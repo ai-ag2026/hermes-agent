@@ -443,11 +443,23 @@ def pytest_configure(config):
     cache_file = cache_dir / f"gw-adapter-guard-{fp}"
     lock_file = cache_dir / f".gw-adapter-guard-{fp}.lock"
 
+    cache_enabled = True
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
-        # Cache is a speed-up, never a requirement. A read-only checkout must
-        # not abort collection (see _gateway_guard_cache_dir).
+        # Cache is a speed-up, never a requirement — but skipping the SCAN
+        # would silently disable the anti-pattern guard entirely (regression
+        # found in TARS re-review 2026-07-27). Run uncached instead.
+        cache_enabled = False
+
+    if not cache_enabled:
+        # Uncached scan: same verdict, just no memoisation across processes.
+        violations = _run_adapter_antipattern_scan()
+        if violations:
+            raise pytest.UsageError(
+                "Plugin-adapter-import anti-pattern detected in gateway tests:\n"
+                + "\n".join(violations) + "\n\n" + _GUARD_HINT
+            )
         return
 
     # Evict stale cache entries from previous fingerprints (best-effort).

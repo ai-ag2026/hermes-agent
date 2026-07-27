@@ -1973,7 +1973,16 @@ def _notify_platform_has_consumer(platform: str) -> bool:
     try:
         pcfg = load_gateway_config().platforms.get(plat)
     except Exception:
-        return True  # cannot read the gateway config → keep the legacy answer
+        # FAIL CLOSED: an unreadable/broken gateway config is not evidence of
+        # a consumer. Answering True here re-opened the original false
+        # delivery promise through a side door (TARS re-review 2026-07-27).
+        # subscribed=false costs a polling fallback; subscribed=true without a
+        # consumer costs the result.
+        logger.warning(
+            "kanban notify: cannot read the gateway config to verify a "
+            "consumer for platform %r — reporting no consumer", p,
+        )
+        return False
     if pcfg is None:
         return False
     return bool(getattr(pcfg, "enabled", True))

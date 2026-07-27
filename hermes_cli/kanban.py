@@ -3536,15 +3536,29 @@ def _all_board_last_copy_paths() -> list:
     seen_dbs: set[str] = set()
     for meta in boards or []:
         slug = (meta.get("slug") if isinstance(meta, dict) else None) or "default"
+        # Resolve the board DB STRUCTURALLY. kanban_db_path()/connect(board=…)
+        # honour HERMES_KANBAN_DB, which pins ONE file regardless of the slug —
+        # every board would dedupe to the same database and the other boards'
+        # protection references would silently vanish. Dispatcher-spawned
+        # workers carry exactly that variable, so this is the normal case, not
+        # an exotic one (TARS re-review 2026-07-27).
         try:
-            db_path = str(Path(kb.kanban_db_path(board=slug)).resolve())
-        except Exception:
-            db_path = slug
-        if db_path in seen_dbs:
+            if slug == kb.DEFAULT_BOARD:
+                db_file = Path(kb.kanban_home()) / "kanban.db"
+            else:
+                db_file = Path(kb.board_dir(slug)) / "kanban.db"
+            db_key = str(db_file.resolve())
+        except Exception as exc:
+            raise ProtectionUnavailable(
+                f"cannot resolve the database of board {slug!r}: {exc}"
+            ) from exc
+        if db_key in seen_dbs:
             continue
-        seen_dbs.add(db_path)
+        seen_dbs.add(db_key)
+        if not db_file.exists():
+            continue  # board metadata without a database yet
         try:
-            with kb.connect_closing(board=slug) as board_conn:
+            with kb.connect_closing(db_path=db_file) as board_conn:
                 protected.extend(_last_copy_artifact_paths(board_conn))
         except ProtectionUnavailable:
             raise
