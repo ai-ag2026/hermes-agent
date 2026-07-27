@@ -11,12 +11,14 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import math
 import os
 import re
 import sqlite3
+import threading
 import time
 from urllib.parse import quote
 from dataclasses import dataclass, replace
@@ -2502,6 +2504,61 @@ class GatewayKanbanWatchersMixin:
             maintenance_interval = 120.0
         maintenance_interval = max(maintenance_interval, 10.0)
 
+        # Maintenance runs on a DEDICATED single-worker executor, not the
+        # default to_thread pool, so shutdown can actually wait for it.
+        # ``task.cancel()`` unblocks the awaiting coroutine but does NOT stop
+        # the OS thread: an aux-LLM round keeps mutating the board for up to
+        # 180 s afterwards. Releasing the singleton dispatcher lock in that
+        # window let a fresh gateway take over while the old maintenance was
+        # still writing (TARS review 2026-07-27, P1).
+        maintenance_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="kanban-maintenance",
+        )
+        maintenance_stop = threading.Event()
+        maintenance_inflight: "list[concurrent.futures.Future]" = []
+
+        async def _run_maintenance(fn, *fn_args):
+            """Submit to the dedicated executor, keeping the future reachable."""
+            future = maintenance_executor.submit(fn, *fn_args)
+            maintenance_inflight.append(future)
+            try:
+                return await asyncio.wrap_future(future)
+            finally:
+                try:
+                    maintenance_inflight.remove(future)
+                except ValueError:
+                    pass
+
+        def _drain_maintenance(timeout: float) -> bool:
+            """Signal stop and wait for in-flight maintenance. True if idle."""
+            maintenance_stop.set()
+            pending = [f for f in list(maintenance_inflight) if not f.done()]
+            if not pending:
+                return True
+            _, not_done = concurrent.futures.wait(pending, timeout=timeout)
+            return not not_done
+
+        def _finish_dispatcher(drain_timeout: float) -> None:
+            """Release the singleton lock ONLY once maintenance is quiet.
+
+            If a round is still in flight we deliberately keep holding the
+            lock: the flock is dropped by the kernel when this process exits,
+            so worst case we block a same-process watcher restart — far
+            better than two gateways mutating one board concurrently.
+            """
+            drained = _drain_maintenance(drain_timeout)
+            maintenance_executor.shutdown(wait=False)
+            if not drained:
+                logger.warning(
+                    "kanban maintenance still in flight after %.0fs — keeping "
+                    "the dispatcher singleton lock (released on process exit) "
+                    "so no second dispatcher can take over mid-write",
+                    drain_timeout,
+                )
+                return
+            _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+            self._kanban_dispatcher_lock_handle = None
+
         async def _maintenance_loop() -> None:
             # pm-supervisor + auto-decompose call the aux LLM synchronously
             # (timeouts 120 s / 180 s). Inline in the dispatch tick they ran
@@ -2512,16 +2569,16 @@ class GatewayKanbanWatchersMixin:
             # Lives strictly inside the dispatcher's singleton-lock scope, so
             # concurrent gateways cannot double-decompose. Toggles are
             # re-read every round (#49638) exactly as before.
-            while self._running:
+            while self._running and not maintenance_stop.is_set():
                 try:
                     _pm_enabled, _pm_per_tick, _pm_max_attempts = _read_pm_supervisor_settings()
-                    if _pm_enabled:
-                        await asyncio.to_thread(
+                    if _pm_enabled and not maintenance_stop.is_set():
+                        await _run_maintenance(
                             _pm_supervisor_tick_once, _pm_per_tick, _pm_max_attempts,
                         )
                     _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
-                    if _ad_enabled:
-                        await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
+                    if _ad_enabled and not maintenance_stop.is_set():
+                        await _run_maintenance(_auto_decompose_tick, _ad_per_tick)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -2529,7 +2586,11 @@ class GatewayKanbanWatchersMixin:
                         "kanban maintenance: pm-supervisor/auto-decompose round failed"
                     )
                 slept = 0.0
-                while slept < maintenance_interval and self._running:
+                while (
+                    slept < maintenance_interval
+                    and self._running
+                    and not maintenance_stop.is_set()
+                ):
                     await asyncio.sleep(min(1.0, maintenance_interval - slept))
                     slept += 1.0
 
@@ -2673,8 +2734,10 @@ class GatewayKanbanWatchersMixin:
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 maintenance_task.cancel()
-                _release_singleton_lock(self._kanban_dispatcher_lock_handle)
-                self._kanban_dispatcher_lock_handle = None
+                # Cancellation path: the loop is going away now, so drain
+                # synchronously with a short budget rather than leaking the
+                # lock to a still-writing maintenance thread.
+                _finish_dispatcher(10.0)
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
@@ -2687,5 +2750,6 @@ class GatewayKanbanWatchersMixin:
                 slept += 1.0
 
         maintenance_task.cancel()
-        _release_singleton_lock(self._kanban_dispatcher_lock_handle)
-        self._kanban_dispatcher_lock_handle = None
+        # Normal stop: give an in-flight aux-LLM round room to finish (its own
+        # timeouts are 120/180 s) before the lock changes hands.
+        await asyncio.to_thread(_finish_dispatcher, 45.0)

@@ -182,3 +182,134 @@ def test_scavenger_refuses_foreign_reference_set(kanban_home, monkeypatch):
     assert removed >= 1
     assert not stray.exists()
     assert path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Repair-Runde nach TARS-Review 2026-07-27
+# ---------------------------------------------------------------------------
+
+def test_gc_workspace_sweep_is_opt_in(kanban_home):
+    """Default must NOT delete workspaces: the sweep is opt-in now."""
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    root = kb.workspaces_root()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="old done", assignee="w")
+        ws = root / tid
+        ws.mkdir(parents=True)
+        (ws / "junk.txt").write_text("scratch")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', workspace_kind='scratch', "
+                "workspace_path=?, completed_at=? WHERE id = ?",
+                (str(ws), int(time.time()) - 30 * 86400, tid),
+            )
+    # Namespace without the flag at all → getattr default 0 → no sweep.
+    rc = kanban_cli._cmd_gc(argparse.Namespace(
+        event_retention_days=30, log_retention_days=30,
+    ))
+    assert rc == 0
+    assert (root / tid).exists(), "default GC must not delete done workspaces"
+
+
+def test_gc_protects_workspace_holding_last_artifact_copy(kanban_home):
+    """A workspace holding the ONLY copy of a recorded artifact survives.
+
+    This is the loss that actually happened on 2026-07-27: the scavenger had
+    destroyed the durable copies, then a GC pass deleted the scratch dirs
+    still holding the originals.
+    """
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    root = kb.workspaces_root()
+    with kb.connect() as conn:
+        keep = kb.create_task(conn, title="has last copy", assignee="w")
+        drop = kb.create_task(conn, title="no artifacts", assignee="w")
+        old = int(time.time()) - 30 * 86400
+        for tid in (keep, drop):
+            ws = root / tid
+            ws.mkdir(parents=True)
+            (ws / "evidence.md").write_text("precious")
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='done', workspace_kind='scratch', "
+                    "workspace_path=?, completed_at=? WHERE id = ?",
+                    (str(ws), old, tid),
+                )
+        # Recorded artifact whose DURABLE copy is gone; original still lives
+        # in the scratch workspace of `keep`.
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_artifacts (task_id, producer_run_id, "
+                "original_path, durable_path, sha256, size, content_type, "
+                "validated_at, retention_class) VALUES (?, 0, ?, ?, 'x', 8, "
+                "'text/markdown', strftime('%s','now'), 'default')",
+                (keep, str(root / keep / "evidence.md"),
+                 str(kanban_home / "gone" / "durable.md")),
+            )
+
+    rc = kanban_cli._cmd_gc(argparse.Namespace(
+        event_retention_days=30, log_retention_days=30,
+        workspace_retention_days=7,
+    ))
+    assert rc == 0
+    assert (root / keep).exists(), "last-copy workspace must be protected"
+    assert not (root / drop).exists(), "unreferenced workspace still swept"
+
+
+def test_gc_protects_cross_task_artifact_location(kanban_home):
+    """Protection is global: task A's artifact may live in B's workspace."""
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    root = kb.workspaces_root()
+    with kb.connect() as conn:
+        owner = kb.create_task(conn, title="owns artifact", assignee="w")
+        host = kb.create_task(conn, title="hosts the file", assignee="w")
+        old = int(time.time()) - 30 * 86400
+        ws = root / host
+        ws.mkdir(parents=True)
+        (ws / "shared.md").write_text("cross-task evidence")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', workspace_kind='scratch', "
+                "workspace_path=?, completed_at=? WHERE id = ?",
+                (str(ws), old, host),
+            )
+            conn.execute(
+                "INSERT INTO task_artifacts (task_id, producer_run_id, "
+                "original_path, durable_path, sha256, size, content_type, "
+                "validated_at, retention_class) VALUES (?, 0, ?, ?, 'y', 8, "
+                "'text/markdown', strftime('%s','now'), 'default')",
+                (owner, str(ws / "shared.md"), str(kanban_home / "gone.md")),
+            )
+    rc = kanban_cli._cmd_gc(argparse.Namespace(
+        event_retention_days=30, log_retention_days=30,
+        workspace_retention_days=7,
+    ))
+    assert rc == 0
+    assert (root / host).exists()
+
+
+def test_human_driven_profiles_reads_root_config(kanban_home, monkeypatch, tmp_path):
+    """Board-global policy must not depend on the asking profile.
+
+    A worker profile carries no kanban.human_driven_profiles, so the reviewer
+    guard used to answer differently inside a worker than in the gateway that
+    later has to dispatch the review (TARS review, P1).
+    """
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  human_driven_profiles: [default, work]\n", encoding="utf-8"
+    )
+    kb._ROOT_KANBAN_CONFIG_CACHE = None
+    assert "work" in kb.human_driven_profiles()
+
+    # Now pretend we are a worker profile: HERMES_HOME points into profiles/,
+    # whose config has no kanban section at all.
+    profile_home = kanban_home / "profiles" / "backend-eng"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    kb._ROOT_KANBAN_CONFIG_CACHE = None
+    assert "work" in kb.human_driven_profiles(), (
+        "worker profile must see the same human-driven set as the gateway"
+    )

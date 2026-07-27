@@ -1059,13 +1059,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
-    p_gc.add_argument("--workspace-retention-days", type=int, default=7,
-                      help="Also remove scratch workspaces of DONE tasks completed "
-                           "more than N days ago (archived: always). The "
-                           "completion-time cleanup defers when children are "
-                           "active and older tasks predate it — 3.6 GiB of "
-                           "done-task scratch dirs had piled up (audit "
-                           "2026-07-27). 0 disables the done-task sweep.")
+    p_gc.add_argument("--workspace-retention-days", type=int, default=0,
+                      help="OPT-IN (default 0 = off): also remove scratch "
+                           "workspaces of DONE tasks completed more than N days "
+                           "ago. Deletes real files the completion-time cleanup "
+                           "deliberately kept; directories holding the only "
+                           "remaining copy of a recorded artifact are always "
+                           "protected. Archived-task workspaces are swept "
+                           "regardless (same artifact protection applies).")
 
     # --- audit / repair (invariant reconciler) ---
     p_audit = sub.add_parser(
@@ -3429,6 +3430,41 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     return 0 if (ok_count > 0 or not ids) else 1
 
 
+def _last_copy_artifact_paths(conn) -> list:
+    """Resolved ``original_path``s whose durable artifact copy is GONE.
+
+    These files are the only remaining copy of a recorded completion
+    artifact, so no cleanup pass may delete the directory holding them.
+
+    Incident 2026-07-27: the scavenger destroyed the durable copies at 17:05;
+    a GC run at 20:58 then deleted the scratch workspaces still holding the
+    originals — 16 artifacts across 10 tasks became unrecoverable in the very
+    session that was investigating artifact loss. Note the mapping is NOT
+    per-task: an artifact of task A can physically live in task B's workspace,
+    so this must be evaluated globally over all artifact rows.
+    """
+    out = []
+    try:
+        rows = conn.execute(
+            "SELECT original_path, durable_path FROM task_artifacts"
+        ).fetchall()
+    except Exception:
+        # No artifact table (pre-artifact schema): nothing to protect.
+        return out
+    for row in rows:
+        original = (row["original_path"] or "").strip()
+        durable = (row["durable_path"] or "").strip()
+        if not original:
+            continue
+        try:
+            if durable and Path(durable).is_file():
+                continue  # durable copy intact — original is expendable
+            out.append(Path(original).resolve())
+        except OSError:
+            continue
+    return out
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove scratch workspaces of terminal tasks, prune old events, and
     delete old worker logs."""
@@ -3436,12 +3472,18 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     import time as _time
     scratch_root = kb.workspaces_root()
     removed_ws = 0
-    ws_days = getattr(args, "workspace_retention_days", 7)
+    protected_ws = 0
+    # OPT-IN (default 0 = off). This sweep deletes real files that the
+    # completion-time cleanup deliberately kept, and a wrong call is
+    # unrecoverable; it must never run just because someone invoked `gc`
+    # for its event/log pruning (TARS review 2026-07-27, BLOCK).
+    ws_days = getattr(args, "workspace_retention_days", 0)
     with kb.connect_closing() as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT id, status, workspace_kind, workspace_path, completed_at "
             "FROM tasks WHERE status IN ('archived', 'done')"
         ).fetchall()]
+        protected_paths = _last_copy_artifact_paths(conn)
         # Done tasks: age-gate plus the same active-children deferral the
         # completion-time cleanup uses — a child may still read handoff
         # files from the parent's scratch dir (#33774).
@@ -3475,6 +3517,25 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         except ValueError:
             # Safety: never delete outside the scratch root.
             continue
+        # Last-copy guard: never delete a directory that still holds the only
+        # remaining copy of a recorded completion artifact — including one
+        # belonging to a DIFFERENT task.
+        holds_last_copy = False
+        for protected in protected_paths:
+            try:
+                protected.relative_to(path)
+            except ValueError:
+                continue
+            holds_last_copy = True
+            break
+        if holds_last_copy:
+            protected_ws += 1
+            print(
+                f"GC: keeping {path} — holds the only remaining copy of a "
+                f"recorded completion artifact",
+                file=sys.stderr,
+            )
+            continue
         if path.exists() and path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
             removed_ws += 1
@@ -3489,7 +3550,9 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         older_than_seconds=log_days * 24 * 3600,
     )
     print(f"GC complete: {removed_ws} workspace(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+          f"{removed_events} event row(s), {removed_logs} log file(s) removed"
+          + (f", {protected_ws} workspace(s) kept (last artifact copy)"
+             if protected_ws else ""))
     return 0
 
 

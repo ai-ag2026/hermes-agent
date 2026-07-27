@@ -15477,6 +15477,47 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 _HUMAN_DRIVEN_PROFILES_DEFAULT = ("work",)
 
 
+_ROOT_KANBAN_CONFIG_CACHE: Optional[tuple] = None  # (stat_key, kanban section)
+
+
+def _root_kanban_config() -> dict:
+    """The ``kanban:`` section of the ROOT config, not the active profile's.
+
+    The board is root-anchored by design (see :func:`kanban_home`), so
+    board-global policy must be answered identically no matter which profile
+    asks. ``load_config_readonly()`` resolves through the caller's
+    ``HERMES_HOME``: a worker profile does not carry
+    ``kanban.human_driven_profiles``, so the same reviewer id was accepted
+    inside a worker and then never dispatched by the default gateway —
+    parking the card in a review lane nobody could execute (TARS review
+    2026-07-27, P1).
+
+    Returns ``{}`` when the root config is unreadable, so callers keep their
+    existing profile-config fallback and fail-safe defaults.
+    """
+    global _ROOT_KANBAN_CONFIG_CACHE
+    try:
+        path = kanban_home() / "config.yaml"
+        st = os.stat(path)
+        stat_key = (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    cached = _ROOT_KANBAN_CONFIG_CACHE
+    if cached is not None and cached[0] == stat_key:
+        return cached[1]
+    section: dict = {}
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+        if isinstance(data, dict) and isinstance(data.get("kanban"), dict):
+            section = data["kanban"]
+    except Exception:
+        section = {}
+    _ROOT_KANBAN_CONFIG_CACHE = (stat_key, section)
+    return section
+
+
 def human_driven_profiles() -> "frozenset[str]":
     """Profiles that are operator-driven, NOT autonomous kanban workers.
 
@@ -15502,11 +15543,15 @@ def human_driven_profiles() -> "frozenset[str]":
     stays on). Read via ``load_config_readonly()`` — this is a hot path
     (dispatcher tick + per-board health probes). See reference-profile-taxonomy.
     """
-    try:
-        from hermes_cli.config import load_config_readonly
-        configured = (load_config_readonly().get("kanban") or {}).get("human_driven_profiles")
-    except Exception:
-        configured = None
+    configured = _root_kanban_config().get("human_driven_profiles")
+    if configured is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+            configured = (load_config_readonly().get("kanban") or {}).get(
+                "human_driven_profiles"
+            )
+        except Exception:
+            configured = None
     if not isinstance(configured, (list, tuple)):
         # None (unset) or malformed → fail-safe built-in default.
         return frozenset(_HUMAN_DRIVEN_PROFILES_DEFAULT)

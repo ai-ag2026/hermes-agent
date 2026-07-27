@@ -6,6 +6,7 @@ import os
 import sqlite3
 import stat
 import threading
+import shutil
 import time
 from pathlib import Path
 
@@ -804,9 +805,16 @@ def test_unreferenced_cleanup_rejects_swapped_symlink_ancestor(kanban_home: Path
     assert (preserved_task_dir / "1" / "source" / artifact.name).exists()
 
 
-def test_scavenger_rejects_symlinked_top_level_root(
+def test_scavenger_skips_explicit_artifact_root(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ):
+    """An explicit HERMES_KANBAN_ARTIFACTS_ROOT is never swept.
+
+    Contract change 2026-07-27: with an override the owning DB is not
+    derivable from the root path, so the sweep now fails CLOSED and returns
+    0 instead of walking (and previously raising) — the protected property
+    is unchanged: nothing outside the store may be deleted.
+    """
     outside = kanban_home / "outside-scavenger"
     outside.mkdir()
     orphan = outside / ".promoting-orphan"
@@ -814,6 +822,33 @@ def test_scavenger_rejects_symlinked_top_level_root(
     root_link = kanban_home / "artifact-root-link"
     root_link.symlink_to(outside, target_is_directory=True)
     monkeypatch.setenv("HERMES_KANBAN_ARTIFACTS_ROOT", str(root_link))
+    with kb.connect() as conn:
+        removed = kb._scavenge_completion_artifacts(
+            conn, board=None, grace_seconds=0, now=time.time() + 1
+        )
+    assert removed == 0
+    assert orphan.exists()
+
+
+def test_scavenger_rejects_symlinked_default_root(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The walk still refuses a symlinked root when no override is set.
+
+    This is the original protection (the sweep must not follow a symlinked
+    top-level root out of the store); it applies on the derivable default
+    root, which the ownership guard lets through.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_ARTIFACTS_ROOT", raising=False)
+    outside = kanban_home / "outside-default-scavenger"
+    outside.mkdir()
+    orphan = outside / ".promoting-orphan"
+    orphan.write_text("must survive", encoding="utf-8")
+    default_root = kb.completion_artifacts_root(None)
+    default_root.parent.mkdir(parents=True, exist_ok=True)
+    if default_root.exists():
+        shutil.rmtree(default_root)
+    default_root.symlink_to(outside, target_is_directory=True)
     with kb.connect() as conn:
         with pytest.raises(OSError):
             kb._scavenge_completion_artifacts(
