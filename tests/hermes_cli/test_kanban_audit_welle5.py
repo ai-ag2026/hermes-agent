@@ -467,3 +467,88 @@ def test_gc_protection_ignores_db_env_override(kanban_home, monkeypatch):
         "the other board's last-copy reference must still protect this "
         "workspace even with HERMES_KANBAN_DB pinned"
     )
+
+
+def test_gc_protection_includes_freely_placed_db_override(kanban_home, monkeypatch):
+    """A HERMES_KANBAN_DB outside kanban_home() must still be consulted.
+
+    The structural board resolution fixed the override COLLAPSE but then
+    excluded such a database entirely — while _cmd_gc still reads the tasks
+    it sweeps through exactly that override (TARS re-review 3).
+    """
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    root = kb.workspaces_root()
+    outside = kanban_home / "elsewhere"
+    outside.mkdir()
+    outside_db = outside / "pinned.db"
+
+    # Workspace + task live in the override DB itself.
+    kb.init_db(outside_db)
+    with kb.connect_closing(db_path=outside_db) as conn:
+        host = kb.create_task(conn, title="pinned board task", assignee="w")
+        ws = root / host
+        ws.mkdir(parents=True, exist_ok=True)
+        (ws / "evidence.md").write_text("precious")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', workspace_kind='scratch', "
+                "workspace_path=?, completed_at=? WHERE id = ?",
+                (str(ws), int(time.time()) - 30 * 86400, host),
+            )
+            conn.execute(
+                "INSERT INTO task_artifacts (task_id, producer_run_id, "
+                "original_path, durable_path, sha256, size, content_type, "
+                "validated_at, retention_class) VALUES (?, 0, ?, ?, 'p', 8, "
+                "'text/markdown', strftime('%s','now'), 'default')",
+                (host, str(ws / "evidence.md"), str(kanban_home / "gone.md")),
+            )
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(outside_db))
+    rc = kanban_cli._cmd_gc(argparse.Namespace(
+        event_retention_days=30, log_retention_days=30,
+        workspace_retention_days=7,
+    ))
+    assert rc == 0
+    assert (root / host).exists(), (
+        "the pinned override DB's own last-copy reference must protect it"
+    )
+
+
+def test_gc_protection_includes_physically_archived_boards(kanban_home):
+    """`boards rm --archive` MOVES a board out of the enumerated slug space.
+
+    list_boards(include_archived=True) skips boards/_archived (not a valid
+    slug), yet those DBs stay recoverable and can reference workspaces an
+    active board would sweep (TARS re-review 3).
+    """
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    root = kb.workspaces_root()
+    with kb.connect() as conn:
+        host = kb.create_task(conn, title="hosts file", assignee="w")
+        ws = _plant_done_ws(conn, root, host)
+
+    kb.create_board("doomed")
+    with kb.connect(board="doomed") as other:
+        owner = kb.create_task(other, title="owns artifact", assignee="w")
+        with kb.write_txn(other):
+            other.execute(
+                "INSERT INTO task_artifacts (task_id, producer_run_id, "
+                "original_path, durable_path, sha256, size, content_type, "
+                "validated_at, retention_class) VALUES (?, 0, ?, ?, 'a', 8, "
+                "'text/markdown', strftime('%s','now'), 'default')",
+                (owner, str(ws / "evidence.md"), str(kanban_home / "gone.md")),
+            )
+    kb.remove_board("doomed", archive=True)
+    archived = list((kb.boards_root() / "_archived").glob("*/kanban.db"))
+    assert archived, "precondition: the board was archived, not deleted"
+
+    rc = kanban_cli._cmd_gc(argparse.Namespace(
+        event_retention_days=30, log_retention_days=30,
+        workspace_retention_days=7,
+    ))
+    assert rc == 0
+    assert (root / host).exists(), (
+        "an archived board's last-copy reference must still protect"
+    )

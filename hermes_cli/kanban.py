@@ -3566,6 +3566,52 @@ def _all_board_last_copy_paths() -> list:
             raise ProtectionUnavailable(
                 f"cannot read artifacts of board {slug!r}: {exc}"
             ) from exc
+
+    # Two sources the structural scan above cannot see (TARS re-review 3):
+    #
+    # (a) A freely placed HERMES_KANBAN_DB. It is a supported direct file pin,
+    #     and _cmd_gc reads the very tasks it is about to sweep through it —
+    #     so omitting it can drop the protection references of exactly the DB
+    #     being processed.
+    # (b) Boards archived by `boards rm` are MOVED to
+    #     boards/_archived/<slug>-<timestamp>/. list_boards() skips that
+    #     directory (``_archived`` is not a valid slug) even with
+    #     include_archived=True, yet those DBs stay recoverable and their
+    #     manifests may reference workspaces an active board would sweep.
+    extra_dbs: list[Path] = []
+    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if override:
+        extra_dbs.append(Path(override).expanduser())
+    try:
+        archived_root = Path(kb.boards_root()) / "_archived"
+        if archived_root.is_dir():
+            extra_dbs.extend(sorted(archived_root.glob("*/kanban.db")))
+    except OSError as exc:
+        raise ProtectionUnavailable(
+            f"cannot enumerate archived boards: {exc}"
+        ) from exc
+
+    for db_file in extra_dbs:
+        try:
+            db_key = str(db_file.resolve())
+        except OSError as exc:
+            raise ProtectionUnavailable(
+                f"cannot resolve database {db_file}: {exc}"
+            ) from exc
+        if db_key in seen_dbs:
+            continue
+        seen_dbs.add(db_key)
+        if not db_file.exists():
+            continue
+        try:
+            with kb.connect_closing(db_path=db_file) as extra_conn:
+                protected.extend(_last_copy_artifact_paths(extra_conn))
+        except ProtectionUnavailable:
+            raise
+        except Exception as exc:
+            raise ProtectionUnavailable(
+                f"cannot read artifacts of {db_file}: {exc}"
+            ) from exc
     return protected
 
 
