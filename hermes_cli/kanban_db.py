@@ -4055,8 +4055,18 @@ def create_task(
     completion_contract: Optional[dict] = None,
     allow_workspace_refs: bool = False,
     work_contract: Optional[dict] = None,
+    acceptance_required: Optional[bool] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
+
+    ``acceptance_required=True`` marks the card as needing an explicit
+    review ``ACCEPT`` before it may reach ``done`` (enforced in
+    ``complete_task`` via ``_acceptance_satisfied``). Before this parameter
+    existed the flag was only reachable through the internal
+    ``work_contract`` promotion path, so ordinary tool/CLI/dashboard cards
+    could never opt into an enforced review — the typed review lane was a
+    recommendation, not a rule (Audit 2026-07-27, P1). An explicit value
+    wins over ``work_contract``.
 
     Returns the new task id.  Status is ``ready`` when there are no
     parents (or all parents already ``done``), otherwise ``todo``.
@@ -4427,8 +4437,12 @@ def create_task(
                         _wc.get("work_kind"),
                         _wc.get("owner_core_id"),
                         _wc.get("origin_conversation_ref"),
-                        (1 if _wc.get("acceptance_required") else 0)
-                        if _wc.get("acceptance_required") is not None else None,
+                        (1 if acceptance_required else 0)
+                        if acceptance_required is not None
+                        else (
+                            (1 if _wc.get("acceptance_required") else 0)
+                            if _wc.get("acceptance_required") is not None else None
+                        ),
                         _wc.get("definition_of_done"),
                         _wc.get("commitment"),
                         _wc.get("commitment_due_at"),
@@ -6355,6 +6369,45 @@ def request_task_review(
     if not reviewer_name:
         raise ValueError("reviewer is required")
     reviewer = reviewer_name
+    # Reject reviewers the dispatcher can never spawn, AT REQUEST TIME. The
+    # review dispatch loop skips unassigned/unknown/human-driven assignees
+    # silently every tick (skipped_nonspawnable) — with the handshake already
+    # open, complete_task refuses forever, no event fires, no audit rule
+    # covers it: a typo in the reviewer name killed the card without a trace
+    # (Audit 2026-07-27, P1). The same misroute must be a loud, immediate
+    # error instead.
+    #
+    # Validation only runs when a profile registry exists on disk: a fresh
+    # install or test home has no profiles root, and there the lane is driven
+    # manually (claim_review_task) with arbitrary reviewer names — that
+    # legacy behaviour stays. In a real deployment the registry exists and a
+    # typo cannot open a dead handshake anymore.
+    _registry_present = False
+    try:
+        from hermes_cli.profiles import (
+            _get_profiles_root,
+            profile_exists as _profile_exists,
+        )
+        _registry_present = _get_profiles_root().is_dir()
+    except Exception:
+        _profile_exists = None  # older builds: keep the legacy behaviour
+    if _registry_present and _profile_exists is not None:
+        if not _profile_exists(reviewer):
+            raise ValueError(
+                f"reviewer profile {reviewer!r} does not exist — the "
+                "dispatcher would silently skip this review forever and the "
+                "card could never complete. Use an existing worker profile "
+                "(hermes profile list), or for human review block the card "
+                "with a human gate instead."
+            )
+        if reviewer in human_driven_profiles():
+            raise ValueError(
+                f"reviewer {reviewer!r} is a human-driven profile that the "
+                "dispatcher never auto-spawns; the review would wait "
+                "unnoticed with no notification. For human sign-off use a "
+                "human gate (kanban block --human-gate); the review lane "
+                "needs an agent reviewer profile."
+            )
     with write_txn(conn):
         pending = _pending_review_request(conn, task_id)
         row = conn.execute(
@@ -6459,6 +6512,22 @@ def request_task_review(
     return True
 
 
+def _review_repair_limit() -> int:
+    """Max NEEDS_REPAIR rounds before the repair loop breaks to triage.
+
+    Configurable via ``kanban.review_repair_limit``; defaults to
+    ``BLOCK_RECURRENCE_LIMIT`` so the review loop is bounded exactly like the
+    unblock loop it mirrors. ``0`` disables the breaker (unbounded rounds —
+    the pre-2026-07-27 behaviour).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = (load_config_readonly().get("kanban") or {})
+        return max(0, int(cfg.get("review_repair_limit", BLOCK_RECURRENCE_LIMIT)))
+    except Exception:
+        return BLOCK_RECURRENCE_LIMIT
+
+
 def decide_task_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6506,6 +6575,35 @@ def decide_task_review(
             "NEEDS_REPAIR": "ready",
             "BLOCK": "blocked",
         }[decision]
+        # NEEDS_REPAIR breaker: worker↔reviewer was the only unbounded loop
+        # in the system — spawn failures cap at DEFAULT_FAILURE_LIMIT, the
+        # unblock loop at BLOCK_RECURRENCE_LIMIT, but repair rounds could
+        # cycle forever at a full model run per round (Audit 2026-07-27, P1).
+        # Counted from the durable review_decided events, so no new column
+        # and no reset bookkeeping; at the limit the card routes to triage —
+        # the same escalation target the recurrence breaker uses — where the
+        # pm-supervisor/attention lane owns it instead of round N+1.
+        repair_rounds = None
+        repair_limit = 0
+        if decision == "NEEDS_REPAIR":
+            repair_limit = _review_repair_limit()
+            try:
+                prior = conn.execute(
+                    "SELECT COUNT(*) FROM task_events "
+                    "WHERE task_id = ? AND kind = 'review_decided' "
+                    "AND json_extract(payload, '$.decision') = 'NEEDS_REPAIR'",
+                    (task_id,),
+                ).fetchone()[0]
+            except sqlite3.OperationalError:
+                prior = 0
+            repair_rounds = int(prior) + 1
+            if repair_limit and repair_rounds >= repair_limit:
+                target_status = "triage"
+                _log.warning(
+                    "kanban review: %s hit NEEDS_REPAIR round %d (limit %d) — "
+                    "breaking the repair loop, routing to triage",
+                    task_id, repair_rounds, repair_limit,
+                )
         cur = conn.execute(
             """
             UPDATE tasks
@@ -6541,14 +6639,20 @@ def decide_task_review(
             summary=summary,
             metadata=metadata,
         )
+        decided_payload = {
+            "decision": decision,
+            "summary": (summary or "").strip().splitlines()[0][:400] or None,
+        }
+        if repair_rounds is not None:
+            decided_payload["repair_rounds"] = repair_rounds
+            if target_status == "triage":
+                decided_payload["routed_to"] = "triage"
+                decided_payload["limit"] = repair_limit
         _append_event(
             conn,
             task_id,
             "review_decided",
-            {
-                "decision": decision,
-                "summary": (summary or "").strip().splitlines()[0][:400] or None,
-            },
+            decided_payload,
             run_id=run_id,
         )
         if decision == "BLOCK":

@@ -334,6 +334,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
+    p_create.add_argument("--acceptance-required", action="store_true",
+                          help="Card cannot reach 'done' without an explicit review "
+                               "ACCEPT (kanban request-review → review-decide). "
+                               "Makes independent review enforced instead of advisory.")
     p_create.add_argument("--idempotency-key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
                                "its id is returned instead of creating a duplicate.")
@@ -1654,6 +1658,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
             allow_workspace_refs=bool(getattr(args, "allow_workspace_refs", False)),
+            acceptance_required=(
+                True if getattr(args, "acceptance_required", False) else None
+            ),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

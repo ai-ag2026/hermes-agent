@@ -1582,6 +1582,10 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
                 completion_contract=args.get("completion_contract"),
+                acceptance_required=(
+                    bool(args["acceptance_required"])
+                    if args.get("acceptance_required") is not None else None
+                ),
                 task_class=task_class,
                 max_retries=(
                     int(max_retries) if max_retries is not None else None
@@ -2471,6 +2475,18 @@ KANBAN_CREATE_SCHEMA = {
                     "Optional fail-closed evidence requirements. Required "
                     "fields must be present in kanban_complete metadata; "
                     "artifacts are validated and durably promoted before done."
+                ),
+            },
+            "acceptance_required": {
+                "type": "boolean",
+                "description": (
+                    "When true, this card cannot reach 'done' on the worker's "
+                    "own say-so: an explicit review ACCEPT (via "
+                    "kanban_request_review → kanban_review_decide) is "
+                    "required before kanban_complete succeeds. Use for work "
+                    "that MUST pass independent review — a free-text "
+                    "'NEEDS_REPAIR' on a normal done card is invisible to "
+                    "the dependency graph."
                 ),
             },
             "task_class": {
