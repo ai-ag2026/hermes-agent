@@ -9417,6 +9417,9 @@ def ensure_ops_channel_gate_subs(conn: sqlite3.Connection, *, board: Optional[st
     return n
 
 
+_OPERATOR_GATE_CHANNELS_CACHE: Optional[tuple] = None  # (stat_key, channels)
+
+
 def _operator_gate_channels() -> list[dict]:
     """The operator's own durable channels that should hear about gates on any
     board: the configured platform *home channels* (gateway.platforms.<p>.
@@ -9427,7 +9430,26 @@ def _operator_gate_channels() -> list[dict]:
     an unrelated task elsewhere.
 
     Each entry: ``{platform, chat_id, thread_id, escalate_after_seconds}``.
+
+    Cached on config.yaml's ``(mtime_ns, size)``: the resolution goes through
+    ``load_gateway_config()``, which re-parses the full YAML on every call —
+    too expensive for callers on the notifier tick. A config edit invalidates
+    the cache via the stat key; the cached value is copied on return so
+    callers cannot mutate shared state.
     """
+    global _OPERATOR_GATE_CHANNELS_CACHE
+    stat_key = None
+    try:
+        st = os.stat(kanban_home() / "config.yaml")
+        stat_key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        # No config.yaml on disk (tests, fresh installs): never cache — the
+        # stat key cannot distinguish two different in-process fake configs.
+        stat_key = None
+    cached = _OPERATOR_GATE_CHANNELS_CACHE
+    if stat_key is not None and cached is not None and cached[0] == stat_key:
+        return [dict(ch) for ch in cached[1]]
+
     channels: list[dict] = []
     seen: set[tuple] = set()
 
@@ -9478,6 +9500,8 @@ def _operator_gate_channels() -> list[dict]:
                 _add(p, c, "", home_escalate)
         except Exception:
             continue
+    if stat_key is not None:
+        _OPERATOR_GATE_CHANNELS_CACHE = (stat_key, [dict(ch) for ch in channels])
     return channels
 
 
@@ -9504,14 +9528,22 @@ def mirror_default_board_subs_to_gated(conn: sqlite3.Connection, *, board: Optio
         slug = DEFAULT_BOARD
     if slug == DEFAULT_BOARD:
         return 0
-    channels = _operator_gate_channels()
-    if not channels:
-        return 0
+    # Cheap indexed SELECT before the channel resolution: the notifier calls
+    # this every tick for every non-default board, and resolving operator
+    # channels parses the full gateway config. With zero gated cards — the
+    # overwhelmingly common state — that parse was ~220 ms of pure waste per
+    # 5 s tick (~two thirds of the gateway's steady-state CPU, audit
+    # 2026-07-27).
     try:
         rows = conn.execute(
             "SELECT id FROM tasks WHERE status='blocked' AND human_gate=1"
         ).fetchall()
     except Exception:
+        return 0
+    if not rows:
+        return 0
+    channels = _operator_gate_channels()
+    if not channels:
         return 0
     n = 0
     for row in rows:
