@@ -2494,8 +2494,50 @@ class GatewayKanbanWatchersMixin:
                         os.environ["HERMES_KANBAN_BOARD"] = prev_env
             return successes
 
+        try:
+            maintenance_interval = float(
+                kanban_cfg.get("maintenance_interval_seconds", 120) or 120
+            )
+        except (ValueError, TypeError):
+            maintenance_interval = 120.0
+        maintenance_interval = max(maintenance_interval, 10.0)
+
+        async def _maintenance_loop() -> None:
+            # pm-supervisor + auto-decompose call the aux LLM synchronously
+            # (timeouts 120 s / 180 s). Inline in the dispatch tick they ran
+            # BEFORE dispatch_once, so one slow aux answer delayed claim/spawn
+            # on every board by up to ~900 s (audit 2026-07-27). As a sibling
+            # task on its own cadence they overlap the dispatch tick instead
+            # of preceding it; the tick itself stays pure claim/spawn work.
+            # Lives strictly inside the dispatcher's singleton-lock scope, so
+            # concurrent gateways cannot double-decompose. Toggles are
+            # re-read every round (#49638) exactly as before.
+            while self._running:
+                try:
+                    _pm_enabled, _pm_per_tick, _pm_max_attempts = _read_pm_supervisor_settings()
+                    if _pm_enabled:
+                        await asyncio.to_thread(
+                            _pm_supervisor_tick_once, _pm_per_tick, _pm_max_attempts,
+                        )
+                    _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
+                    if _ad_enabled:
+                        await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "kanban maintenance: pm-supervisor/auto-decompose round failed"
+                    )
+                slept = 0.0
+                while slept < maintenance_interval and self._running:
+                    await asyncio.sleep(min(1.0, maintenance_interval - slept))
+                    slept += 1.0
+
+        maintenance_task = asyncio.create_task(_maintenance_loop())
+
         logger.info(
-            "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
+            "kanban dispatcher: embedded in gateway (interval=%.1fs, "
+            "maintenance=%.1fs)", interval, maintenance_interval,
         )
         while self._running:
             try:
@@ -2551,19 +2593,9 @@ class GatewayKanbanWatchersMixin:
                 pass
 
             try:
-                # pm-supervisor runs before auto-decompose (see comment at its
-                # definition above) — off by default, live-toggled each tick.
-                _pm_enabled, _pm_per_tick, _pm_max_attempts = _read_pm_supervisor_settings()
-                if _pm_enabled:
-                    await asyncio.to_thread(
-                        _pm_supervisor_tick_once, _pm_per_tick, _pm_max_attempts,
-                    )
-                # Re-read the auto-decompose toggle live each tick so a user
-                # flipping kanban.auto_decompose=false to STOP runaway fan-out
-                # takes effect on the next tick, not on gateway restart (#49638).
-                _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
-                if _ad_enabled:
-                    await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
+                # pm-supervisor and auto-decompose run in _maintenance_loop
+                # (own cadence, sibling task above) — NOT here, so their aux-LLM
+                # calls can never delay claim/spawn on this tick.
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):
@@ -2640,6 +2672,7 @@ class GatewayKanbanWatchersMixin:
                         last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
+                maintenance_task.cancel()
                 _release_singleton_lock(self._kanban_dispatcher_lock_handle)
                 self._kanban_dispatcher_lock_handle = None
                 raise
@@ -2653,5 +2686,6 @@ class GatewayKanbanWatchersMixin:
                 await asyncio.sleep(min(1.0, interval - slept))
                 slept += 1.0
 
+        maintenance_task.cancel()
         _release_singleton_lock(self._kanban_dispatcher_lock_handle)
         self._kanban_dispatcher_lock_handle = None
