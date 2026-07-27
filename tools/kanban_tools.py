@@ -1667,7 +1667,14 @@ def _handle_artifacts(args: dict, **kw) -> str:
                 try:
                     opened = Path(os.readlink(f"/proc/self/fd/{fd}")).resolve()
                 except OSError:
-                    opened = path.resolve()
+                    # No /proc (some containers): re-resolving the NAME would
+                    # reintroduce the very TOCTOU this path exists to close —
+                    # the name can point somewhere else than the open fd. Fail
+                    # closed instead (TARS re-review 2026-07-27).
+                    return tool_error(
+                        f"artifact {read_id}: cannot verify the identity of the "
+                        "opened file (no /proc); refusing to read"
+                    )
                 try:
                     opened.relative_to(root)
                 except ValueError:
@@ -1920,12 +1927,15 @@ def _notify_platform_has_consumer(platform: str) -> bool:
       custom poller does not need a code change here.
 
     Still an ASSERTION about configuration, not a liveness probe: it cannot
-    tell whether the gateway process is up right now, and a platform the enum
-    knows but nobody configured (e.g. a bundled-but-unused adapter) still
-    answers True. Residual risk accepted because the alternative — demanding
-    presence in the gateway config — silently drops env-configured adapters
-    like ntfy. The audit rule ``undelivered_subscription`` is the backstop
-    that surfaces a subscription whose events nobody drains.
+    tell whether the gateway process is up right now. A platform that is
+    configured and enabled but whose gateway happens to be down still answers
+    True; the audit rule ``undelivered_subscription`` is the backstop that
+    surfaces a subscription whose events nobody drains.
+
+    A plugin platform that the gateway connects WITHOUT appearing in the
+    resolved platform config (measured: ``reachy``) answers False. Declare it
+    in ``HERMES_KANBAN_NOTIFY_CONSUMER_PLATFORMS`` if such a session must
+    auto-subscribe.
 
     ``tui`` deliberately resolves to False: no TUI consumer exists (the
     docstring that used to claim ``tui_gateway/server.py`` polls these rows
@@ -1950,20 +1960,23 @@ def _notify_platform_has_consumer(platform: str) -> bool:
         plat = Platform(p)
     except Exception:
         return False
-    # A resolvable Platform proves the enum knows the name, not that anything
-    # delivers. We can positively rule out one case from here: a platform the
-    # gateway config carries but has DISABLED. We deliberately do not require
-    # presence in the gateway config — adapters like ntfy/reachy are
-    # configured through .env and never appear in ``platforms``, so demanding
-    # it would produce false negatives and silently stop subscribing channels
-    # that do work.
+    # A resolvable Platform proves only that the enum knows the name. The
+    # gateway notifier delivers exclusively through a CONFIGURED, ENABLED
+    # adapter, so that is what we require.
+    #
+    # Measured 2026-07-27 (correcting an earlier wrong call of mine):
+    # ``load_gateway_config()`` runs ``discover_plugins()`` and folds
+    # env-configured plugin platforms into ``platforms`` — with ``.env``
+    # loaded, as every dispatcher-spawned worker has it, ntfy appears there.
+    # The earlier "env adapters are invisible here" objection came from a
+    # measurement in a bare process without ``.env``.
     try:
         pcfg = load_gateway_config().platforms.get(plat)
     except Exception:
-        return True
-    if pcfg is not None and not getattr(pcfg, "enabled", True):
+        return True  # cannot read the gateway config → keep the legacy answer
+    if pcfg is None:
         return False
-    return True
+    return bool(getattr(pcfg, "enabled", True))
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:

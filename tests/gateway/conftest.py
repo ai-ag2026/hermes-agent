@@ -32,6 +32,7 @@ incident.
 """
 
 import ast
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -381,6 +382,34 @@ def _run_adapter_antipattern_scan() -> list[str]:
     return violations
 
 
+def _gateway_guard_cache_dir(config) -> Path:
+    """Where the adapter-guard fingerprint cache may be written.
+
+    ``Path.cwd()/.pytest-cache`` is wrong whenever the checkout is not
+    writable — which is exactly the state the mandated hermetic runner
+    creates (it kernel-binds the agent checkout read-only). Collection then
+    died with ``OSError: Read-only file system`` BEFORE the first gateway
+    test, so the whole gateway suite was unrunnable on the prescribed path
+    and its coverage unreproducible (TARS re-review 2026-07-27).
+
+    Resolution order:
+      1. ``HERMES_GATEWAY_TEST_CACHE`` — explicit override;
+      2. pytest's own ``--basetemp`` (the hermetic runner always sets it into
+         the sandbox), so the cache follows the run's writable scratch area;
+      3. the legacy ``cwd`` location for plain local runs.
+    """
+    override = os.environ.get("HERMES_GATEWAY_TEST_CACHE", "").strip()
+    if override:
+        return Path(override).expanduser()
+    try:
+        basetemp = config.getoption("basetemp", None)
+    except Exception:
+        basetemp = None
+    if basetemp:
+        return Path(str(basetemp)) / ".pytest-cache"
+    return Path.cwd() / ".pytest-cache"
+
+
 def pytest_configure(config):
     """Reject plugin-adapter tests that use the sys.path anti-pattern.
 
@@ -410,11 +439,16 @@ def pytest_configure(config):
         return
 
     fp = _fingerprint_gateway_tests()
-    cache_dir = Path.cwd() / ".pytest-cache"
+    cache_dir = _gateway_guard_cache_dir(config)
     cache_file = cache_dir / f"gw-adapter-guard-{fp}"
     lock_file = cache_dir / f".gw-adapter-guard-{fp}.lock"
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Cache is a speed-up, never a requirement. A read-only checkout must
+        # not abort collection (see _gateway_guard_cache_dir).
+        return
 
     # Evict stale cache entries from previous fingerprints (best-effort).
     try:

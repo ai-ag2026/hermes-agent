@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -3430,39 +3432,127 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     return 0 if (ok_count > 0 or not ids) else 1
 
 
-def _last_copy_artifact_paths(conn) -> list:
-    """Resolved ``original_path``s whose durable artifact copy is GONE.
+class ProtectionUnavailable(Exception):
+    """The last-copy protection set could not be built completely."""
 
-    These files are the only remaining copy of a recorded completion
-    artifact, so no cleanup pass may delete the directory holding them.
+
+def _durable_copy_is_intact(durable: str, sha256: str, size) -> bool:
+    """True only if the durable copy provably still holds the recorded bytes.
+
+    ``is_file()`` alone is not proof: a truncated, corrupted or replaced
+    durable file would license deleting the last GOOD original (TARS
+    re-review 2026-07-27). Any doubt answers False, which protects.
+    """
+    if not durable:
+        return False
+    try:
+        path = Path(durable)
+        stat_result = path.stat()
+        if not path.is_file():
+            return False
+        if size is not None and int(size) != stat_result.st_size:
+            return False
+        if not sha256:
+            return False
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest() == sha256
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _last_copy_artifact_paths(conn) -> list:
+    """Paths that are the ONLY remaining copy of a recorded artifact.
+
+    No cleanup pass may delete a directory holding one of these.
 
     Incident 2026-07-27: the scavenger destroyed the durable copies at 17:05;
     a GC run at 20:58 then deleted the scratch workspaces still holding the
     originals — 16 artifacts across 10 tasks became unrecoverable in the very
-    session that was investigating artifact loss. Note the mapping is NOT
-    per-task: an artifact of task A can physically live in task B's workspace,
-    so this must be evaluated globally over all artifact rows.
+    session that was investigating artifact loss. The mapping is NOT
+    per-task: an artifact of task A can physically live in task B's
+    workspace, so this is evaluated globally over all artifact rows.
+
+    FAIL-CLOSED: raises :class:`ProtectionUnavailable` when the set cannot be
+    built completely (unreadable table, unresolvable or relative path). A
+    partial protection set silently licenses deletion, which is precisely the
+    failure mode being defended against.
+
+    Both the raw stored path and its resolved form are protected: promotion
+    stores ``original_path`` as written, so a symlink ancestor changed
+    afterwards would otherwise re-resolve to a different location and leave
+    the real directory unguarded.
     """
-    out = []
+    out: list = []
     try:
         rows = conn.execute(
-            "SELECT original_path, durable_path FROM task_artifacts"
+            "SELECT original_path, durable_path, sha256, size FROM task_artifacts"
         ).fetchall()
-    except Exception:
-        # No artifact table (pre-artifact schema): nothing to protect.
-        return out
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return out  # pre-artifact schema: nothing recorded, nothing to lose
+        raise ProtectionUnavailable(f"task_artifacts unreadable: {exc}") from exc
+    except Exception as exc:
+        raise ProtectionUnavailable(f"task_artifacts unreadable: {exc}") from exc
+
     for row in rows:
         original = (row["original_path"] or "").strip()
-        durable = (row["durable_path"] or "").strip()
         if not original:
             continue
+        if _durable_copy_is_intact(
+            (row["durable_path"] or "").strip(), row["sha256"], row["size"]
+        ):
+            continue  # a verified durable copy exists — the original is expendable
+        raw = Path(original)
+        if not raw.is_absolute():
+            raise ProtectionUnavailable(
+                f"artifact original_path is not absolute: {original!r}"
+            )
+        out.append(raw)
         try:
-            if durable and Path(durable).is_file():
-                continue  # durable copy intact — original is expendable
-            out.append(Path(original).resolve())
-        except OSError:
-            continue
+            out.append(raw.resolve())
+        except OSError as exc:
+            raise ProtectionUnavailable(
+                f"cannot resolve artifact original_path {original!r}: {exc}"
+            ) from exc
     return out
+
+
+def _all_board_last_copy_paths() -> list:
+    """Union of the last-copy protection sets across EVERY board.
+
+    Workspaces are not board-scoped: ``HERMES_KANBAN_WORKSPACES_ROOT`` and
+    explicit workspace paths let board B's sweep reach a directory whose only
+    last-copy reference lives in board A (TARS re-review 2026-07-27). Failing
+    to read any board fails the whole sweep closed.
+    """
+    protected: list = []
+    try:
+        boards = kb.list_boards(include_archived=True)
+    except Exception as exc:
+        raise ProtectionUnavailable(f"cannot enumerate boards: {exc}") from exc
+    seen_dbs: set[str] = set()
+    for meta in boards or []:
+        slug = (meta.get("slug") if isinstance(meta, dict) else None) or "default"
+        try:
+            db_path = str(Path(kb.kanban_db_path(board=slug)).resolve())
+        except Exception:
+            db_path = slug
+        if db_path in seen_dbs:
+            continue
+        seen_dbs.add(db_path)
+        try:
+            with kb.connect_closing(board=slug) as board_conn:
+                protected.extend(_last_copy_artifact_paths(board_conn))
+        except ProtectionUnavailable:
+            raise
+        except Exception as exc:
+            raise ProtectionUnavailable(
+                f"cannot read artifacts of board {slug!r}: {exc}"
+            ) from exc
+    return protected
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
@@ -3478,18 +3568,28 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     # unrecoverable; it must never run just because someone invoked `gc`
     # for its event/log pruning (TARS review 2026-07-27, BLOCK).
     ws_days = getattr(args, "workspace_retention_days", 0)
+    # Build the protection set FIRST and across all boards. If it cannot be
+    # built completely, no sweep happens at all (fail-closed).
+    try:
+        protected_paths = _all_board_last_copy_paths()
+    except ProtectionUnavailable as exc:
+        print(
+            f"GC: refusing to sweep workspaces — artifact protection set "
+            f"incomplete ({exc}). Events/logs are still pruned.",
+            file=sys.stderr,
+        )
+        protected_paths = None
     with kb.connect_closing() as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT id, status, workspace_kind, workspace_path, completed_at "
             "FROM tasks WHERE status IN ('archived', 'done')"
         ).fetchall()]
-        protected_paths = _last_copy_artifact_paths(conn)
         # Done tasks: age-gate plus the same active-children deferral the
         # completion-time cleanup uses — a child may still read handoff
         # files from the parent's scratch dir (#33774).
         cutoff = int(_time.time()) - int(ws_days) * 24 * 3600
         eligible = []
-        for row in rows:
+        for row in (rows if protected_paths is not None else []):
             if row["workspace_kind"] != "scratch":
                 continue
             if row["status"] == "done":
@@ -3507,9 +3607,9 @@ def _cmd_gc(args: argparse.Namespace) -> int:
                     continue
             eligible.append(row)
     for row in eligible:
-        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
+        raw_path = Path(row["workspace_path"] or (scratch_root / row["id"]))
         try:
-            path = path.resolve()
+            path = raw_path.resolve()
         except OSError:
             continue
         try:
@@ -3520,14 +3620,20 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         # Last-copy guard: never delete a directory that still holds the only
         # remaining copy of a recorded completion artifact — including one
         # belonging to a DIFFERENT task.
+        # Compare in BOTH spellings: the protection set carries the stored
+        # (raw) and the resolved form of each artifact path, and the
+        # workspace itself may be reached under either.
         holds_last_copy = False
         for protected in protected_paths:
-            try:
-                protected.relative_to(path)
-            except ValueError:
-                continue
-            holds_last_copy = True
-            break
+            for base in (path, raw_path):
+                try:
+                    protected.relative_to(base)
+                except ValueError:
+                    continue
+                holds_last_copy = True
+                break
+            if holds_last_copy:
+                break
         if holds_last_copy:
             protected_ws += 1
             print(
@@ -3537,8 +3643,16 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             )
             continue
         if path.exists() and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-            removed_ws += 1
+            failures: list = []
+            shutil.rmtree(path, onerror=lambda *a: failures.append(a))
+            if failures or path.exists():
+                print(
+                    f"GC: could not fully remove {path} ({len(failures)} error(s)) "
+                    "— not counted as removed",
+                    file=sys.stderr,
+                )
+            else:
+                removed_ws += 1
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)

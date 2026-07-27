@@ -177,16 +177,29 @@ def test_pause_decision_does_not_skip_auto_decompose_or_dispatch(monkeypatch: py
     monkeypatch.setattr(decomp, "decompose_task", lambda *a, **kw: calls.append("decompose") or SimpleNamespace(ok=True, fanout=False, child_ids=[]))
 
     async def immediate_to_thread(fn, *args, **kwargs):
+        # Yield like the real to_thread does, otherwise the whole tick runs
+        # without a single suspension point and the sibling maintenance task
+        # (auto-decompose since Welle 2) never gets scheduled.
+        await asyncio.sleep(0)
         value = fn(*args, **kwargs)
         if getattr(fn, "__name__", "") == "_ready_nonempty":
             runner._running = False
         return value
+    # Must actually YIELD: since auto-decompose moved out of the dispatch tick
+    # into the sibling maintenance loop (Welle 2), a sleep that never suspends
+    # would starve that task and the decompose call could never happen — the
+    # test would then "prove" the absence of its own subject.
+    _real_sleep = asyncio.sleep
     async def immediate_sleep(_delay):
-        return None
+        await _real_sleep(0)
     monkeypatch.setattr(watchers.asyncio, "to_thread", immediate_to_thread)
     monkeypatch.setattr(watchers.asyncio, "sleep", immediate_sleep)
-    asyncio.run(asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=3))
-    assert calls == ["reap", "decompose", "dispatch"]
+    asyncio.run(asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=5))
+    # Order between the two loops is no longer fixed (that is the point of the
+    # split), so assert presence, not sequence: a hot shadow decision must
+    # gate neither the dispatch tick nor the maintenance round.
+    assert "reap" in calls and "dispatch" in calls
+    assert "decompose" in calls, calls
 
 
 def test_duplicate_suppression_shadow_is_board_scoped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -229,6 +242,10 @@ def test_duplicate_suppression_shadow_is_board_scoped(monkeypatch: pytest.Monkey
     monkeypatch.setattr(watchers, "_log_shadow_warning", decisions.append)
 
     async def immediate_to_thread(fn, *args, **kwargs):
+        # Yield like the real to_thread does, otherwise the whole tick runs
+        # without a single suspension point and the sibling maintenance task
+        # (auto-decompose since Welle 2) never gets scheduled.
+        await asyncio.sleep(0)
         value = fn(*args, **kwargs)
         if getattr(fn, "__name__", "") == "_ready_nonempty":
             runner._running = False

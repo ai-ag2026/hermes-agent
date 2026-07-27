@@ -2518,24 +2518,38 @@ class GatewayKanbanWatchersMixin:
         maintenance_inflight: "list[concurrent.futures.Future]" = []
 
         async def _run_maintenance(fn, *fn_args):
-            """Submit to the dedicated executor, keeping the future reachable."""
+            """Submit to the dedicated executor, keeping the future reachable.
+
+            The future is registered ONCE and only ever removed by the drain
+            once it has actually completed. Removing it in a ``finally`` was
+            wrong: cancelling the awaiting coroutine runs that ``finally``
+            while the executor thread keeps going, so the drain saw an empty
+            list and released the lock under a still-writing thread — the
+            same P1 the first repair round meant to close (TARS re-review).
+            """
             future = maintenance_executor.submit(fn, *fn_args)
             maintenance_inflight.append(future)
-            try:
-                return await asyncio.wrap_future(future)
-            finally:
-                try:
-                    maintenance_inflight.remove(future)
-                except ValueError:
-                    pass
+            return await asyncio.wrap_future(future)
 
         def _drain_maintenance(timeout: float) -> bool:
             """Signal stop and wait for in-flight maintenance. True if idle."""
             maintenance_stop.set()
+            # Prune only genuinely finished work; a cancelled awaiter leaves
+            # its future here on purpose.
+            for done_future in [f for f in list(maintenance_inflight) if f.done()]:
+                try:
+                    maintenance_inflight.remove(done_future)
+                except ValueError:
+                    pass
             pending = [f for f in list(maintenance_inflight) if not f.done()]
             if not pending:
                 return True
             _, not_done = concurrent.futures.wait(pending, timeout=timeout)
+            for finished in [f for f in pending if f.done()]:
+                try:
+                    maintenance_inflight.remove(finished)
+                except ValueError:
+                    pass
             return not not_done
 
         def _finish_dispatcher(drain_timeout: float) -> None:
@@ -2548,16 +2562,46 @@ class GatewayKanbanWatchersMixin:
             """
             drained = _drain_maintenance(drain_timeout)
             maintenance_executor.shutdown(wait=False)
-            if not drained:
-                logger.warning(
-                    "kanban maintenance still in flight after %.0fs — keeping "
-                    "the dispatcher singleton lock (released on process exit) "
-                    "so no second dispatcher can take over mid-write",
-                    drain_timeout,
-                )
+            handle = self._kanban_dispatcher_lock_handle
+            if drained:
+                _release_singleton_lock(handle)
+                self._kanban_dispatcher_lock_handle = None
                 return
-            _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+            # Not drained: releasing now would hand the board to a second
+            # dispatcher mid-write. Holding it until process exit avoids that
+            # but wedges every in-process watcher restart (TARS re-review).
+            # Instead hand the release to a watchdog that waits for the actual
+            # thread to finish — the window is bounded by the aux-LLM timeout,
+            # not by the process lifetime.
             self._kanban_dispatcher_lock_handle = None
+
+            def _release_after_maintenance() -> None:
+                try:
+                    pending = [f for f in list(maintenance_inflight) if not f.done()]
+                    if pending:
+                        concurrent.futures.wait(pending)
+                except Exception:
+                    logger.warning(
+                        "kanban maintenance: watchdog wait failed; releasing "
+                        "the dispatcher lock anyway", exc_info=True,
+                    )
+                _release_singleton_lock(handle)
+                logger.info(
+                    "kanban maintenance finished after shutdown — dispatcher "
+                    "singleton lock released"
+                )
+
+            logger.warning(
+                "kanban maintenance still in flight after %.0fs — dispatcher "
+                "singleton lock stays held until it finishes (no second "
+                "dispatcher may take over mid-write)",
+                drain_timeout,
+            )
+            threading.Thread(
+                target=_release_after_maintenance,
+                name="kanban-maintenance-lock-release",
+                daemon=True,
+            ).start()
 
         async def _maintenance_loop() -> None:
             # pm-supervisor + auto-decompose call the aux LLM synchronously

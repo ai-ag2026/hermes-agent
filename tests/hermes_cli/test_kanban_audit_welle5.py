@@ -313,3 +313,116 @@ def test_human_driven_profiles_reads_root_config(kanban_home, monkeypatch, tmp_p
     assert "work" in kb.human_driven_profiles(), (
         "worker profile must see the same human-driven set as the gateway"
     )
+
+
+# ---------------------------------------------------------------------------
+# Zweite Repair-Runde (TARS-Re-Abnahme 2026-07-27)
+# ---------------------------------------------------------------------------
+
+def _plant_done_ws(conn, root, tid, *, age_days=30):
+    ws = root / tid
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "evidence.md").write_text("precious")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='done', workspace_kind='scratch', "
+            "workspace_path=?, completed_at=? WHERE id = ?",
+            (str(ws), int(time.time()) - age_days * 86400, tid),
+        )
+    return ws
+
+
+def test_gc_refuses_sweep_when_protection_set_unreadable(kanban_home, monkeypatch):
+    """Fail-closed: an unreadable artifact table blocks the sweep entirely."""
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    root = kb.workspaces_root()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="sweepable", assignee="w")
+        _plant_done_ws(conn, root, tid)
+
+    def boom(*_a, **_kw):
+        raise kanban_cli.ProtectionUnavailable("simulated read failure")
+    monkeypatch.setattr(kanban_cli, "_all_board_last_copy_paths", boom)
+
+    rc = kanban_cli._cmd_gc(argparse.Namespace(
+        event_retention_days=30, log_retention_days=30,
+        workspace_retention_days=7,
+    ))
+    assert rc == 0
+    assert (root / tid).exists(), "no sweep may happen without a full protection set"
+
+
+def test_durable_copy_must_match_manifest_to_expose_original(kanban_home):
+    """A CORRUPTED durable copy does not license deleting the original."""
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    root = kb.workspaces_root()
+    durable = kanban_home / "durable"
+    durable.mkdir()
+    good = durable / "intact.md"
+    good.write_text("precious")
+    bad = durable / "corrupt.md"
+    bad.write_text("TAMPERED - different bytes")
+    import hashlib as _h
+    good_sha = _h.sha256(b"precious").hexdigest()
+
+    with kb.connect() as conn:
+        keep = kb.create_task(conn, title="corrupt durable", assignee="w")
+        drop = kb.create_task(conn, title="intact durable", assignee="w")
+        ws_keep = _plant_done_ws(conn, root, keep)
+        ws_drop = _plant_done_ws(conn, root, drop)
+        with kb.write_txn(conn):
+            # durable exists but does NOT match the manifest → original protected
+            conn.execute(
+                "INSERT INTO task_artifacts (task_id, producer_run_id, "
+                "original_path, durable_path, sha256, size, content_type, "
+                "validated_at, retention_class) VALUES (?, 0, ?, ?, ?, 8, "
+                "'text/markdown', strftime('%s','now'), 'default')",
+                (keep, str(ws_keep / "evidence.md"), str(bad), good_sha),
+            )
+            # durable matches → original expendable
+            conn.execute(
+                "INSERT INTO task_artifacts (task_id, producer_run_id, "
+                "original_path, durable_path, sha256, size, content_type, "
+                "validated_at, retention_class) VALUES (?, 0, ?, ?, ?, 8, "
+                "'text/markdown', strftime('%s','now'), 'default')",
+                (drop, str(ws_drop / "evidence.md"), str(good), good_sha),
+            )
+
+    rc = kanban_cli._cmd_gc(argparse.Namespace(
+        event_retention_days=30, log_retention_days=30,
+        workspace_retention_days=7,
+    ))
+    assert rc == 0
+    assert (root / keep).exists(), "corrupt durable copy must not expose the original"
+    assert not (root / drop).exists(), "verified durable copy frees the original"
+
+
+def test_gc_protection_spans_all_boards(kanban_home):
+    """A last-copy reference on board A protects a workspace board B sweeps."""
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    root = kb.workspaces_root()
+    with kb.connect() as conn:
+        host = kb.create_task(conn, title="hosts file", assignee="w")
+        ws = _plant_done_ws(conn, root, host)
+
+    kb.create_board("other")
+    with kb.connect(board="other") as other:
+        owner = kb.create_task(other, title="owns artifact", assignee="w")
+        with kb.write_txn(other):
+            other.execute(
+                "INSERT INTO task_artifacts (task_id, producer_run_id, "
+                "original_path, durable_path, sha256, size, content_type, "
+                "validated_at, retention_class) VALUES (?, 0, ?, ?, 'z', 8, "
+                "'text/markdown', strftime('%s','now'), 'default')",
+                (owner, str(ws / "evidence.md"), str(kanban_home / "gone.md")),
+            )
+
+    rc = kanban_cli._cmd_gc(argparse.Namespace(
+        event_retention_days=30, log_retention_days=30,
+        workspace_retention_days=7,
+    ))
+    assert rc == 0
+    assert (root / host).exists(), "cross-board last-copy reference must protect"

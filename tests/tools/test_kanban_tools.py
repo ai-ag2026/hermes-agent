@@ -2284,11 +2284,52 @@ def _sub_index(subs):
     return out
 
 
-def test_create_subscribes_gateway_session(monkeypatch, worker_env):
-    """A gateway session (platform + chat_id set) gets auto-subscribed
-    to its own kanban_create result, and the response surfaces the
-    ``subscribed`` flag so the orchestrator can react."""
+def _fake_gateway_config(monkeypatch, *platform_names, enabled=True):
+    """Pretend the gateway has these platforms configured."""
+    import gateway.config as gwcfg
+    from types import SimpleNamespace
+    platforms = {}
+    for name in platform_names:
+        platforms[gwcfg.Platform(name)] = SimpleNamespace(enabled=enabled)
+    monkeypatch.setattr(
+        gwcfg, "load_gateway_config",
+        lambda: SimpleNamespace(platforms=platforms),
+    )
+
+
+def test_create_does_not_subscribe_unconfigured_platform(monkeypatch, worker_env):
+    """Enum-known but never configured → no consumer, so no false promise.
+
+    TARS re-review 2026-07-27: a resolvable Platform proves only that the name
+    exists; the gateway notifier delivers exclusively through a configured,
+    enabled adapter.
+    """
     from tools import kanban_tools as kt
+    _fake_gateway_config(monkeypatch, "telegram")  # discord NOT configured
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chan-1")
+    d = json.loads(kt._handle_create({"title": "unconfigured", "assignee": "peer"}))
+    assert d["ok"] is True
+    assert d["subscribed"] is False, d
+    assert _list_subs_for_task(d["task_id"]) == []
+
+
+def test_create_does_not_subscribe_disabled_platform(monkeypatch, worker_env):
+    """Configured but disabled is also consumerless."""
+    from tools import kanban_tools as kt
+    _fake_gateway_config(monkeypatch, "telegram", enabled=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-9")
+    d = json.loads(kt._handle_create({"title": "disabled", "assignee": "peer"}))
+    assert d["subscribed"] is False, d
+
+
+def test_create_subscribes_gateway_session(monkeypatch, worker_env):
+    """A gateway session on a CONFIGURED, ENABLED platform gets
+    auto-subscribed, and the response surfaces the ``subscribed`` flag so the
+    orchestrator can react."""
+    from tools import kanban_tools as kt
+    _fake_gateway_config(monkeypatch, "telegram")
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
     monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
