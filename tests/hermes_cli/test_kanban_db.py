@@ -7201,7 +7201,12 @@ def test_human_gate_token_never_persisted_in_plaintext(kanban_home):
 def test_human_gate_ntfy_failure_is_fail_closed(kanban_home, monkeypatch):
     """A mocked HTTP failure during the ntfy push must leave the card
     hard-blocked: the token hash stays persisted (nobody holds the
-    plaintext), so unblock_task keeps refusing until `gate off`."""
+    plaintext), so unblock_task keeps refusing until `gate off`.
+
+    The ntfy push is legacy-opt-in since gate_notify_ntfy defaulted to off
+    (the durable ops channel replaced it); this test pins the LEGACY path,
+    so it enables the flag explicitly."""
+    monkeypatch.setattr(kb, "gate_notify_ntfy_enabled", lambda: True)
     monkeypatch.setenv("NTFY_TOPIC", "test-topic")
 
     def _raise(*_a, **_kw):
@@ -7234,7 +7239,34 @@ def test_human_gate_ntfy_failure_is_fail_closed(kanban_home, monkeypatch):
         assert kb.get_task(conn, tid).human_gate is False
 
 
+def test_human_gate_token_issuance_succeeds_without_ntfy_by_default(
+    kanban_home, monkeypatch,
+):
+    """Current contract: with gate_notify_ntfy OFF (the default) issuance
+    succeeds WITHOUT any delivery dependency — the durable ops channel and
+    the cockpit are the notify/release paths, ntfy is out of the loop and
+    must not even be attempted."""
+    monkeypatch.delenv("NTFY_TOPIC", raising=False)
+
+    def _must_not_send(*_a, **_kw):
+        raise AssertionError("ntfy push attempted although gate_notify_ntfy is off")
+
+    monkeypatch.setattr(kb, "send_gate_token_ntfy", _must_not_send)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker")
+        kb.block_task(conn, tid, reason="x", kind="needs_input", human_gate=True)
+        assert kb.issue_and_notify_gate_token(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "blocked"
+        row = conn.execute(
+            "SELECT gate_token_hash FROM tasks WHERE id = ?", (tid,)
+        ).fetchone()
+        assert row["gate_token_hash"] is not None
+
+
 def test_human_gate_missing_ntfy_config_is_fail_closed(kanban_home, monkeypatch):
+    """Legacy path (gate_notify_ntfy explicitly on): no configured topic
+    means no delivery — fail-closed."""
+    monkeypatch.setattr(kb, "gate_notify_ntfy_enabled", lambda: True)
     monkeypatch.delenv("NTFY_TOPIC", raising=False)
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="gated", assignee="worker")
@@ -7307,6 +7339,8 @@ def test_cmd_gate_token_issues_delivers_and_redeems_action_grant(
         delivered.update(task_id=task_id, token=token, board=board, action=action)
         return True
 
+    # Legacy ntfy delivery path — opt-in since gate_notify_ntfy defaulted off.
+    monkeypatch.setattr(kb, "gate_notify_ntfy_enabled", lambda: True)
     monkeypatch.setattr(kb, "send_gate_token_ntfy", _capture)
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="gated", assignee="worker")

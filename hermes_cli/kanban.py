@@ -1053,12 +1053,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     # --- gc ---
     p_gc = sub.add_parser(
-        "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
+        "gc", help="Garbage-collect terminal-task workspaces, old events, and old logs",
     )
     p_gc.add_argument("--event-retention-days", type=int, default=30,
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
+    p_gc.add_argument("--workspace-retention-days", type=int, default=7,
+                      help="Also remove scratch workspaces of DONE tasks completed "
+                           "more than N days ago (archived: always). The "
+                           "completion-time cleanup defers when children are "
+                           "active and older tasks predate it — 3.6 GiB of "
+                           "done-task scratch dirs had piled up (audit "
+                           "2026-07-27). 0 disables the done-task sweep.")
 
     # --- audit / repair (invariant reconciler) ---
     p_audit = sub.add_parser(
@@ -3423,18 +3430,41 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove scratch workspaces of archived tasks, prune old events, and
+    """Remove scratch workspaces of terminal tasks, prune old events, and
     delete old worker logs."""
     import shutil
+    import time as _time
     scratch_root = kb.workspaces_root()
     removed_ws = 0
+    ws_days = getattr(args, "workspace_retention_days", 7)
     with kb.connect_closing() as conn:
-        rows = conn.execute(
-            "SELECT id, workspace_kind, workspace_path FROM tasks WHERE status = 'archived'"
-        ).fetchall()
-    for row in rows:
-        if row["workspace_kind"] != "scratch":
-            continue
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, status, workspace_kind, workspace_path, completed_at "
+            "FROM tasks WHERE status IN ('archived', 'done')"
+        ).fetchall()]
+        # Done tasks: age-gate plus the same active-children deferral the
+        # completion-time cleanup uses — a child may still read handoff
+        # files from the parent's scratch dir (#33774).
+        cutoff = int(_time.time()) - int(ws_days) * 24 * 3600
+        eligible = []
+        for row in rows:
+            if row["workspace_kind"] != "scratch":
+                continue
+            if row["status"] == "done":
+                if not ws_days:
+                    continue
+                if (row["completed_at"] or 0) >= cutoff:
+                    continue
+                active_child = conn.execute(
+                    "SELECT 1 FROM task_links l JOIN tasks t ON t.id = l.child_id "
+                    "WHERE l.parent_id = ? AND t.status NOT IN "
+                    "('done', 'archived', 'failed', 'cancelled') LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                if active_child:
+                    continue
+            eligible.append(row)
+    for row in eligible:
         path = Path(row["workspace_path"] or (scratch_root / row["id"]))
         try:
             path = path.resolve()

@@ -1780,6 +1780,7 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_task_id        ON task_events(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_mutation_log_op_at    ON mutation_log(op, at);
 CREATE INDEX IF NOT EXISTS idx_manifest_active       ON mutation_manifest(kind, status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task         ON task_artifacts(task_id, producer_run_id);
@@ -2578,9 +2579,62 @@ def _scavenge_completion_artifacts_locked(
     grace_seconds: int = 3600,
     now: Optional[float] = None,
 ) -> int:
-    """Remove stale files that no committed manifest references."""
+    """Remove stale files that no committed manifest references.
+
+    HARD PRECONDITION (incident 2026-07-27): the reference set comes from
+    ``conn``'s ``task_artifacts`` table, the sweep walks the ROOT resolved
+    from ``board``/env. Those two resolved independently: with
+    ``HERMES_KANBAN_DB`` pointing at board X while the current board resolves
+    to default, the sweep walked the DEFAULT artifact root holding board X's
+    reference set — and deleted every default-board artifact file older than
+    the grace window as "unreferenced". One mismatched CLI invocation
+    (``HERMES_KANBAN_DB=<board-db> hermes kanban audit``) destroyed all 84
+    durable artifact files of the default board; the 2026-07-13 artifact
+    losses match the same signature. The sweep now refuses to run unless the
+    DB actually backing ``conn`` is the canonical DB of the same board whose
+    root it is about to sweep.
+    """
     root = completion_artifacts_root(board=board).absolute()
     if not root.exists() or not hasattr(os, "fwalk"):
+        return 0
+    try:
+        actual_db = None
+        for _, name, filename in conn.execute("PRAGMA database_list"):
+            if name == "main":
+                actual_db = filename
+                break
+        # Derive the owning DB STRUCTURALLY from the root path — NOT via
+        # kanban_db_path(), which honours the very HERMES_KANBAN_DB override
+        # that caused the mismatch in the first place. Default root
+        # <home>/kanban/artifacts belongs to <home>/kanban.db; a board root
+        # <home>/kanban/boards/<slug>/artifacts belongs to its sibling
+        # kanban.db. An HERMES_KANBAN_ARTIFACTS_ROOT override has no
+        # derivable owner: fail closed, never sweep.
+        default_root = (kanban_home() / "kanban" / "artifacts").absolute()
+        if os.environ.get("HERMES_KANBAN_ARTIFACTS_ROOT", "").strip():
+            _log.warning(
+                "kanban artifact scavenger: HERMES_KANBAN_ARTIFACTS_ROOT is "
+                "set; owner DB not derivable — skipping sweep of %s", root,
+            )
+            return 0
+        if root == default_root:
+            expected_db = (kanban_home() / "kanban.db").resolve()
+        else:
+            expected_db = (root.parent / "kanban.db").resolve()
+        if not actual_db or Path(actual_db).resolve() != expected_db:
+            _log.warning(
+                "kanban artifact scavenger: connection DB %r does not own "
+                "artifact root %s (owner: %s) — refusing to sweep with a "
+                "foreign reference set",
+                actual_db, root, expected_db,
+            )
+            return 0
+    except Exception:
+        # Fail CLOSED: if we cannot prove DB↔root identity, do not delete.
+        _log.warning(
+            "kanban artifact scavenger: could not verify DB/root identity; "
+            "skipping sweep", exc_info=True,
+        )
         return 0
     referenced = {
         str(row[0]) for row in conn.execute("SELECT durable_path FROM task_artifacts")
@@ -3558,6 +3612,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
+    )
+    # Notify-cursor seek path: unseen_events_for_sub filters ``task_id = ?
+    # AND id > ?``. idx_events_task is (task_id, created_at), so the id bound
+    # could not be used as a seek and every poll re-read the task's full
+    # event history plus a TEMP B-TREE sort. Costs scale with events-per-task
+    # (max 427 today — vorsorglich, not a felt latency yet; audit 2026-07-27).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_task_id "
+        "ON task_events(task_id, id)"
     )
 
     # task_runs gained a session_id column (event-sourcing resume, #2). It pins

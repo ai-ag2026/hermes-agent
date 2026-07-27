@@ -379,13 +379,33 @@ def _audit_stale_promotable(conn) -> list[Finding]:
     """
     findings: list[Finding] = []
     rows = conn.execute(
-        "SELECT id, status, consecutive_failures, max_retries "
+        "SELECT id, status, consecutive_failures, max_retries, human_gate "
         "FROM tasks WHERE status IN ('todo', 'blocked')"
     ).fetchall()
     for row in rows:
         task_id = row["id"]
         status = row["status"]
+        # Full parity with recompute_ready's exclusion set (human_gate,
+        # sticky block, live attention) — the docstring's "can never
+        # disagree with the dispatcher" claim was false for human-gated and
+        # attention-carrying cards, which showed up as safe_repair noise the
+        # repair path then refused (audit 2026-07-27).
+        try:
+            human_gate = int(row["human_gate"] or 0)
+        except (KeyError, IndexError, TypeError, ValueError):
+            human_gate = 0
+        if status == "blocked" and human_gate:
+            continue
         if status == "blocked" and kb._has_sticky_block(conn, task_id):
+            continue
+        try:
+            has_attention = conn.execute(
+                "SELECT 1 FROM task_attentions WHERE task_id = ? LIMIT 1",
+                (task_id,),
+            ).fetchone() is not None
+        except Exception:
+            has_attention = False
+        if status == "blocked" and has_attention:
             continue
         parents = conn.execute(
             "SELECT t.status FROM tasks t "
@@ -756,6 +776,168 @@ def _audit_referential_integrity(conn) -> list[Finding]:
     return findings
 
 
+# Aging thresholds (audit 2026-07-27): every one of these states has, or had,
+# a real silent-death path — a review nobody can claim, a triage card no
+# supervisor picks up, a subscription whose events nobody delivers, an
+# attention delivery whose sender died mid-lease. The audit's job is to make
+# "nothing is moving" visible; it stays read-only.
+_AUDIT_REVIEW_STALE_SECONDS = 30 * 60
+_AUDIT_TRIAGE_STALE_SECONDS = 7 * 24 * 3600
+_AUDIT_SUB_UNDELIVERED_SECONDS = 15 * 60
+_AUDIT_ATTENTION_LEASE_GRACE_SECONDS = 5 * 60
+
+
+def _audit_aging_unclaimed_states(conn) -> list[Finding]:
+    """Cards aging in states that need an actor who may never come.
+
+    ``review`` without a claim: the reviewer spawn is skipped silently for
+    unassigned/unknown/human-driven assignees (skipped_nonspawnable) — the
+    request-time validation stops NEW dead handshakes, this catches legacy
+    and edge cases. ``triage``: auto-decompose can give up and the
+    pm-supervisor is off by default; nothing else ever looks at old triage.
+    """
+    findings: list[Finding] = []
+    now = int(time.time())
+    try:
+        rows = conn.execute(
+            "SELECT t.id, t.status, t.assignee, "
+            "  COALESCE((SELECT MAX(e.created_at) FROM task_events e "
+            "            WHERE e.task_id = t.id), t.created_at) AS last_activity "
+            "FROM tasks t WHERE t.status IN ('review', 'triage') "
+            "AND t.claim_lock IS NULL"
+        ).fetchall()
+    except Exception:
+        return findings
+    for row in rows:
+        age = now - int(row["last_activity"] or 0)
+        threshold = (
+            _AUDIT_REVIEW_STALE_SECONDS if row["status"] == "review"
+            else _AUDIT_TRIAGE_STALE_SECONDS
+        )
+        if age < threshold:
+            continue
+        findings.append(
+            Finding(
+                kind=f"stale_{row['status']}_task",
+                task_id=row["id"],
+                bucket="triage",
+                detail=(
+                    f"task has sat unclaimed in {row['status']!r} for "
+                    f"{age // 60} min (assignee={row['assignee'] or '-'}) — "
+                    "nothing dispatches it and nobody was notified"
+                ),
+                data={"age_seconds": age, "assignee": row["assignee"]},
+            )
+        )
+    return findings
+
+
+def _audit_undelivered_notify_subscriptions(conn) -> list[Finding]:
+    """Active subscriptions whose task finished but whose cursor never moved.
+
+    The 2026-07-27 incident shape: 155 webui rows sat at cursor 0 with 372
+    undelivered terminal events and NO audit rule saw them (the referential
+    check only finds subs on deleted tasks). A healthy notifier claims a
+    terminal event within one tick; minutes of lag means the platform has no
+    consumer or the consumer is broken.
+    """
+    findings: list[Finding] = []
+    now = int(time.time())
+    try:
+        rows = conn.execute(
+            "SELECT s.task_id, s.platform, s.chat_id, s.last_event_id, "
+            "  (SELECT MAX(e.id) FROM task_events e WHERE e.task_id = s.task_id) AS max_event, "
+            "  (SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = s.task_id) AS last_event_at "
+            "FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+            "WHERE s.active = 1 AND t.status IN ('done', 'archived', 'blocked')"
+        ).fetchall()
+    except Exception:
+        return findings
+    for row in rows:
+        if int(row["last_event_id"] or 0) >= int(row["max_event"] or 0):
+            continue
+        lag = now - int(row["last_event_at"] or 0)
+        if lag < _AUDIT_SUB_UNDELIVERED_SECONDS:
+            continue
+        findings.append(
+            Finding(
+                kind="undelivered_subscription",
+                task_id=row["task_id"],
+                bucket="triage",
+                detail=(
+                    f"active subscription {row['platform']}:{row['chat_id']} "
+                    f"is {lag // 60} min behind the task's terminal events "
+                    "(cursor never advanced) — no consumer is delivering "
+                    "for this platform"
+                ),
+                data={
+                    "platform": row["platform"],
+                    "chat_id": row["chat_id"],
+                    "cursor": int(row["last_event_id"] or 0),
+                    "max_event": int(row["max_event"] or 0),
+                },
+            )
+        )
+    return findings
+
+
+def _audit_stuck_attention_deliveries(conn) -> list[Finding]:
+    """'sending' attention deliveries whose lease expired long ago."""
+    findings: list[Finding] = []
+    cutoff = int(time.time()) - _AUDIT_ATTENTION_LEASE_GRACE_SECONDS
+    try:
+        rows = conn.execute(
+            "SELECT task_id, platform, chat_id, lease_until "
+            "FROM kanban_attention_deliveries "
+            "WHERE state = 'sending' AND lease_until < ?",
+            (cutoff,),
+        ).fetchall()
+    except Exception:
+        return findings
+    for row in rows:
+        findings.append(
+            Finding(
+                kind="stuck_attention_delivery",
+                task_id=row["task_id"],
+                bucket="triage",
+                detail=(
+                    f"attention delivery to {row['platform']}:{row['chat_id']} "
+                    "is stuck in 'sending' past its lease — the claiming "
+                    "notifier died mid-send"
+                ),
+                data={"platform": row["platform"], "chat_id": row["chat_id"]},
+            )
+        )
+    return findings
+
+
+def _audit_claim_residue(conn) -> list[Finding]:
+    """claim_lock/claim_expires left behind on non-running cards."""
+    findings: list[Finding] = []
+    try:
+        rows = conn.execute(
+            "SELECT id, status, claim_lock FROM tasks "
+            "WHERE claim_lock IS NOT NULL AND status != 'running'"
+        ).fetchall()
+    except Exception:
+        return findings
+    for row in rows:
+        findings.append(
+            Finding(
+                kind="claim_residue",
+                task_id=row["id"],
+                bucket="triage",
+                detail=(
+                    f"task is {row['status']!r} but still carries claim "
+                    f"{row['claim_lock']!r} — a terminal transition skipped "
+                    "the claim clear"
+                ),
+                data={"status": row["status"], "claim_lock": row["claim_lock"]},
+            )
+        )
+    return findings
+
+
 _AUDIT_FUNCS: tuple[Callable[[Any], list[Finding]], ...] = (
     _audit_run_pointer_invariants,
     _audit_multiple_open_runs,
@@ -766,6 +948,10 @@ _AUDIT_FUNCS: tuple[Callable[[Any], list[Finding]], ...] = (
     _audit_closeout_evidence_on_blocked,
     _audit_archived_with_pending_review,
     _audit_referential_integrity,
+    _audit_aging_unclaimed_states,
+    _audit_undelivered_notify_subscriptions,
+    _audit_stuck_attention_deliveries,
+    _audit_claim_residue,
 )
 
 

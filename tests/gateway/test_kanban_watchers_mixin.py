@@ -88,6 +88,9 @@ def test_issue_pending_gate_tokens_issues_and_pushes_for_gated_blocked_cards(
     kb.init_db()
 
     pushed: list[tuple[str, str]] = []
+    # Legacy ntfy delivery path — opt-in since gate_notify_ntfy defaulted off
+    # (the durable ops channel replaced it); this test pins the legacy push.
+    monkeypatch.setattr(kb, "gate_notify_ntfy_enabled", lambda: True)
     monkeypatch.setattr(
         kb, "send_gate_token_ntfy",
         lambda task_id, token, **kw: (pushed.append((task_id, token)) or True),
