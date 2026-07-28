@@ -1783,13 +1783,35 @@ class TestGetDueJobs:
             "origin": None,
         }])
 
-        # Whatever croniter makes of the non-existent slot, the recovery must
-        # produce a usable, stored next_run_at and must not raise.
+        # TARS re-review round 4 asked for a stronger assertion than "parsable
+        # and tz-aware". Pinning the ACTUAL behaviour, which I measured against
+        # the parent commit before writing it down: croniter hands back
+        # 2026-03-29T02:30+01:00 — a local time that does NOT exist that day,
+        # carrying the pre-transition offset. That is pre-existing croniter
+        # behaviour, identical with and without the recovery change, so this
+        # test pins it rather than pretending the recovery invented it.
+        #
+        # What matters operationally is that the phantom RESOLVES: the value
+        # lands before now, so the job becomes due, catches up exactly once and
+        # re-anchors into the future. A regression that left it looping (due
+        # every tick, never advancing) would fail here.
         get_due_jobs()
         stored = get_job("cron-dst-gap")["next_run_at"]
         assert stored, "the gap must not leave the job without a next run"
         parsed = datetime.fromisoformat(stored)
         assert parsed.tzinfo is not None, "and it stays timezone-aware"
+        assert parsed.astimezone(berlin).replace(tzinfo=None) == datetime(
+            2026, 3, 29, 3, 30
+        ), "the nominal 02:30+01:00 is 03:30 local — the skipped hour, shifted"
+
+        assert [j["id"] for j in get_due_jobs()] == ["cron-dst-gap"], (
+            "the phantom slot is in the past, so the job is due"
+        )
+        advance_next_run("cron-dst-gap")
+        mark_job_run("cron-dst-gap", success=True)
+        after = datetime.fromisoformat(get_job("cron-dst-gap")["next_run_at"])
+        assert after > now, "one catch-up, then forward — not a per-tick loop"
+        assert get_due_jobs() == [], "and it stays consumed"
 
     def test_history_less_interval_uses_created_at_as_cadence_anchor(self, tmp_cron_dir, monkeypatch):
         """TARS review, P3: the grace lookback can never help an interval job.

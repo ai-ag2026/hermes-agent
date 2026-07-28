@@ -26,6 +26,7 @@ from cron.jobs import (
     get_job,
     list_jobs,
     mark_job_run,
+    stamp_schedule_anchor,
     parse_schedule,
     pause_job,
     remove_job,
@@ -635,6 +636,19 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}
+
+        # An immediate manual run RE-PHASES an interval job: mark_job_run
+        # anchors the following terms on this completion. Stamp the cadence
+        # anchor with it, or a later recovery of a lost next_run_at (or a
+        # definitions restore, which carries no history) rebuilds the old phase
+        # (TARS re-review, round 4). trigger_job does the same for its path.
+        try:
+            stamp_schedule_anchor(job_id)
+        except Exception:
+            logger.warning(
+                "Could not re-stamp the cadence anchor for %s; the immediate "
+                "run proceeds", job_id, exc_info=True,
+            )
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.

@@ -1720,6 +1720,34 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
+def stamp_schedule_anchor(job_id: str) -> bool:
+    """Re-stamp ``schedule_anchor_at`` — the interval cadence anchor.
+
+    Call this from paths that RESTART the cadence rather than follow it: an
+    immediate manual run re-phases the job, because ``mark_job_run`` anchors the
+    following interval terms on that completion. Without the stamp, a later
+    recovery of a lost ``next_run_at`` — or a definitions restore, which carries
+    no history at all — reconstructs the pre-run phase (TARS re-review, round 4).
+
+    Deliberately NOT called from :func:`claim_job_for_fire`: that one also
+    serves the regular external-provider fire path, which follows the schedule
+    instead of re-phasing it.
+
+    Touches exactly this one field, under the jobs lock, so it cannot clobber a
+    fire claim written by a concurrent tick.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                if job.get("schedule", {}).get("kind") != "interval":
+                    return False  # cron carries its phase in the expression
+                job["schedule_anchor_at"] = _hermes_now().isoformat()
+                save_jobs(jobs)
+                return True
+        return False
+
+
 def advance_next_run(job_id: str) -> bool:
     """Preemptively advance next_run_at for a recurring job before execution.
 
