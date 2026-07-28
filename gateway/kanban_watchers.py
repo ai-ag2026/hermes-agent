@@ -2025,15 +2025,37 @@ class GatewayKanbanWatchersMixin:
         # (shared across profiles by design), so it serialises ALL gateways.
         self._kanban_dispatcher_lock_handle = None
         _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
-        _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
-        if _lock_state == "contended":
-            logger.info(
-                "kanban dispatcher: another gateway already holds the dispatcher "
-                "lock (%s); this gateway will NOT dispatch.", _lock_path,
-            )
-            return
+        # A watcher restart can land inside the maintenance watchdog's release
+        # window: the watchdog keeps the flock until the last maintenance thread
+        # finishes (bounded by the aux-LLM timeout, not by process lifetime). A
+        # single "contended" answer there used to make this gateway give up for
+        # good — it stayed dark until the next restart although the lock became
+        # free seconds later (TARS re-review 2026-07-27, P2 liveness). Retry for
+        # a bounded window; nothing is held yet, so a cancellation here is free.
+        _CONTENDED_RETRY_SECONDS = 15.0
+        _CONTENDED_RETRY_BUDGET = 300.0
+        _contended_waited = 0.0
+        while True:
+            _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+            if _lock_state != "contended":
+                break
+            if _contended_waited >= _CONTENDED_RETRY_BUDGET:
+                logger.info(
+                    "kanban dispatcher: another gateway still holds the dispatcher "
+                    "lock (%s) after %.0fs; this gateway will NOT dispatch.",
+                    _lock_path, _contended_waited,
+                )
+                return
+            if _contended_waited == 0.0:
+                logger.info(
+                    "kanban dispatcher: dispatcher lock (%s) is held — retrying for "
+                    "up to %.0fs before standing down.",
+                    _lock_path, _CONTENDED_RETRY_BUDGET,
+                )
+            await asyncio.sleep(_CONTENDED_RETRY_SECONDS)
+            _contended_waited += _CONTENDED_RETRY_SECONDS
         if _lock_state == "held":
-            self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
+            self._kanban_dispatcher_lock_handle = _lock_handle  # held while dispatching
             logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
         else:
             logger.warning(
@@ -2041,759 +2063,787 @@ class GatewayKanbanWatchersMixin:
                 "on config control alone.", _lock_path,
             )
 
+        # Set once the maintenance executor exists, so the outer finally can
+        # drain instead of releasing under a still-writing maintenance thread.
+        self._kanban_dispatcher_finish = None
         try:
-            interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
-        except (ValueError, TypeError):
-            logger.warning(
-                "kanban dispatcher: invalid dispatch_interval_seconds=%r, using default 60",
-                kanban_cfg.get("dispatch_interval_seconds"),
-            )
-            interval = 60.0
-        interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
-
-        # Read max_spawn config to limit concurrent kanban tasks
-        max_spawn = kanban_cfg.get("max_spawn", None)
-        if max_spawn is not None:
-            logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
-
-        # Cap the number of simultaneously running tasks so slow workers
-        # (local LLMs, resource-constrained hosts) don't pile up and time
-        # out. When set, the dispatcher skips spawning when the board
-        # already has this many tasks in 'running' status.
-        raw_max_in_progress = kanban_cfg.get("max_in_progress", None)
-        max_in_progress = None
-        if raw_max_in_progress is not None:
             try:
-                max_in_progress = int(raw_max_in_progress)
-            except (TypeError, ValueError):
+                interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
+            except (ValueError, TypeError):
                 logger.warning(
-                    "kanban dispatcher: invalid kanban.max_in_progress=%r; ignoring",
-                    raw_max_in_progress,
+                    "kanban dispatcher: invalid dispatch_interval_seconds=%r, using default 60",
+                    kanban_cfg.get("dispatch_interval_seconds"),
                 )
-                max_in_progress = None
-            else:
-                if max_in_progress < 1:
+                interval = 60.0
+            interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
+
+            # Read max_spawn config to limit concurrent kanban tasks
+            max_spawn = kanban_cfg.get("max_spawn", None)
+            if max_spawn is not None:
+                logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
+
+            # Cap the number of simultaneously running tasks so slow workers
+            # (local LLMs, resource-constrained hosts) don't pile up and time
+            # out. When set, the dispatcher skips spawning when the board
+            # already has this many tasks in 'running' status.
+            raw_max_in_progress = kanban_cfg.get("max_in_progress", None)
+            max_in_progress = None
+            if raw_max_in_progress is not None:
+                try:
+                    max_in_progress = int(raw_max_in_progress)
+                except (TypeError, ValueError):
                     logger.warning(
-                        "kanban dispatcher: kanban.max_in_progress=%r is below 1; ignoring",
+                        "kanban dispatcher: invalid kanban.max_in_progress=%r; ignoring",
                         raw_max_in_progress,
                     )
                     max_in_progress = None
                 else:
-                    logger.info(f"kanban dispatcher: max_in_progress={max_in_progress}")
+                    if max_in_progress < 1:
+                        logger.warning(
+                            "kanban dispatcher: kanban.max_in_progress=%r is below 1; ignoring",
+                            raw_max_in_progress,
+                        )
+                        max_in_progress = None
+                    else:
+                        logger.info(f"kanban dispatcher: max_in_progress={max_in_progress}")
 
-        raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
-        try:
-            failure_limit = int(raw_failure_limit)
-        except (TypeError, ValueError):
-            logger.warning(
-                "kanban dispatcher: invalid kanban.failure_limit=%r; using default %d",
-                raw_failure_limit,
-                _kb.DEFAULT_FAILURE_LIMIT,
-            )
-            failure_limit = _kb.DEFAULT_FAILURE_LIMIT
-        if failure_limit < 1:
-            logger.warning(
-                "kanban dispatcher: kanban.failure_limit=%r is below 1; using default %d",
-                raw_failure_limit,
-                _kb.DEFAULT_FAILURE_LIMIT,
-            )
-            failure_limit = _kb.DEFAULT_FAILURE_LIMIT
-
-        # Read stale_timeout_seconds — 0 disables stale detection.
-        raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
-        resource_monitor = kanban_cfg.get("resource_monitor", {})
-        if not isinstance(resource_monitor, dict):
-            resource_monitor = {}
-        try:
-            stale_timeout_seconds = int(raw_stale or 0)
-        except (TypeError, ValueError):
-            logger.warning(
-                "kanban dispatcher: invalid kanban.dispatch_stale_timeout_seconds=%r; "
-                "disabling stale detection",
-                raw_stale,
-            )
-            stale_timeout_seconds = 0
-
-        # Read kanban.default_assignee — fallback profile for tasks
-        # created without an explicit assignee (e.g. via the dashboard).
-        # When set, the dispatcher applies it to unassigned ready tasks
-        # instead of skipping them indefinitely (#27145). Empty string
-        # (the schema default) means "no fallback, keep skipping" —
-        # backward-compatible with existing installs.
-        default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
-        if default_assignee:
-            logger.info(
-                "kanban dispatcher: default_assignee=%r (unassigned ready tasks "
-                "will route to this profile)",
-                default_assignee,
-            )
-
-        # Read kanban.max_in_progress_per_profile — per-profile concurrency
-        # cap (#21582). When set, no single profile gets more than N
-        # workers running at once, even if the global max_in_progress
-        # would allow it. Prevents one profile's local model / API quota
-        # / browser pool from being overwhelmed by a fan-out.
-        raw_per_profile = kanban_cfg.get("max_in_progress_per_profile", None)
-        max_in_progress_per_profile = None
-        if raw_per_profile is not None:
+            raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
             try:
-                max_in_progress_per_profile = int(raw_per_profile)
+                failure_limit = int(raw_failure_limit)
             except (TypeError, ValueError):
                 logger.warning(
-                    "kanban dispatcher: invalid kanban.max_in_progress_per_profile=%r; ignoring",
-                    raw_per_profile,
+                    "kanban dispatcher: invalid kanban.failure_limit=%r; using default %d",
+                    raw_failure_limit,
+                    _kb.DEFAULT_FAILURE_LIMIT,
                 )
-                max_in_progress_per_profile = None
-            else:
-                if max_in_progress_per_profile < 1:
+                failure_limit = _kb.DEFAULT_FAILURE_LIMIT
+            if failure_limit < 1:
+                logger.warning(
+                    "kanban dispatcher: kanban.failure_limit=%r is below 1; using default %d",
+                    raw_failure_limit,
+                    _kb.DEFAULT_FAILURE_LIMIT,
+                )
+                failure_limit = _kb.DEFAULT_FAILURE_LIMIT
+
+            # Read stale_timeout_seconds — 0 disables stale detection.
+            raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
+            resource_monitor = kanban_cfg.get("resource_monitor", {})
+            if not isinstance(resource_monitor, dict):
+                resource_monitor = {}
+            try:
+                stale_timeout_seconds = int(raw_stale or 0)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "kanban dispatcher: invalid kanban.dispatch_stale_timeout_seconds=%r; "
+                    "disabling stale detection",
+                    raw_stale,
+                )
+                stale_timeout_seconds = 0
+
+            # Read kanban.default_assignee — fallback profile for tasks
+            # created without an explicit assignee (e.g. via the dashboard).
+            # When set, the dispatcher applies it to unassigned ready tasks
+            # instead of skipping them indefinitely (#27145). Empty string
+            # (the schema default) means "no fallback, keep skipping" —
+            # backward-compatible with existing installs.
+            default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
+            if default_assignee:
+                logger.info(
+                    "kanban dispatcher: default_assignee=%r (unassigned ready tasks "
+                    "will route to this profile)",
+                    default_assignee,
+                )
+
+            # Read kanban.max_in_progress_per_profile — per-profile concurrency
+            # cap (#21582). When set, no single profile gets more than N
+            # workers running at once, even if the global max_in_progress
+            # would allow it. Prevents one profile's local model / API quota
+            # / browser pool from being overwhelmed by a fan-out.
+            raw_per_profile = kanban_cfg.get("max_in_progress_per_profile", None)
+            max_in_progress_per_profile = None
+            if raw_per_profile is not None:
+                try:
+                    max_in_progress_per_profile = int(raw_per_profile)
+                except (TypeError, ValueError):
                     logger.warning(
-                        "kanban dispatcher: kanban.max_in_progress_per_profile=%r is below 1; ignoring",
+                        "kanban dispatcher: invalid kanban.max_in_progress_per_profile=%r; ignoring",
                         raw_per_profile,
                     )
                     max_in_progress_per_profile = None
                 else:
-                    logger.info(
-                        "kanban dispatcher: max_in_progress_per_profile=%d",
-                        max_in_progress_per_profile,
-                    )
+                    if max_in_progress_per_profile < 1:
+                        logger.warning(
+                            "kanban dispatcher: kanban.max_in_progress_per_profile=%r is below 1; ignoring",
+                            raw_per_profile,
+                        )
+                        max_in_progress_per_profile = None
+                    else:
+                        logger.info(
+                            "kanban dispatcher: max_in_progress_per_profile=%d",
+                            max_in_progress_per_profile,
+                        )
 
-        # Initial delay so the gateway finishes wiring adapters before the
-        # dispatcher spawns workers (those workers may hit gateway notify
-        # subscriptions etc.). Matches the notifier watcher's delay.
-        await asyncio.sleep(5)
+            # Initial delay so the gateway finishes wiring adapters before the
+            # dispatcher spawns workers (those workers may hit gateway notify
+            # subscriptions etc.). Matches the notifier watcher's delay.
+            await asyncio.sleep(5)
 
-        # Health telemetry mirrored from `_cmd_daemon`: warn when ready
-        # queue is non-empty but spawns are 0 for N consecutive ticks —
-        # usually means broken PATH, missing venv, or credential loss.
-        HEALTH_WINDOW = 6
-        bad_ticks = 0
-        last_warn_at = 0
-        shadow_last_warning: dict[tuple[str, str], int] = {}
-        # Avoid hot-looping corrupt-looking board DBs, but do not suppress
-        # same-fingerprint retries forever: transient WAL/open races can
-        # surface as "database disk image is malformed" for one tick.
-        CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
-        disabled_corrupt_boards: dict[
-            str, tuple[tuple[str, int | None, int | None], float]
-        ] = {}
+            # Health telemetry mirrored from `_cmd_daemon`: warn when ready
+            # queue is non-empty but spawns are 0 for N consecutive ticks —
+            # usually means broken PATH, missing venv, or credential loss.
+            HEALTH_WINDOW = 6
+            bad_ticks = 0
+            last_warn_at = 0
+            shadow_last_warning: dict[tuple[str, str], int] = {}
+            # Avoid hot-looping corrupt-looking board DBs, but do not suppress
+            # same-fingerprint retries forever: transient WAL/open races can
+            # surface as "database disk image is malformed" for one tick.
+            CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
+            disabled_corrupt_boards: dict[
+                str, tuple[tuple[str, int | None, int | None], float]
+            ] = {}
 
-        def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
-            path = _kb.kanban_db_path(slug)
-            try:
-                resolved = str(path.expanduser().resolve())
-            except Exception:
-                resolved = str(path)
-            try:
-                stat = path.stat()
-            except OSError:
-                return (resolved, None, None)
-            return (resolved, stat.st_mtime_ns, stat.st_size)
+            def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
+                path = _kb.kanban_db_path(slug)
+                try:
+                    resolved = str(path.expanduser().resolve())
+                except Exception:
+                    resolved = str(path)
+                try:
+                    stat = path.stat()
+                except OSError:
+                    return (resolved, None, None)
+                return (resolved, stat.st_mtime_ns, stat.st_size)
 
-        def _is_corrupt_board_db_error(exc: Exception) -> bool:
-            corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
-            if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
-                return True
-            if not isinstance(exc, sqlite3.DatabaseError):
-                return False
-            msg = str(exc).lower()
-            return (
-                "file is not a database" in msg
-                or "database disk image is malformed" in msg
-            )
-
-        def _tick_once_for_board(slug: str) -> "Optional[object]":
-            """Run one dispatch_once for a specific board.
-
-            Runs in a worker thread via `asyncio.to_thread`. `board=slug`
-            is passed through `dispatch_once` so `resolve_workspace` and
-            `_default_spawn` see the right paths. The per-board DB is
-            opened explicitly so concurrent boards never share a
-            connection handle or accidentally claim across each other.
-            """
-            conn = None
-            fingerprint = _board_db_fingerprint(slug)
-            disabled_entry = disabled_corrupt_boards.get(slug)
-            if disabled_entry is not None:
-                disabled_fingerprint, disabled_at = disabled_entry
-                age = time.monotonic() - disabled_at
-                if (
-                    disabled_fingerprint == fingerprint
-                    and age < CORRUPT_BOARD_RETRY_AFTER_SECONDS
-                ):
-                    return None
-                if disabled_fingerprint == fingerprint:
-                    logger.info(
-                        "kanban dispatcher: board %s database fingerprint unchanged "
-                        "after %.0fs quarantine; retrying dispatch",
-                        slug,
-                        age,
-                    )
-                else:
-                    logger.info(
-                        "kanban dispatcher: board %s database changed; retrying dispatch",
-                        slug,
-                    )
-                disabled_corrupt_boards.pop(slug, None)
-            try:
-                conn = _kb.connect(board=slug)
-                # `connect()` runs the schema + idempotent migration on
-                # first open per process; the previous explicit
-                # `init_db()` call here busted the per-process cache and
-                # re-ran the migration on a second connection, racing
-                # the first. See the matching comment in
-                # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
-                    conn,
-                    board=slug,
-                    max_spawn=max_spawn,
-                    max_in_progress=max_in_progress,
-                    failure_limit=failure_limit,
-                    stale_timeout_seconds=stale_timeout_seconds,
-                    default_assignee=default_assignee,
-                    max_in_progress_per_profile=max_in_progress_per_profile,
-                    resource_monitor=resource_monitor,
+            def _is_corrupt_board_db_error(exc: Exception) -> bool:
+                corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
+                if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
+                    return True
+                if not isinstance(exc, sqlite3.DatabaseError):
+                    return False
+                msg = str(exc).lower()
+                return (
+                    "file is not a database" in msg
+                    or "database disk image is malformed" in msg
                 )
-            except sqlite3.DatabaseError as exc:
-                if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; pausing dispatch for this board until "
-                        "the file changes, the gateway restarts, or the "
-                        "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
-                    return None
-                logger.exception("kanban dispatcher: tick failed on board %s", slug)
-                return None
-            except Exception as exc:
-                if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; pausing dispatch for this board until "
-                        "the file changes, the gateway restarts, or the "
-                        "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
-                    return None
-                logger.exception("kanban dispatcher: tick failed on board %s", slug)
-                return None
-            finally:
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
 
-        def _tick_once() -> "list[tuple[str, Optional[object]]]":
-            """Run one dispatch_once per board. Returns (slug, result) pairs.
+            def _tick_once_for_board(slug: str) -> "Optional[object]":
+                """Run one dispatch_once for a specific board.
 
-            Enumerating boards on every tick keeps the dispatcher honest
-            when users create a new board mid-run: no restart required,
-            the next tick picks it up automatically.
-            """
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            out: list[tuple[str, "Optional[object]"]] = []
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug)))
-            return out
-
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
-
-            Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
-            ``orion-research``) are pulled by terminals via
-            ``claim_task`` directly and never spawnable, so a queue full
-            of those is "correctly idle", not "stuck". Filtering them out
-            here keeps the stuck-warn fire only on real failures (broken
-            PATH, missing venv, credential loss for a real Hermes profile).
-            """
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
+                Runs in a worker thread via `asyncio.to_thread`. `board=slug`
+                is passed through `dispatch_once` so `resolve_workspace` and
+                `_default_spawn` see the right paths. The per-board DB is
+                opened explicitly so concurrent boards never share a
+                connection handle or accidentally claim across each other.
+                """
                 conn = None
+                fingerprint = _board_db_fingerprint(slug)
+                disabled_entry = disabled_corrupt_boards.get(slug)
+                if disabled_entry is not None:
+                    disabled_fingerprint, disabled_at = disabled_entry
+                    age = time.monotonic() - disabled_at
+                    if (
+                        disabled_fingerprint == fingerprint
+                        and age < CORRUPT_BOARD_RETRY_AFTER_SECONDS
+                    ):
+                        return None
+                    if disabled_fingerprint == fingerprint:
+                        logger.info(
+                            "kanban dispatcher: board %s database fingerprint unchanged "
+                            "after %.0fs quarantine; retrying dispatch",
+                            slug,
+                            age,
+                        )
+                    else:
+                        logger.info(
+                            "kanban dispatcher: board %s database changed; retrying dispatch",
+                            slug,
+                        )
+                    disabled_corrupt_boards.pop(slug, None)
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _kb.has_spawnable_review(conn):
-                        return True
-                except Exception:
-                    continue
+                    # `connect()` runs the schema + idempotent migration on
+                    # first open per process; the previous explicit
+                    # `init_db()` call here busted the per-process cache and
+                    # re-ran the migration on a second connection, racing
+                    # the first. See the matching comment in
+                    # `_kanban_notifier_watcher` and issue #21378.
+                    return _kb.dispatch_once(
+                        conn,
+                        board=slug,
+                        max_spawn=max_spawn,
+                        max_in_progress=max_in_progress,
+                        failure_limit=failure_limit,
+                        stale_timeout_seconds=stale_timeout_seconds,
+                        default_assignee=default_assignee,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                        resource_monitor=resource_monitor,
+                    )
+                except sqlite3.DatabaseError as exc:
+                    if _is_corrupt_board_db_error(exc):
+                        disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
+                        logger.error(
+                            "kanban dispatcher: board %s database %s is not a valid "
+                            "SQLite database; pausing dispatch for this board until "
+                            "the file changes, the gateway restarts, or the "
+                            "quarantine timer expires. Move or restore the file, "
+                            "then run `hermes kanban init` if you need a fresh board.",
+                            slug,
+                            fingerprint[0],
+                        )
+                        return None
+                    logger.exception("kanban dispatcher: tick failed on board %s", slug)
+                    return None
+                except Exception as exc:
+                    if _is_corrupt_board_db_error(exc):
+                        disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
+                        logger.error(
+                            "kanban dispatcher: board %s database %s is not a valid "
+                            "SQLite database; pausing dispatch for this board until "
+                            "the file changes, the gateway restarts, or the "
+                            "quarantine timer expires. Move or restore the file, "
+                            "then run `hermes kanban init` if you need a fresh board.",
+                            slug,
+                            fingerprint[0],
+                        )
+                        return None
+                    logger.exception("kanban dispatcher: tick failed on board %s", slug)
+                    return None
                 finally:
                     if conn is not None:
                         try:
                             conn.close()
                         except Exception:
                             pass
-            return False
 
-        # Auto-decompose: turn fresh triage tasks into ready workgraphs
-        # before the dispatcher fans out workers. Gated by
-        # ``kanban.auto_decompose`` (default True). Capped by
-        # ``kanban.auto_decompose_per_tick`` (default 3) so a bulk-load
-        # of triage tasks doesn't burst-spend the aux LLM in one tick;
-        # remainder defers to subsequent ticks.
-        #
-        # The flag is re-read from config EVERY tick (#49638) rather than
-        # captured once at boot. Auto-decompose is a safety toggle: a user who
-        # sees it fan out and run tasks they didn't intend reaches for
-        # ``kanban.auto_decompose: false`` to STOP it — and that must take
-        # effect on the next tick, not require a gateway restart. (Reported:
-        # auto-decompose created and launched destructive tasks while the user
-        # was still typing the task description, and the flag "couldn't be
-        # disabled" because the gateway had captured its boot-time value.)
-        # pm-supervisor: give needs_input/gave_up/decompose_gave_up cards one
-        # autonomous pass BEFORE they page a human. Off by default
-        # (``kanban.pm_supervisor_enabled``); re-read live every tick, same
-        # reasoning as auto-decompose above. Runs BEFORE auto-decompose so a
-        # card the pm-supervisor routes to "decompose" is picked up by the
-        # very next block in this same tick, not a tick later.
-        def _read_pm_supervisor_settings() -> "tuple[bool, int, int]":
-            return _resolve_pm_supervisor_settings(_load_config)
+            def _tick_once() -> "list[tuple[str, Optional[object]]]":
+                """Run one dispatch_once per board. Returns (slug, result) pairs.
 
-        def _pm_supervisor_tick_once(per_tick: int, max_attempts: int) -> int:
-            try:
-                from agent.auxiliary_client import call_llm as _call_llm
-            except Exception as exc:
-                logger.warning(
-                    "pm-supervisor: auxiliary client import failed (%s); skipping", exc,
-                )
-                return 0
-            operator_authors = _resolve_operator_authors(_load_config)
-            return _pm_supervisor_tick(
-                kb_module=_kb, load_config=_load_config, call_llm_fn=_call_llm,
-                per_tick=per_tick, max_attempts=max_attempts,
-                operator_authors=operator_authors,
-            )
-
-        def _read_auto_decompose_settings() -> tuple[bool, int]:
-            """Re-resolve (enabled, per_tick) from current config each tick."""
-            return _resolve_auto_decompose_settings(_load_config)
-
-        def _auto_decompose_tick(auto_decompose_per_tick: int) -> int:
-            """Run the auto-decomposer for up to N triage tasks across all
-            boards. Returns the number of triage tasks that were
-            successfully decomposed or specified this tick.
-            """
-            try:
-                from hermes_cli import kanban_decompose as _decomp
-            except Exception as exc:  # pragma: no cover
-                logger.warning(
-                    "kanban auto-decompose: import failed (%s); skipping", exc,
-                )
-                return 0
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            attempted = 0
-            successes = 0
-            # K-10: Versuchslimit pro Karte, live aus der Config (0 = aus).
-            max_attempts = _resolve_decompose_max_attempts(_load_config)
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                if attempted >= auto_decompose_per_tick:
-                    break
-                # Pin this board for the duration of the call — same
-                # pattern as the dashboard specify endpoint. The
-                # decomposer module connects with no board kwarg and
-                # relies on the env var.
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
+                Enumerating boards on every tick keeps the dispatcher honest
+                when users create a new board mid-run: no restart required,
+                the next tick picks it up automatically.
+                """
                 try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
+                    boards = _kb.list_boards(include_archived=False)
+                except Exception:
+                    boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                out: list[tuple[str, "Optional[object]"]] = []
+                for b in boards:
+                    slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    out.append((slug, _tick_once_for_board(slug)))
+                return out
+
+            def _ready_nonempty() -> bool:
+                """Cheap probe: is there at least one ready+assigned+unclaimed
+                task on ANY board whose assignee maps to a real Hermes profile
+                (i.e. one the dispatcher would actually spawn for)?
+
+                Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
+                ``orion-research``) are pulled by terminals via
+                ``claim_task`` directly and never spawnable, so a queue full
+                of those is "correctly idle", not "stuck". Filtering them out
+                here keeps the stuck-warn fire only on real failures (broken
+                PATH, missing venv, credential loss for a real Hermes profile).
+                """
+                try:
+                    boards = _kb.list_boards(include_archived=False)
+                except Exception:
+                    boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                for b in boards:
+                    slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    conn = None
                     try:
-                        triage_ids = _decomp.list_triage_ids()
-                    except Exception as exc:
-                        logger.debug(
-                            "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
-                            slug, exc,
-                        )
-                        triage_ids = []
-                    if triage_ids:
-                        operator_authors = _resolve_operator_authors(_load_config)
-                        triage_ids = _filter_operator_owned_triage_ids(
-                            triage_ids,
-                            board_slug=slug,
-                            operator_authors=operator_authors,
-                            kb_module=_kb,
-                        )
-                    for tid in triage_ids:
-                        if attempted >= auto_decompose_per_tick:
-                            break
-                        if max_attempts:
-                            prior = _count_failed_decompose_attempts(_kb, tid)
-                            if prior >= max_attempts:
-                                # Ausgeschöpft: nicht mehr retryen (kein
-                                # Aux-Spend, kein per-tick-Budget) — Karte
-                                # bleibt sichtbar in triage, Ping macht der
-                                # Attention-Cron nach dem Grace-Fenster.
-                                if _record_decompose_gave_up_once(
-                                    _kb, tid, attempts=prior, limit=max_attempts,
-                                ):
-                                    logger.warning(
-                                        "kanban auto-decompose [%s]: %s gave up "
-                                        "after %d failed attempts (limit %d)",
-                                        slug, tid, prior, max_attempts,
+                        conn = _kb.connect(board=slug)
+                        if _kb.has_spawnable_ready(conn):
+                            return True
+                        if _kb.has_spawnable_review(conn):
+                            return True
+                    except Exception:
+                        continue
+                    finally:
+                        if conn is not None:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                return False
+
+            # Auto-decompose: turn fresh triage tasks into ready workgraphs
+            # before the dispatcher fans out workers. Gated by
+            # ``kanban.auto_decompose`` (default True). Capped by
+            # ``kanban.auto_decompose_per_tick`` (default 3) so a bulk-load
+            # of triage tasks doesn't burst-spend the aux LLM in one tick;
+            # remainder defers to subsequent ticks.
+            #
+            # The flag is re-read from config EVERY tick (#49638) rather than
+            # captured once at boot. Auto-decompose is a safety toggle: a user who
+            # sees it fan out and run tasks they didn't intend reaches for
+            # ``kanban.auto_decompose: false`` to STOP it — and that must take
+            # effect on the next tick, not require a gateway restart. (Reported:
+            # auto-decompose created and launched destructive tasks while the user
+            # was still typing the task description, and the flag "couldn't be
+            # disabled" because the gateway had captured its boot-time value.)
+            # pm-supervisor: give needs_input/gave_up/decompose_gave_up cards one
+            # autonomous pass BEFORE they page a human. Off by default
+            # (``kanban.pm_supervisor_enabled``); re-read live every tick, same
+            # reasoning as auto-decompose above. Runs BEFORE auto-decompose so a
+            # card the pm-supervisor routes to "decompose" is picked up by the
+            # very next block in this same tick, not a tick later.
+            def _read_pm_supervisor_settings() -> "tuple[bool, int, int]":
+                return _resolve_pm_supervisor_settings(_load_config)
+
+            def _pm_supervisor_tick_once(per_tick: int, max_attempts: int) -> int:
+                try:
+                    from agent.auxiliary_client import call_llm as _call_llm
+                except Exception as exc:
+                    logger.warning(
+                        "pm-supervisor: auxiliary client import failed (%s); skipping", exc,
+                    )
+                    return 0
+                operator_authors = _resolve_operator_authors(_load_config)
+                return _pm_supervisor_tick(
+                    kb_module=_kb, load_config=_load_config, call_llm_fn=_call_llm,
+                    per_tick=per_tick, max_attempts=max_attempts,
+                    operator_authors=operator_authors,
+                )
+
+            def _read_auto_decompose_settings() -> tuple[bool, int]:
+                """Re-resolve (enabled, per_tick) from current config each tick."""
+                return _resolve_auto_decompose_settings(_load_config)
+
+            def _auto_decompose_tick(auto_decompose_per_tick: int) -> int:
+                """Run the auto-decomposer for up to N triage tasks across all
+                boards. Returns the number of triage tasks that were
+                successfully decomposed or specified this tick.
+                """
+                try:
+                    from hermes_cli import kanban_decompose as _decomp
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(
+                        "kanban auto-decompose: import failed (%s); skipping", exc,
+                    )
+                    return 0
+                try:
+                    boards = _kb.list_boards(include_archived=False)
+                except Exception:
+                    boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                attempted = 0
+                successes = 0
+                # K-10: Versuchslimit pro Karte, live aus der Config (0 = aus).
+                max_attempts = _resolve_decompose_max_attempts(_load_config)
+                for b in boards:
+                    slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    if attempted >= auto_decompose_per_tick:
+                        break
+                    # Pin this board for the duration of the call — same
+                    # pattern as the dashboard specify endpoint. The
+                    # decomposer module connects with no board kwarg and
+                    # relies on the env var.
+                    prev_env = os.environ.get("HERMES_KANBAN_BOARD")
+                    try:
+                        os.environ["HERMES_KANBAN_BOARD"] = slug
+                        try:
+                            triage_ids = _decomp.list_triage_ids()
+                        except Exception as exc:
+                            logger.debug(
+                                "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
+                                slug, exc,
+                            )
+                            triage_ids = []
+                        if triage_ids:
+                            operator_authors = _resolve_operator_authors(_load_config)
+                            triage_ids = _filter_operator_owned_triage_ids(
+                                triage_ids,
+                                board_slug=slug,
+                                operator_authors=operator_authors,
+                                kb_module=_kb,
+                            )
+                        for tid in triage_ids:
+                            if attempted >= auto_decompose_per_tick:
+                                break
+                            if max_attempts:
+                                prior = _count_failed_decompose_attempts(_kb, tid)
+                                if prior >= max_attempts:
+                                    # Ausgeschöpft: nicht mehr retryen (kein
+                                    # Aux-Spend, kein per-tick-Budget) — Karte
+                                    # bleibt sichtbar in triage, Ping macht der
+                                    # Attention-Cron nach dem Grace-Fenster.
+                                    if _record_decompose_gave_up_once(
+                                        _kb, tid, attempts=prior, limit=max_attempts,
+                                    ):
+                                        logger.warning(
+                                            "kanban auto-decompose [%s]: %s gave up "
+                                            "after %d failed attempts (limit %d)",
+                                            slug, tid, prior, max_attempts,
+                                        )
+                                    continue
+                            attempted += 1
+                            try:
+                                outcome = _decomp.decompose_task(
+                                    tid, author="auto-decomposer",
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "kanban auto-decompose: decompose_task crashed on %s",
+                                    tid,
+                                )
+                                if max_attempts:
+                                    _record_failed_decompose_attempt(
+                                        _kb, tid, "decompose_task crashed",
                                     )
                                 continue
-                        attempted += 1
-                        try:
-                            outcome = _decomp.decompose_task(
-                                tid, author="auto-decomposer",
-                            )
-                        except Exception:
-                            logger.exception(
-                                "kanban auto-decompose: decompose_task crashed on %s",
-                                tid,
-                            )
-                            if max_attempts:
-                                _record_failed_decompose_attempt(
-                                    _kb, tid, "decompose_task crashed",
+                            if outcome.ok:
+                                successes += 1
+                                if outcome.fanout and outcome.child_ids:
+                                    logger.info(
+                                        "kanban auto-decompose [%s]: %s → %d children",
+                                        slug, tid, len(outcome.child_ids),
+                                    )
+                                else:
+                                    logger.info(
+                                        "kanban auto-decompose [%s]: %s → single task (no fanout)",
+                                        slug, tid,
+                                    )
+                            else:
+                                # Common no-op reasons (no aux client configured) shouldn't
+                                # spam logs every tick. Log at debug.
+                                logger.debug(
+                                    "kanban auto-decompose [%s]: %s skipped: %s",
+                                    slug, tid, outcome.reason,
                                 )
+                                if max_attempts:
+                                    _record_failed_decompose_attempt(
+                                        _kb, tid, outcome.reason or "not ok",
+                                    )
+                    finally:
+                        if prev_env is None:
+                            os.environ.pop("HERMES_KANBAN_BOARD", None)
+                        else:
+                            os.environ["HERMES_KANBAN_BOARD"] = prev_env
+                return successes
+
+            try:
+                maintenance_interval = float(
+                    kanban_cfg.get("maintenance_interval_seconds", 120) or 120
+                )
+            except (ValueError, TypeError):
+                maintenance_interval = 120.0
+            maintenance_interval = max(maintenance_interval, 10.0)
+
+            # Maintenance runs on a DEDICATED single-worker executor, not the
+            # default to_thread pool, so shutdown can actually wait for it.
+            # ``task.cancel()`` unblocks the awaiting coroutine but does NOT stop
+            # the OS thread: an aux-LLM round keeps mutating the board for up to
+            # 180 s afterwards. Releasing the singleton dispatcher lock in that
+            # window let a fresh gateway take over while the old maintenance was
+            # still writing (TARS review 2026-07-27, P1).
+            maintenance_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="kanban-maintenance",
+            )
+            maintenance_stop = threading.Event()
+            maintenance_inflight: "list[concurrent.futures.Future]" = []
+
+            async def _run_maintenance(fn, *fn_args):
+                """Submit to the dedicated executor, keeping the future reachable.
+
+                The future is registered ONCE and only ever removed by the drain
+                once it has actually completed. Removing it in a ``finally`` was
+                wrong: cancelling the awaiting coroutine runs that ``finally``
+                while the executor thread keeps going, so the drain saw an empty
+                list and released the lock under a still-writing thread — the
+                same P1 the first repair round meant to close (TARS re-review).
+                """
+                future = maintenance_executor.submit(fn, *fn_args)
+                maintenance_inflight.append(future)
+                return await asyncio.wrap_future(future)
+
+            def _drain_maintenance(timeout: float) -> bool:
+                """Signal stop and wait for in-flight maintenance. True if idle."""
+                maintenance_stop.set()
+                # Prune only genuinely finished work; a cancelled awaiter leaves
+                # its future here on purpose.
+                for done_future in [f for f in list(maintenance_inflight) if f.done()]:
+                    try:
+                        maintenance_inflight.remove(done_future)
+                    except ValueError:
+                        pass
+                pending = [f for f in list(maintenance_inflight) if not f.done()]
+                if not pending:
+                    return True
+                _, not_done = concurrent.futures.wait(pending, timeout=timeout)
+                for finished in [f for f in pending if f.done()]:
+                    try:
+                        maintenance_inflight.remove(finished)
+                    except ValueError:
+                        pass
+                return not not_done
+
+            def _finish_dispatcher(drain_timeout: float) -> None:
+                """Release the singleton lock ONLY once maintenance is quiet.
+
+                If a round is still in flight we deliberately keep holding the
+                lock: the flock is dropped by the kernel when this process exits,
+                so worst case we block a same-process watcher restart — far
+                better than two gateways mutating one board concurrently.
+                """
+                drained = _drain_maintenance(drain_timeout)
+                maintenance_executor.shutdown(wait=False)
+                handle = self._kanban_dispatcher_lock_handle
+                if drained:
+                    _release_singleton_lock(handle)
+                    self._kanban_dispatcher_lock_handle = None
+                    return
+                # Not drained: releasing now would hand the board to a second
+                # dispatcher mid-write. Holding it until process exit avoids that
+                # but wedges every in-process watcher restart (TARS re-review).
+                # Instead hand the release to a watchdog that waits for the actual
+                # thread to finish — the window is bounded by the aux-LLM timeout,
+                # not by the process lifetime.
+                self._kanban_dispatcher_lock_handle = None
+
+                def _release_after_maintenance() -> None:
+                    try:
+                        pending = [f for f in list(maintenance_inflight) if not f.done()]
+                        if pending:
+                            concurrent.futures.wait(pending)
+                    except Exception:
+                        logger.warning(
+                            "kanban maintenance: watchdog wait failed; releasing "
+                            "the dispatcher lock anyway", exc_info=True,
+                        )
+                    _release_singleton_lock(handle)
+                    logger.info(
+                        "kanban maintenance finished after shutdown — dispatcher "
+                        "singleton lock released"
+                    )
+
+                logger.warning(
+                    "kanban maintenance still in flight after %.0fs — dispatcher "
+                    "singleton lock stays held until it finishes (no second "
+                    "dispatcher may take over mid-write)",
+                    drain_timeout,
+                )
+                threading.Thread(
+                    target=_release_after_maintenance,
+                    name="kanban-maintenance-lock-release",
+                    daemon=True,
+                ).start()
+
+            self._kanban_dispatcher_finish = _finish_dispatcher
+
+            async def _maintenance_loop() -> None:
+                # pm-supervisor + auto-decompose call the aux LLM synchronously
+                # (timeouts 120 s / 180 s). Inline in the dispatch tick they ran
+                # BEFORE dispatch_once, so one slow aux answer delayed claim/spawn
+                # on every board by up to ~900 s (audit 2026-07-27). As a sibling
+                # task on its own cadence they overlap the dispatch tick instead
+                # of preceding it; the tick itself stays pure claim/spawn work.
+                # Lives strictly inside the dispatcher's singleton-lock scope, so
+                # concurrent gateways cannot double-decompose. Toggles are
+                # re-read every round (#49638) exactly as before.
+                while self._running and not maintenance_stop.is_set():
+                    try:
+                        _pm_enabled, _pm_per_tick, _pm_max_attempts = _read_pm_supervisor_settings()
+                        if _pm_enabled and not maintenance_stop.is_set():
+                            await _run_maintenance(
+                                _pm_supervisor_tick_once, _pm_per_tick, _pm_max_attempts,
+                            )
+                        _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
+                        if _ad_enabled and not maintenance_stop.is_set():
+                            await _run_maintenance(_auto_decompose_tick, _ad_per_tick)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "kanban maintenance: pm-supervisor/auto-decompose round failed"
+                        )
+                    slept = 0.0
+                    while (
+                        slept < maintenance_interval
+                        and self._running
+                        and not maintenance_stop.is_set()
+                    ):
+                        await asyncio.sleep(min(1.0, maintenance_interval - slept))
+                        slept += 1.0
+
+            maintenance_task = asyncio.create_task(_maintenance_loop())
+
+            logger.info(
+                "kanban dispatcher: embedded in gateway (interval=%.1fs, "
+                "maintenance=%.1fs)", interval, maintenance_interval,
+            )
+            while self._running:
+                try:
+                    # Reap zombie children before per-board work so a board DB
+                    # failure cannot block cleanup of unrelated workers.
+                    pids = await asyncio.to_thread(_kb.reap_worker_zombies)
+                    if pids:
+                        logger.info(
+                            "kanban dispatcher: reaped %d zombie worker(s), pids=%s",
+                            len(pids),
+                            pids,
+                        )
+                except Exception:
+                    logger.exception("kanban dispatcher: zombie reaper failed")
+
+                # Shadow is report-only: per-board read-only diagnostics run before
+                # the existing Reap → Auto-Decompose → Dispatch execution block.
+                # Its decision is intentionally not consulted below.
+                try:
+                    shadow_cfg = _resolve_backpressure_shadow_config(_load_config)
+                    if shadow_cfg.shadow_enabled:
+                        boards = _kb.list_boards(include_archived=False)
+                        duplicate_outcomes = getattr(
+                            self, "_kanban_shadow_duplicate_suppressed_last_tick", {}
+                        )
+                        if not isinstance(duplicate_outcomes, Mapping):
+                            duplicate_outcomes = {}
+                        now = int(time.time())
+                        for board_meta in boards:
+                            slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                            try:
+                                board_slug = _kb._normalize_board_slug(slug) or _kb.DEFAULT_BOARD
+                            except (TypeError, ValueError):
+                                continue
+                            path = board_meta.get("db_path") or _kb.kanban_db_path(slug)
+                            metrics = await asyncio.to_thread(_collect_attention_storm_metrics_readonly, path, now)
+                            if metrics is None:
+                                continue
+                            metrics = AttentionStormMetrics(
+                                metrics.active_human_required, metrics.new_attention_5m,
+                                metrics.new_attention_15m, metrics.blocked_run_ratio_15m,
+                                metrics.recurrent_blocks, metrics.current_delivery_identities_materialized,
+                                int(duplicate_outcomes.get(board_slug, 0) or 0),
+                            )
+                            decision = evaluate_backpressure_shadow(metrics, shadow_cfg.__dict__)
+                            if _should_emit_shadow_warning(
+                                shadow_last_warning, board_slug, decision, now, shadow_cfg.warning_cooldown_seconds,
+                            ):
+                                _log_shadow_warning(decision)
+                except Exception:
+                    # Shadow diagnostics never impact the execution loop and never
+                    # surface board/path/error text through the safe warning channel.
+                    pass
+
+                try:
+                    # pm-supervisor and auto-decompose run in _maintenance_loop
+                    # (own cadence, sibling task above) — NOT here, so their aux-LLM
+                    # calls can never delay claim/spawn on this tick.
+                    results = await asyncio.to_thread(_tick_once)
+                    any_spawned = False
+                    for slug, res in (results or []):
+                        if res is None:
                             continue
-                        if outcome.ok:
-                            successes += 1
-                            if outcome.fanout and outcome.child_ids:
-                                logger.info(
-                                    "kanban auto-decompose [%s]: %s → %d children",
-                                    slug, tid, len(outcome.child_ids),
+                        if getattr(res, "spawned", None):
+                            any_spawned = True
+                        # Quiet by default — only log when something actually
+                        # happened, so an idle gateway stays silent. Audit
+                        # 2026-07-11 H5: "something" includes crash/timeout/
+                        # reclaim/auto-block ticks, not just spawns — a crash
+                        # wave without a simultaneous spawn was invisible (also
+                        # to the mission-control log-tail escalation).
+                        _spawned_n = len(getattr(res, "spawned", None) or [])
+                        _crashed = len(res.crashed) if hasattr(getattr(res, "crashed", None), "__len__") else 0
+                        _timed_out = len(res.timed_out) if hasattr(getattr(res, "timed_out", None), "__len__") else 0
+                        _auto_blocked = len(res.auto_blocked) if hasattr(getattr(res, "auto_blocked", None), "__len__") else 0
+                        _reclaimed = getattr(res, "reclaimed", 0) or 0
+                        if _spawned_n or _crashed or _timed_out or _auto_blocked or _reclaimed:
+                            logger.info(
+                                "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
+                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+                                slug,
+                                _spawned_n,
+                                _reclaimed,
+                                _crashed,
+                                _timed_out,
+                                res.promoted,
+                                _auto_blocked,
+                            )
+                    # Health telemetry (aggregate across boards)
+                    ready_pending = await asyncio.to_thread(_ready_nonempty)
+                    if ready_pending and not any_spawned:
+                        bad_ticks += 1
+                    else:
+                        bad_ticks = 0
+                    if bad_ticks >= HEALTH_WINDOW:
+                        now = int(time.time())
+                        if now - last_warn_at >= 300:
+                            # Distinguish "spawn machinery broken" from "dispatcher
+                            # deliberately deferring via respawn guards" — the old
+                            # blanket "check profile health" message sent operators
+                            # chasing venv/credential ghosts when every skipped
+                            # spawn was actually an explicit guard decision.
+                            guard_counts: dict[str, int] = {}
+                            for _slug, _res in (results or []):
+                                for _tid, _greason in (
+                                    getattr(_res, "respawn_guarded", None) or []
+                                ):
+                                    guard_counts[_greason] = (
+                                        guard_counts.get(_greason, 0) + 1
+                                    )
+                            if guard_counts:
+                                logger.warning(
+                                    "kanban dispatcher idle-by-guard: ready queue "
+                                    "non-empty for %d consecutive ticks, 0 workers "
+                                    "spawned — deferred by respawn guards (%s). "
+                                    "Inspect the tasks' 'respawn_guarded' events; "
+                                    "profile health is NOT implicated.",
+                                    bad_ticks,
+                                    ", ".join(
+                                        f"{r}×{n}"
+                                        for r, n in sorted(guard_counts.items())
+                                    ),
                                 )
                             else:
-                                logger.info(
-                                    "kanban auto-decompose [%s]: %s → single task (no fanout)",
-                                    slug, tid,
+                                logger.warning(
+                                    "kanban dispatcher stuck: ready queue non-empty "
+                                    "for %d consecutive ticks but 0 workers spawned. "
+                                    "Check profile health (venv, PATH, credentials) "
+                                    "and `hermes kanban list --status ready`.",
+                                    bad_ticks,
                                 )
-                        else:
-                            # Common no-op reasons (no aux client configured) shouldn't
-                            # spam logs every tick. Log at debug.
-                            logger.debug(
-                                "kanban auto-decompose [%s]: %s skipped: %s",
-                                slug, tid, outcome.reason,
-                            )
-                            if max_attempts:
-                                _record_failed_decompose_attempt(
-                                    _kb, tid, outcome.reason or "not ok",
-                                )
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
-            return successes
-
-        try:
-            maintenance_interval = float(
-                kanban_cfg.get("maintenance_interval_seconds", 120) or 120
-            )
-        except (ValueError, TypeError):
-            maintenance_interval = 120.0
-        maintenance_interval = max(maintenance_interval, 10.0)
-
-        # Maintenance runs on a DEDICATED single-worker executor, not the
-        # default to_thread pool, so shutdown can actually wait for it.
-        # ``task.cancel()`` unblocks the awaiting coroutine but does NOT stop
-        # the OS thread: an aux-LLM round keeps mutating the board for up to
-        # 180 s afterwards. Releasing the singleton dispatcher lock in that
-        # window let a fresh gateway take over while the old maintenance was
-        # still writing (TARS review 2026-07-27, P1).
-        maintenance_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="kanban-maintenance",
-        )
-        maintenance_stop = threading.Event()
-        maintenance_inflight: "list[concurrent.futures.Future]" = []
-
-        async def _run_maintenance(fn, *fn_args):
-            """Submit to the dedicated executor, keeping the future reachable.
-
-            The future is registered ONCE and only ever removed by the drain
-            once it has actually completed. Removing it in a ``finally`` was
-            wrong: cancelling the awaiting coroutine runs that ``finally``
-            while the executor thread keeps going, so the drain saw an empty
-            list and released the lock under a still-writing thread — the
-            same P1 the first repair round meant to close (TARS re-review).
-            """
-            future = maintenance_executor.submit(fn, *fn_args)
-            maintenance_inflight.append(future)
-            return await asyncio.wrap_future(future)
-
-        def _drain_maintenance(timeout: float) -> bool:
-            """Signal stop and wait for in-flight maintenance. True if idle."""
-            maintenance_stop.set()
-            # Prune only genuinely finished work; a cancelled awaiter leaves
-            # its future here on purpose.
-            for done_future in [f for f in list(maintenance_inflight) if f.done()]:
-                try:
-                    maintenance_inflight.remove(done_future)
-                except ValueError:
-                    pass
-            pending = [f for f in list(maintenance_inflight) if not f.done()]
-            if not pending:
-                return True
-            _, not_done = concurrent.futures.wait(pending, timeout=timeout)
-            for finished in [f for f in pending if f.done()]:
-                try:
-                    maintenance_inflight.remove(finished)
-                except ValueError:
-                    pass
-            return not not_done
-
-        def _finish_dispatcher(drain_timeout: float) -> None:
-            """Release the singleton lock ONLY once maintenance is quiet.
-
-            If a round is still in flight we deliberately keep holding the
-            lock: the flock is dropped by the kernel when this process exits,
-            so worst case we block a same-process watcher restart — far
-            better than two gateways mutating one board concurrently.
-            """
-            drained = _drain_maintenance(drain_timeout)
-            maintenance_executor.shutdown(wait=False)
-            handle = self._kanban_dispatcher_lock_handle
-            if drained:
-                _release_singleton_lock(handle)
-                self._kanban_dispatcher_lock_handle = None
-                return
-            # Not drained: releasing now would hand the board to a second
-            # dispatcher mid-write. Holding it until process exit avoids that
-            # but wedges every in-process watcher restart (TARS re-review).
-            # Instead hand the release to a watchdog that waits for the actual
-            # thread to finish — the window is bounded by the aux-LLM timeout,
-            # not by the process lifetime.
-            self._kanban_dispatcher_lock_handle = None
-
-            def _release_after_maintenance() -> None:
-                try:
-                    pending = [f for f in list(maintenance_inflight) if not f.done()]
-                    if pending:
-                        concurrent.futures.wait(pending)
-                except Exception:
-                    logger.warning(
-                        "kanban maintenance: watchdog wait failed; releasing "
-                        "the dispatcher lock anyway", exc_info=True,
-                    )
-                _release_singleton_lock(handle)
-                logger.info(
-                    "kanban maintenance finished after shutdown — dispatcher "
-                    "singleton lock released"
-                )
-
-            logger.warning(
-                "kanban maintenance still in flight after %.0fs — dispatcher "
-                "singleton lock stays held until it finishes (no second "
-                "dispatcher may take over mid-write)",
-                drain_timeout,
-            )
-            threading.Thread(
-                target=_release_after_maintenance,
-                name="kanban-maintenance-lock-release",
-                daemon=True,
-            ).start()
-
-        async def _maintenance_loop() -> None:
-            # pm-supervisor + auto-decompose call the aux LLM synchronously
-            # (timeouts 120 s / 180 s). Inline in the dispatch tick they ran
-            # BEFORE dispatch_once, so one slow aux answer delayed claim/spawn
-            # on every board by up to ~900 s (audit 2026-07-27). As a sibling
-            # task on its own cadence they overlap the dispatch tick instead
-            # of preceding it; the tick itself stays pure claim/spawn work.
-            # Lives strictly inside the dispatcher's singleton-lock scope, so
-            # concurrent gateways cannot double-decompose. Toggles are
-            # re-read every round (#49638) exactly as before.
-            while self._running and not maintenance_stop.is_set():
-                try:
-                    _pm_enabled, _pm_per_tick, _pm_max_attempts = _read_pm_supervisor_settings()
-                    if _pm_enabled and not maintenance_stop.is_set():
-                        await _run_maintenance(
-                            _pm_supervisor_tick_once, _pm_per_tick, _pm_max_attempts,
-                        )
-                    _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
-                    if _ad_enabled and not maintenance_stop.is_set():
-                        await _run_maintenance(_auto_decompose_tick, _ad_per_tick)
+                            last_warn_at = now
                 except asyncio.CancelledError:
+                    logger.debug("kanban dispatcher: cancelled")
+                    maintenance_task.cancel()
+                    # Cancellation path: the loop is going away now, so drain
+                    # synchronously with a short budget rather than leaking the
+                    # lock to a still-writing maintenance thread.
+                    _finish_dispatcher(10.0)
                     raise
                 except Exception:
-                    logger.exception(
-                        "kanban maintenance: pm-supervisor/auto-decompose round failed"
-                    )
+                    logger.exception("kanban dispatcher: unexpected watcher error")
+
+                # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
+                # waits up to `interval` seconds for the current sleep to finish.
                 slept = 0.0
-                while (
-                    slept < maintenance_interval
-                    and self._running
-                    and not maintenance_stop.is_set()
-                ):
-                    await asyncio.sleep(min(1.0, maintenance_interval - slept))
+                while slept < interval and self._running:
+                    await asyncio.sleep(min(1.0, interval - slept))
                     slept += 1.0
 
-        maintenance_task = asyncio.create_task(_maintenance_loop())
-
-        logger.info(
-            "kanban dispatcher: embedded in gateway (interval=%.1fs, "
-            "maintenance=%.1fs)", interval, maintenance_interval,
-        )
-        while self._running:
-            try:
-                # Reap zombie children before per-board work so a board DB
-                # failure cannot block cleanup of unrelated workers.
-                pids = await asyncio.to_thread(_kb.reap_worker_zombies)
-                if pids:
-                    logger.info(
-                        "kanban dispatcher: reaped %d zombie worker(s), pids=%s",
-                        len(pids),
-                        pids,
-                    )
-            except Exception:
-                logger.exception("kanban dispatcher: zombie reaper failed")
-
-            # Shadow is report-only: per-board read-only diagnostics run before
-            # the existing Reap → Auto-Decompose → Dispatch execution block.
-            # Its decision is intentionally not consulted below.
-            try:
-                shadow_cfg = _resolve_backpressure_shadow_config(_load_config)
-                if shadow_cfg.shadow_enabled:
-                    boards = _kb.list_boards(include_archived=False)
-                    duplicate_outcomes = getattr(
-                        self, "_kanban_shadow_duplicate_suppressed_last_tick", {}
-                    )
-                    if not isinstance(duplicate_outcomes, Mapping):
-                        duplicate_outcomes = {}
-                    now = int(time.time())
-                    for board_meta in boards:
-                        slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
-                        try:
-                            board_slug = _kb._normalize_board_slug(slug) or _kb.DEFAULT_BOARD
-                        except (TypeError, ValueError):
-                            continue
-                        path = board_meta.get("db_path") or _kb.kanban_db_path(slug)
-                        metrics = await asyncio.to_thread(_collect_attention_storm_metrics_readonly, path, now)
-                        if metrics is None:
-                            continue
-                        metrics = AttentionStormMetrics(
-                            metrics.active_human_required, metrics.new_attention_5m,
-                            metrics.new_attention_15m, metrics.blocked_run_ratio_15m,
-                            metrics.recurrent_blocks, metrics.current_delivery_identities_materialized,
-                            int(duplicate_outcomes.get(board_slug, 0) or 0),
-                        )
-                        decision = evaluate_backpressure_shadow(metrics, shadow_cfg.__dict__)
-                        if _should_emit_shadow_warning(
-                            shadow_last_warning, board_slug, decision, now, shadow_cfg.warning_cooldown_seconds,
-                        ):
-                            _log_shadow_warning(decision)
-            except Exception:
-                # Shadow diagnostics never impact the execution loop and never
-                # surface board/path/error text through the safe warning channel.
-                pass
-
-            try:
-                # pm-supervisor and auto-decompose run in _maintenance_loop
-                # (own cadence, sibling task above) — NOT here, so their aux-LLM
-                # calls can never delay claim/spawn on this tick.
-                results = await asyncio.to_thread(_tick_once)
-                any_spawned = False
-                for slug, res in (results or []):
-                    if res is None:
-                        continue
-                    if getattr(res, "spawned", None):
-                        any_spawned = True
-                    # Quiet by default — only log when something actually
-                    # happened, so an idle gateway stays silent. Audit
-                    # 2026-07-11 H5: "something" includes crash/timeout/
-                    # reclaim/auto-block ticks, not just spawns — a crash
-                    # wave without a simultaneous spawn was invisible (also
-                    # to the mission-control log-tail escalation).
-                    _spawned_n = len(getattr(res, "spawned", None) or [])
-                    _crashed = len(res.crashed) if hasattr(getattr(res, "crashed", None), "__len__") else 0
-                    _timed_out = len(res.timed_out) if hasattr(getattr(res, "timed_out", None), "__len__") else 0
-                    _auto_blocked = len(res.auto_blocked) if hasattr(getattr(res, "auto_blocked", None), "__len__") else 0
-                    _reclaimed = getattr(res, "reclaimed", 0) or 0
-                    if _spawned_n or _crashed or _timed_out or _auto_blocked or _reclaimed:
-                        logger.info(
-                            "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
-                            slug,
-                            _spawned_n,
-                            _reclaimed,
-                            _crashed,
-                            _timed_out,
-                            res.promoted,
-                            _auto_blocked,
-                        )
-                # Health telemetry (aggregate across boards)
-                ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
-                    bad_ticks += 1
+            maintenance_task.cancel()
+            # Normal stop: give an in-flight aux-LLM round room to finish (its own
+            # timeouts are 120/180 s) before the lock changes hands.
+            await asyncio.to_thread(_finish_dispatcher, 45.0)
+        finally:
+            # Outer net around the ENTIRE lock-owning lifecycle. Before this,
+            # a cancellation in the 5 s startup grace above — or any early
+            # return/exception raised before the tick loop's own handlers —
+            # left the singleton lock held by a dispatcher that no longer runs:
+            # no other gateway could take over and this one stayed dark until
+            # the process exited (TARS re-review 2026-07-27, P2 liveness).
+            _finish = self._kanban_dispatcher_finish
+            self._kanban_dispatcher_finish = None
+            if self._kanban_dispatcher_lock_handle is not None:
+                if _finish is not None:
+                    # Maintenance may still be writing: drain first and let the
+                    # watchdog own the release if it does not go quiet in time.
+                    _finish(10.0)
                 else:
-                    bad_ticks = 0
-                if bad_ticks >= HEALTH_WINDOW:
-                    now = int(time.time())
-                    if now - last_warn_at >= 300:
-                        # Distinguish "spawn machinery broken" from "dispatcher
-                        # deliberately deferring via respawn guards" — the old
-                        # blanket "check profile health" message sent operators
-                        # chasing venv/credential ghosts when every skipped
-                        # spawn was actually an explicit guard decision.
-                        guard_counts: dict[str, int] = {}
-                        for _slug, _res in (results or []):
-                            for _tid, _greason in (
-                                getattr(_res, "respawn_guarded", None) or []
-                            ):
-                                guard_counts[_greason] = (
-                                    guard_counts.get(_greason, 0) + 1
-                                )
-                        if guard_counts:
-                            logger.warning(
-                                "kanban dispatcher idle-by-guard: ready queue "
-                                "non-empty for %d consecutive ticks, 0 workers "
-                                "spawned — deferred by respawn guards (%s). "
-                                "Inspect the tasks' 'respawn_guarded' events; "
-                                "profile health is NOT implicated.",
-                                bad_ticks,
-                                ", ".join(
-                                    f"{r}×{n}"
-                                    for r, n in sorted(guard_counts.items())
-                                ),
-                            )
-                        else:
-                            logger.warning(
-                                "kanban dispatcher stuck: ready queue non-empty "
-                                "for %d consecutive ticks but 0 workers spawned. "
-                                "Check profile health (venv, PATH, credentials) "
-                                "and `hermes kanban list --status ready`.",
-                                bad_ticks,
-                            )
-                        last_warn_at = now
-            except asyncio.CancelledError:
-                logger.debug("kanban dispatcher: cancelled")
-                maintenance_task.cancel()
-                # Cancellation path: the loop is going away now, so drain
-                # synchronously with a short budget rather than leaking the
-                # lock to a still-writing maintenance thread.
-                _finish_dispatcher(10.0)
-                raise
-            except Exception:
-                logger.exception("kanban dispatcher: unexpected watcher error")
-
-            # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
-            # waits up to `interval` seconds for the current sleep to finish.
-            slept = 0.0
-            while slept < interval and self._running:
-                await asyncio.sleep(min(1.0, interval - slept))
-                slept += 1.0
-
-        maintenance_task.cancel()
-        # Normal stop: give an in-flight aux-LLM round room to finish (its own
-        # timeouts are 120/180 s) before the lock changes hands.
-        await asyncio.to_thread(_finish_dispatcher, 45.0)
+                    # Nothing was ever started — release straight away.
+                    _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+                    self._kanban_dispatcher_lock_handle = None
+                logger.info(
+                    "kanban dispatcher: watcher exited — singleton dispatcher "
+                    "lock handed back (%s)", _lock_path,
+                )

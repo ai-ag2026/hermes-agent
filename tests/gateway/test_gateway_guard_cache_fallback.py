@@ -100,3 +100,120 @@ def test_unwritable_cache_still_reports_violations(tmp_path, monkeypatch):
     )
     with pytest.raises(pytest.UsageError, match="anti-pattern"):
         mod.pytest_configure(_FakeConfig(basetemp=tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# Repair round 5 (2026-07-28): the fallback covered mkdir ONLY
+# ---------------------------------------------------------------------------
+#
+# TARS re-review: everything else about the cache — taking the lock, reading a
+# stale entry, writing the verdict — still propagated its OSError and killed
+# collection. The cache is a speed-up; none of those failures says anything
+# about the anti-pattern, so they must degrade to the uncached scan exactly
+# like mkdir does.
+
+
+def _fake_filelock_module(exc: Exception):
+    """A ``filelock`` stand-in whose lock cannot be entered."""
+    import types
+
+    module = types.ModuleType("filelock")
+
+    class _FailingLock:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            raise exc
+
+        def __exit__(self, *a):
+            return False
+
+    module.FileLock = _FailingLock
+    module.Timeout = RuntimeError
+    return module
+
+
+def test_lock_timeout_still_runs_the_scan(tmp_path, monkeypatch):
+    """Lock contention/timeout must not fail collection — scan uncached."""
+    import sys
+
+    mod = _load_conftest_module()
+    monkeypatch.delenv("HERMES_GATEWAY_TEST_CACHE", raising=False)
+    monkeypatch.setitem(
+        sys.modules, "filelock", _fake_filelock_module(TimeoutError("lock busy")),
+    )
+
+    scanned = []
+    monkeypatch.setattr(
+        mod, "_run_adapter_antipattern_scan", lambda: scanned.append(True) or [],
+    )
+    mod.pytest_configure(_FakeConfig(basetemp=tmp_path))
+    assert scanned == [True], "an unusable lock must not disable the guard"
+
+
+def test_lock_timeout_still_reports_violations(tmp_path, monkeypatch):
+    """And the degraded path must still FAIL collection on a violation."""
+    import sys
+
+    mod = _load_conftest_module()
+    monkeypatch.delenv("HERMES_GATEWAY_TEST_CACHE", raising=False)
+    monkeypatch.setitem(
+        sys.modules, "filelock", _fake_filelock_module(TimeoutError("lock busy")),
+    )
+    monkeypatch.setattr(
+        mod, "_run_adapter_antipattern_scan",
+        lambda: ["tests/gateway/test_bogus.py: bare adapter import"],
+    )
+    with pytest.raises(pytest.UsageError, match="anti-pattern"):
+        mod.pytest_configure(_FakeConfig(basetemp=tmp_path))
+
+
+def test_unreadable_cache_entry_still_runs_the_scan(tmp_path, monkeypatch):
+    """A cache entry that exists but cannot be read → re-scan, don't die."""
+    mod = _load_conftest_module()
+    monkeypatch.delenv("HERMES_GATEWAY_TEST_CACHE", raising=False)
+
+    config = _FakeConfig(basetemp=tmp_path)
+    cache_dir = mod._gateway_guard_cache_dir(config)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fp = mod._fingerprint_gateway_tests()
+    (cache_dir / f"gw-adapter-guard-{fp}").write_text("clean", encoding="utf-8")
+
+    real_read_text = Path.read_text
+
+    def refusing_read_text(self, *args, **kwargs):
+        if self.name.startswith("gw-adapter-guard-"):
+            raise OSError(5, "Input/output error")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", refusing_read_text)
+
+    scanned = []
+    monkeypatch.setattr(
+        mod, "_run_adapter_antipattern_scan", lambda: scanned.append(True) or [],
+    )
+    mod.pytest_configure(config)
+    assert scanned == [True], "an unreadable cache entry must trigger a re-scan"
+
+
+def test_unwritable_cache_file_keeps_the_clean_verdict(tmp_path, monkeypatch):
+    """Memoising may fail; the verdict it was memoising must still stand."""
+    mod = _load_conftest_module()
+    monkeypatch.delenv("HERMES_GATEWAY_TEST_CACHE", raising=False)
+
+    real_write_text = Path.write_text
+
+    def refusing_write_text(self, *args, **kwargs):
+        if self.name.startswith("gw-adapter-guard-"):
+            raise OSError(30, "Read-only file system")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", refusing_write_text)
+
+    scans = []
+    monkeypatch.setattr(
+        mod, "_run_adapter_antipattern_scan", lambda: scans.append(True) or [],
+    )
+    mod.pytest_configure(_FakeConfig(basetemp=tmp_path))
+    assert len(scans) == 1, "a failed cache write must not re-run the scan"

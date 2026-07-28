@@ -410,6 +410,14 @@ def _gateway_guard_cache_dir(config) -> Path:
     return Path.cwd() / ".pytest-cache"
 
 
+def _write_cache_best_effort(cache_file, payload: str) -> None:
+    """Memoise the verdict. A failing write must never change the verdict."""
+    try:
+        cache_file.write_text(payload, encoding="utf-8")
+    except OSError:
+        pass  # Next process re-scans; correctness is unaffected.
+
+
 def pytest_configure(config):
     """Reject plugin-adapter tests that use the sys.path anti-pattern.
 
@@ -443,24 +451,22 @@ def pytest_configure(config):
     cache_file = cache_dir / f"gw-adapter-guard-{fp}"
     lock_file = cache_dir / f".gw-adapter-guard-{fp}.lock"
 
-    cache_enabled = True
-    try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        # Cache is a speed-up, never a requirement — but skipping the SCAN
-        # would silently disable the anti-pattern guard entirely (regression
-        # found in TARS re-review 2026-07-27). Run uncached instead.
-        cache_enabled = False
-
-    if not cache_enabled:
-        # Uncached scan: same verdict, just no memoisation across processes.
+    def _scan_uncached() -> None:
+        """Same verdict as the cached path, just no memoisation."""
         violations = _run_adapter_antipattern_scan()
         if violations:
             raise pytest.UsageError(
                 "Plugin-adapter-import anti-pattern detected in gateway tests:\n"
                 + "\n".join(violations) + "\n\n" + _GUARD_HINT
             )
-        return
+
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Cache is a speed-up, never a requirement — but skipping the SCAN
+        # would silently disable the anti-pattern guard entirely (regression
+        # found in TARS re-review 2026-07-27). Run uncached instead.
+        return _scan_uncached()
 
     # Evict stale cache entries from previous fingerprints (best-effort).
     try:
@@ -489,25 +495,36 @@ def pytest_configure(config):
                 pass
         lock = _NoLock()
 
-    with lock:
-        if cache_file.exists():
-            cached = cache_file.read_text(encoding="utf-8")
-            if cached == "clean":
-                return
-            raise pytest.UsageError(cached)
+    try:
+        with lock:
+            if cache_file.exists():
+                cached = cache_file.read_text(encoding="utf-8")
+                if cached == "clean":
+                    return
+                raise pytest.UsageError(cached)
 
-        # Slow path: this process is the first to acquire the lock.
-        violations = _run_adapter_antipattern_scan()
+            # Slow path: this process is the first to acquire the lock.
+            violations = _run_adapter_antipattern_scan()
 
-        if violations:
-            msg = (
-                "Plugin-adapter-import anti-pattern detected in gateway tests:\n"
-                + "\n".join(violations)
-                + "\n\n"
-                + _GUARD_HINT
-            )
-            cache_file.write_text(msg, encoding="utf-8")
-            raise pytest.UsageError(msg)
-        else:
-            cache_file.write_text("clean", encoding="utf-8")
+            if violations:
+                msg = (
+                    "Plugin-adapter-import anti-pattern detected in gateway tests:\n"
+                    + "\n".join(violations)
+                    + "\n\n"
+                    + _GUARD_HINT
+                )
+                _write_cache_best_effort(cache_file, msg)
+                raise pytest.UsageError(msg)
+            else:
+                _write_cache_best_effort(cache_file, "clean")
+    except pytest.UsageError:
+        raise
+    except Exception:
+        # Everything that can go wrong with the CACHE — lock timeout under
+        # contention, a lock file that cannot be created, a cache entry that
+        # vanished between exists() and read, an undecodable entry — says
+        # nothing about the anti-pattern. The mkdir path already degrades to
+        # an uncached scan; these did not and would have failed collection
+        # (TARS re-review 2026-07-27: the fallback covered mkdir only).
+        return _scan_uncached()
 
