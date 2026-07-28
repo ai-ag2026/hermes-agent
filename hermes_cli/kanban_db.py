@@ -1771,6 +1771,17 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     -- attention immediately, so this holds the ops push back until the delay
     -- elapses; if the operator resolves it first, it is never delivered.
     escalate_after_seconds INTEGER NOT NULL DEFAULT 0,
+    -- Delivery lease (2026-07-28, B0). The cursor above is advanced ONLY after a
+    -- confirmed hand-over; while a delivery is in flight the subscription is
+    -- leased to exactly one process. A crash therefore leaves the cursor on the
+    -- undelivered events instead of past them — the loss path that made the
+    -- 2026-07-27 incident unrecoverable is closed by construction rather than
+    -- repaired afterwards by a rewind.
+    lease_owner   TEXT,
+    lease_until   INTEGER,
+    -- Fence: bumped on every acquisition, so a previous owner whose lease
+    -- expired can no longer commit or fail somebody else's attempt.
+    lease_version INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -3172,6 +3183,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "kanban_notify_subs", "escalate_after_seconds",
             "escalate_after_seconds INTEGER NOT NULL DEFAULT 0",
+        )
+    if sub_cols and "lease_owner" not in sub_cols:
+        # 2026-07-28 (B0): delivery lease, see the table definition.
+        _add_column_if_missing(
+            conn, "kanban_notify_subs", "lease_owner", "lease_owner TEXT",
+        )
+    if sub_cols and "lease_until" not in sub_cols:
+        _add_column_if_missing(
+            conn, "kanban_notify_subs", "lease_until", "lease_until INTEGER",
+        )
+    if sub_cols and "lease_version" not in sub_cols:
+        _add_column_if_missing(
+            conn, "kanban_notify_subs", "lease_version",
+            "lease_version INTEGER NOT NULL DEFAULT 0",
         )
 
     action_cols = {
@@ -17493,6 +17518,168 @@ def unseen_events_for_sub(
         ))
         max_id = max(max_id, int(r["id"]))
     return max_id, out
+
+
+NOTIFY_LEASE_SECONDS = 300
+
+
+def acquire_notify_sub_lease(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    owner: str,
+    lease_seconds: int = NOTIFY_LEASE_SECONDS,
+    now: Optional[int] = None,
+) -> Optional[dict]:
+    """Take the delivery lease for one subscription. CAS, single owner.
+
+    B0 (2026-07-28). The cursor is deliberately NOT touched here. Until this
+    change the claim advanced ``last_event_id`` and delivery happened
+    afterwards, so a process that died in between left a cursor past events
+    nobody had received — recoverable only by an in-memory rewind that a crash
+    took with it. Now the lease says "I am delivering this", the cursor still
+    says "nothing delivered yet", and a crash costs a retry instead of a
+    result.
+
+    Returns ``{"generation", "lease_version", "last_event_id"}`` when the lease
+    is ours, ``None`` when another owner holds a live lease or the
+    subscription is gone/inactive. An EXPIRED lease is reclaimable — that is
+    the recovery path, not an error.
+    """
+    now = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        updated = conn.execute(
+            "UPDATE kanban_notify_subs "
+            "   SET lease_owner = ?, lease_until = ?, lease_version = lease_version + 1 "
+            " WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "   AND active = 1 "
+            "   AND (lease_until IS NULL OR lease_until <= ?)",
+            (owner, now + max(1, int(lease_seconds)), task_id, platform, chat_id,
+             thread_id or "", now),
+        ).rowcount
+        if not updated:
+            return None
+        row = conn.execute(
+            "SELECT generation, lease_version, last_event_id FROM kanban_notify_subs "
+            " WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "generation": int(row["generation"]),
+            "lease_version": int(row["lease_version"]),
+            "last_event_id": int(row["last_event_id"]),
+        }
+
+
+def commit_notify_sub_delivery(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    owner: str,
+    generation: int,
+    lease_version: int,
+    new_cursor: int,
+) -> bool:
+    """Advance the cursor and release the lease — fenced, one transaction.
+
+    Only the CURRENT lease holder of the SAME subscription generation may
+    commit. A previous owner whose lease expired, or a holder from before an
+    unsubscribe/re-subscribe (the ABA case ``generation`` exists for), fails
+    the CAS and changes nothing.
+
+    Returns True when the cursor moved.
+    """
+    with write_txn(conn):
+        return conn.execute(
+            "UPDATE kanban_notify_subs "
+            "   SET last_event_id = ?, lease_owner = NULL, lease_until = NULL "
+            " WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "   AND lease_owner = ? AND lease_version = ? AND generation = ?",
+            (int(new_cursor), task_id, platform, chat_id, thread_id or "",
+             owner, int(lease_version), int(generation)),
+        ).rowcount == 1
+
+
+def release_notify_sub_lease(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    owner: str,
+    generation: int,
+    lease_version: int,
+    retry_after_seconds: int = 0,
+    now: Optional[int] = None,
+) -> bool:
+    """Give the lease back WITHOUT moving the cursor (delivery did not happen).
+
+    ``retry_after_seconds`` parks the subscription for a backoff window: the
+    lease stays unowned but not yet reclaimable, which is how a busy session
+    (409) or a failing turn start is held off durably instead of in process
+    memory. Fenced exactly like :func:`commit_notify_sub_delivery`.
+    """
+    now = int(time.time()) if now is None else int(now)
+    park_until = now + int(retry_after_seconds) if retry_after_seconds > 0 else None
+    with write_txn(conn):
+        return conn.execute(
+            "UPDATE kanban_notify_subs "
+            "   SET lease_owner = NULL, lease_until = ? "
+            " WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "   AND lease_owner = ? AND lease_version = ? AND generation = ?",
+            (park_until, task_id, platform, chat_id, thread_id or "",
+             owner, int(lease_version), int(generation)),
+        ).rowcount == 1
+
+
+def retire_notify_sub_with_marker(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    owner: str,
+    generation: int,
+    lease_version: int,
+    reason: str,
+    payload: Optional[dict] = None,
+) -> bool:
+    """Deactivate a subscription AND record why — atomically.
+
+    Terminal state and its visible evidence must not be able to drift apart:
+    writing the marker and deactivating in two transactions can leave a dropped
+    subscription with no trace, or a trace with a live subscription (TARS
+    design review 2026-07-28). Fenced on owner/lease/generation.
+
+    Returns True when the subscription was retired by this call.
+    """
+    with write_txn(conn):
+        retired = conn.execute(
+            "UPDATE kanban_notify_subs "
+            "   SET active = 0, lease_owner = NULL, lease_until = NULL "
+            " WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "   AND lease_owner = ? AND lease_version = ? AND generation = ?",
+            (task_id, platform, chat_id, thread_id or "",
+             owner, int(lease_version), int(generation)),
+        ).rowcount == 1
+        if not retired:
+            return False
+        marker = dict(payload or {})
+        marker.setdefault("reason", reason)
+        marker.setdefault("platform", platform)
+        marker.setdefault("chat_id", chat_id)
+        _append_event(conn, task_id, "notify_delivery_failed", marker)
+        return True
 
 
 def claim_unseen_events_for_sub(
