@@ -1488,6 +1488,12 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     job = resolve_job_ref(job_id)
     if not job:
         return None
+    # A manual trigger is NOT cadence-neutral, however much it looks like it:
+    # it replaces next_run_at with now, and mark_job_run() then re-anchors the
+    # following interval terms on that manual completion. The live phase really
+    # does restart here — so the stored anchor has to restart with it, or a
+    # later recovery (or a definitions restore, which carries no history) would
+    # reconstruct the PRE-trigger phase (TARS re-review, round 3).
     return update_job(
         job["id"],
         {
@@ -1496,6 +1502,7 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "paused_at": None,
             "paused_reason": None,
             "next_run_at": _hermes_now().isoformat(),
+            "schedule_anchor_at": _hermes_now().isoformat(),
         },
     )
 
@@ -2073,6 +2080,15 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                         # (which carry no history) would make every interval
                         # job instantly overdue and fire them all at once
                         # (TARS re-review, round 2).
+                        #
+                        # TRADE-OFF, accepted knowingly: a genuinely never-run
+                        # job whose slot passed longer ago than the grace loses
+                        # its catch-up too — the bound cannot tell it apart from
+                        # a restored definition, both look like "no history,
+                        # old anchor". Jobs WITH history keep their unbounded
+                        # single catch-up. Telling the two apart would need
+                        # restore provenance, not a time heuristic (TARS
+                        # re-review, round 3).
                         for candidate_anchor in (
                             job.get("schedule_anchor_at"), job.get("created_at"),
                         ):

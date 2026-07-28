@@ -3,6 +3,7 @@
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from cron.jobs import (
     parse_duration,
@@ -16,6 +17,7 @@ from cron.jobs import (
     update_job,
     pause_job,
     resume_job,
+    trigger_job,
     remove_job,
     mark_job_run,
     advance_next_run,
@@ -1688,6 +1690,106 @@ class TestGetDueJobs:
         assert resumed["schedule_anchor_at"] == even_later.isoformat(), (
             "resume recomputes next_run_at from now — the anchor follows too"
         )
+
+    def test_trigger_restamps_the_cadence_anchor(self, tmp_cron_dir, monkeypatch):
+        """A manual run really does restart the phase — the anchor must follow.
+
+        TARS re-review round 3: trigger_job replaces next_run_at with now, and
+        mark_job_run re-anchors the following interval terms on that manual
+        completion. Leaving schedule_anchor_at untouched would let a later
+        recovery (or a definitions restore, which carries no history)
+        reconstruct the PRE-trigger phase.
+        """
+        now = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job("interval sweep", "every 360m", name="Trigger job")
+
+        later = datetime(2026, 7, 26, 14, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: later)
+        triggered = trigger_job(job["id"])
+
+        assert triggered["next_run_at"] == later.isoformat()
+        assert triggered["schedule_anchor_at"] == later.isoformat(), (
+            "the manual run is the new phase — the anchor cannot stay behind"
+        )
+
+    def test_wall_clock_reinterpretation_across_dst_autumn_fold(self, tmp_cron_dir, monkeypatch):
+        """DST, not just fixed offsets (TARS re-review round 3, P3).
+
+        The new tests used datetime.timezone with fixed offsets. A real host
+        runs an IANA zone, where the SAME wall clock exists twice in autumn and
+        not at all in the spring gap. Re-attaching now.tzinfo to a stored wall
+        clock must stay well-defined there — no crash, no doubled run.
+        """
+        berlin = ZoneInfo("Europe/Berlin")
+        # 2026-10-25: 02:00+02:00 -> 02:00+01:00, the 02:xx hour happens twice.
+        now = datetime(2026, 10, 25, 4, 30, tzinfo=berlin)   # after the fold
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "cron-dst-fold",
+            "name": "Nightly during the fold",
+            "prompt": "...",
+            "schedule": {"kind": "cron", "expr": "30 2 * * *", "display": "30 2 * * *"},
+            "schedule_display": "30 2 * * *",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-10-01T02:30:00+02:00",
+            "next_run_at": None,
+            # Written under the pre-fold offset — the case the guard rewrites.
+            "last_run_at": "2026-10-24T02:30:00+02:00",
+            "last_status": "ok",
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == ["cron-dst-fold"], (
+            "02:30 has passed on the fold day — one catch-up, not a skip"
+        )
+        # And exactly once: consuming the slot must not leave it due again.
+        advance_next_run("cron-dst-fold")
+        mark_job_run("cron-dst-fold", success=True)
+        assert get_due_jobs() == [], "the doubled wall-clock hour must not double-fire"
+
+    def test_wall_clock_reinterpretation_across_dst_spring_gap(self, tmp_cron_dir, monkeypatch):
+        """The spring gap: 02:30 does not exist on that date at all."""
+        berlin = ZoneInfo("Europe/Berlin")
+        # 2026-03-29: 02:00 -> 03:00, so 02:30 is skipped entirely.
+        now = datetime(2026, 3, 29, 5, 0, tzinfo=berlin)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "cron-dst-gap",
+            "name": "Nightly across the gap",
+            "prompt": "...",
+            "schedule": {"kind": "cron", "expr": "30 2 * * *", "display": "30 2 * * *"},
+            "schedule_display": "30 2 * * *",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-03-01T02:30:00+01:00",
+            "next_run_at": None,
+            "last_run_at": "2026-03-28T02:30:00+01:00",
+            "last_status": "ok",
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        # Whatever croniter makes of the non-existent slot, the recovery must
+        # produce a usable, stored next_run_at and must not raise.
+        get_due_jobs()
+        stored = get_job("cron-dst-gap")["next_run_at"]
+        assert stored, "the gap must not leave the job without a next run"
+        parsed = datetime.fromisoformat(stored)
+        assert parsed.tzinfo is not None, "and it stays timezone-aware"
 
     def test_history_less_interval_uses_created_at_as_cadence_anchor(self, tmp_cron_dir, monkeypatch):
         """TARS review, P3: the grace lookback can never help an interval job.
