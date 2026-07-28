@@ -1746,6 +1746,18 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
     content_type        TEXT,
     validated_at        INTEGER NOT NULL,
     retention_class     TEXT NOT NULL,
+    -- Identity of the SOURCE file at promotion time (A0, 2026-07-28).
+    -- original_path alone cannot identify the object later: a symlink ancestor
+    -- rebent after promotion makes the same string resolve somewhere else, and
+    -- the last-copy guard would then protect the wrong inode — or nothing at
+    -- all. Captured here, once, while the file is provably the one we copied.
+    -- NULL on rows written before this column existed: those are NOT provable
+    -- and any guard that relies on identity must treat them fail-closed.
+    original_dev        INTEGER,
+    original_ino        INTEGER,
+    -- The fully resolved path at promotion time, kept ALONGSIDE the raw one
+    -- (which stays the value the producer reported).
+    original_realpath   TEXT,
     UNIQUE(task_id, producer_run_id, original_path, sha256),
     UNIQUE(durable_path)
 );
@@ -3173,6 +3185,24 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "kanban_attention_deliveries", "subscription_generation",
             "subscription_generation INTEGER NOT NULL DEFAULT 1",
+        )
+
+    artifact_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(task_artifacts)")
+    }
+    if artifact_cols and "original_dev" not in artifact_cols:
+        # 2026-07-28 (A0): source identity at promotion time. Legacy rows keep
+        # NULL and are therefore not provable — see the table definition.
+        _add_column_if_missing(
+            conn, "task_artifacts", "original_dev", "original_dev INTEGER",
+        )
+    if artifact_cols and "original_ino" not in artifact_cols:
+        _add_column_if_missing(
+            conn, "task_artifacts", "original_ino", "original_ino INTEGER",
+        )
+    if artifact_cols and "original_realpath" not in artifact_cols:
+        _add_column_if_missing(
+            conn, "task_artifacts", "original_realpath", "original_realpath TEXT",
         )
 
     sub_cols = {
@@ -7978,6 +8008,42 @@ def _promote_completion_artifacts(
                     f"artifact is not a readable regular file: {raw_path}",
                     path=raw_path,
                 )
+            # A0 (2026-07-28): pin the SOURCE identity now, while we still hold
+            # the proof that this path is the file we are about to copy. Doing
+            # it later — at GC time, from original_path — identifies whatever
+            # the string resolves to THEN, which after a rebent symlink
+            # ancestor is a different object (TARS design review).
+            source_dev = source_ino = None
+            source_realpath = None
+            try:
+                identity_fd = os.open(
+                    source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                )
+                try:
+                    identity = os.fstat(identity_fd)
+                    if not stat.S_ISREG(identity.st_mode):
+                        # O_NOFOLLOW does not fail on a final symlink under
+                        # every combination; the type check is what settles it.
+                        raise CompletionEvidenceError(
+                            "artifact_not_durable",
+                            f"artifact is not a regular file: {raw_path}",
+                            path=raw_path,
+                        )
+                    source_dev, source_ino = identity.st_dev, identity.st_ino
+                finally:
+                    os.close(identity_fd)
+                source_realpath = os.path.realpath(source)
+            except CompletionEvidenceError:
+                raise
+            except OSError as exc:
+                # Fail CLOSED: an artifact whose identity cannot be pinned is
+                # exactly the one a later guard must not have to guess about.
+                raise CompletionEvidenceError(
+                    "artifact_promotion_failed",
+                    f"cannot pin the identity of artifact {raw_path}: {exc}",
+                    path=raw_path,
+                ) from exc
+
             source_id = hashlib.sha256(str(source).encode("utf-8")).hexdigest()[:12]
             source_destination, source_destination_fd = _open_artifact_destination_child(
                 destination_dir, destination_fd, source_id
@@ -8009,6 +8075,9 @@ def _promote_completion_artifacts(
                     "content_type": mimetypes.guess_type(source.name)[0] or "application/octet-stream",
                     "validated_at": int(time.time()),
                     "retention_class": "task_completion",
+                    "original_dev": source_dev,
+                    "original_ino": source_ino,
+                    "original_realpath": source_realpath,
                 }
             )
         return manifests, created_paths
@@ -8093,8 +8162,9 @@ def _persist_completion_artifact_manifest(
             """
             INSERT INTO task_artifacts (
                 task_id, producer_run_id, original_path, durable_path,
-                sha256, size, content_type, validated_at, retention_class
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sha256, size, content_type, validated_at, retention_class,
+                original_dev, original_ino, original_realpath
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 manifest["task_id"],
@@ -8106,6 +8176,9 @@ def _persist_completion_artifact_manifest(
                 manifest["content_type"],
                 manifest["validated_at"],
                 manifest["retention_class"],
+                manifest.get("original_dev"),
+                manifest.get("original_ino"),
+                manifest.get("original_realpath"),
             ),
         )
     except sqlite3.Error as exc:
