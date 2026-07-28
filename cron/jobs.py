@@ -1992,14 +1992,61 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # to a single run — exactly the contract a stale (rather than
                 # missing) next_run_at already gets, see this function's docstring.
                 if not recovered_next and kind in {"cron", "interval"}:
+                    # A run this process is still executing must not be
+                    # recovered into a second dispatch: next_run_at can be
+                    # nulled again AFTER advance_next_run but BEFORE
+                    # mark_job_run writes last_run_at, and the anchor would
+                    # then still point at the slot that is running right now.
+                    # The execution ledger does not deduplicate per schedule
+                    # slot, so this is the guard that exists (TARS review of
+                    # 7770d66e4). It settles the single-gateway case; a second
+                    # process racing the same slot stays out of reach here.
+                    if _job_running_in_this_process(job.get("id", "")):
+                        continue
+
                     anchor = job.get("last_run_at")
+                    if anchor and kind == "cron":
+                        # A cron expression describes LOCAL wall-clock intent.
+                        # An anchor written under a different UTC offset (host
+                        # or config TZ migration) yields an occurrence in the
+                        # OLD frame, which can land before `now` — the job then
+                        # fires at the wrong local time and again at the
+                        # intended one. Reproduced on 7770d66e4: 21:00 job,
+                        # anchor 21:00+10, now 13:02+02 -> due at 13:02. The
+                        # stored-value path is guarded by the
+                        # _timezone_offset_mismatch branch below; the recovery
+                        # path must not slip past it, so drop the stale-frame
+                        # anchor and let the current frame decide.
+                        # Compare the RAW parse, like the stored-value path
+                        # does with raw_next_run_dt: _ensure_aware() converts an
+                        # aware timestamp into the configured zone, so an
+                        # offset checked after it can never mismatch (that is
+                        # what made the first attempt at this guard inert).
+                        try:
+                            raw_anchor_dt = datetime.fromisoformat(anchor)
+                        except (TypeError, ValueError):
+                            raw_anchor_dt = None
+                        if raw_anchor_dt is None or _timezone_offset_mismatch(
+                            raw_anchor_dt, now
+                        ):
+                            anchor = None
                     if anchor:
                         recovered_next = compute_next_run(schedule, anchor)
+                    if not recovered_next and kind == "interval":
+                        # No history: created_at is this schedule's other real
+                        # cadence anchor. The grace lookback below cannot help
+                        # an interval job at all — grace is at most half the
+                        # period, so `now - grace` always yields a FUTURE slot
+                        # and the first cadence silently slides to
+                        # `now + period - grace` (TARS review, P3).
+                        recovered_next = compute_next_run(
+                            schedule, job.get("created_at")
+                        ) if job.get("created_at") else None
                     if not recovered_next:
-                        # Never ran, or unparsable history: look back one grace
-                        # window so an occurrence inside it is still honoured
-                        # instead of jumped over. Outside the window this is
-                        # identical to computing from `now`.
+                        # Never ran, no usable anchor, or unparsable history:
+                        # look back one grace window so an occurrence inside it
+                        # is still honoured instead of jumped over. Outside the
+                        # window this is identical to computing from `now`.
                         lookback = now - timedelta(
                             seconds=_compute_grace_seconds(schedule)
                         )

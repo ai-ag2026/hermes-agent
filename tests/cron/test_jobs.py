@@ -1325,13 +1325,19 @@ class TestGetDueJobs:
             }]
         )
 
-        assert get_due_jobs() == []
+        # 2026-07-28: this used to assert `get_due_jobs() == []` and a FUTURE
+        # next_run_at — which encoded the recovery bug. The job was created at
+        # 09:00 with a 60-minute interval, so a healthy job (add_job stores
+        # created_at + interval) would have fired at exactly 10:00. Recovering
+        # from created_at now reproduces that, instead of silently sliding the
+        # first cadence to now + period - grace (TARS review of 7770d66e4, P3).
+        assert [j["id"] for j in get_due_jobs()] == ["interval-recover"]
         recovered = get_job("interval-recover")["next_run_at"]
         assert recovered is not None
         recovered_dt = datetime.fromisoformat(recovered)
         if recovered_dt.tzinfo is None:
             recovered_dt = recovered_dt.replace(tzinfo=timezone.utc)
-        assert recovered_dt > now
+        assert recovered_dt <= now, "the arrived slot is what fires"
 
 
     def test_weekly_job_losing_next_run_at_fires_the_missed_slot(self, tmp_cron_dir, monkeypatch):
@@ -1499,6 +1505,162 @@ class TestGetDueJobs:
         }])
 
         assert get_due_jobs() == []
+
+    def test_missing_next_run_with_migrated_tz_does_not_fire_early(self, tmp_cron_dir, monkeypatch):
+        """TARS review of 7770d66e4, P2: recovery must not bypass the TZ guard.
+
+        A cron expression is LOCAL wall-clock intent. Anchoring the recovery on
+        a ``last_run_at`` written under the old offset produced an occurrence in
+        the OLD frame, which landed before ``now`` — the job fired at 13:02 and
+        then again at the intended 21:00. The stored-value path has guarded this
+        since #28934; the recovery path slipped past it because the value it
+        reconstructed already carried the CURRENT offset, so
+        ``_timezone_offset_mismatch`` no longer saw a mismatch.
+        """
+        current_tz = timezone(timedelta(hours=2))
+        now = datetime(2026, 5, 19, 13, 2, 0, tzinfo=current_tz)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "cron-tz-null",
+            "name": "Migrated local cron",
+            "prompt": "...",
+            "schedule": {"kind": "cron", "expr": "0 21 * * *", "display": "0 21 * * *"},
+            "schedule_display": "0 21 * * *",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-05-12T21:00:00+10:00",
+            "next_run_at": None,                       # lost
+            "last_run_at": "2026-05-18T21:00:00+10:00",  # written under UTC+10
+            "last_status": "ok",
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        assert get_due_jobs() == [], (
+            "13:02 is not this job's local 21:00 — a migrated offset must not "
+            "make it due early"
+        )
+        recovered = datetime.fromisoformat(get_job("cron-tz-null")["next_run_at"])
+        assert recovered.hour == 21, "the recovered slot keeps the local intent"
+        assert recovered.utcoffset() == timedelta(hours=2), "…in the CURRENT frame"
+
+    def test_history_less_interval_uses_created_at_as_cadence_anchor(self, tmp_cron_dir, monkeypatch):
+        """TARS review, P3: the grace lookback can never help an interval job.
+
+        Grace is at most half the period, so ``now - grace`` always yields a
+        FUTURE slot and the first cadence slid to ``now + period - grace``.
+        ``created_at`` is the schedule's other real anchor.
+        """
+        now = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "interval-nohistory",
+            "name": "Six-hourly sweep",
+            "prompt": "...",
+            "schedule": {"kind": "interval", "minutes": 360, "display": "every 360m"},
+            "schedule_display": "every 6h",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-07-26T05:00:00+00:00",   # slot was 11:00, an hour ago
+            "next_run_at": None,
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        assert [j["id"] for j in get_due_jobs()] == ["interval-nohistory"], (
+            "the 11:00 slot from the created_at cadence is due, not now+3h"
+        )
+
+    def test_recovery_skips_a_job_running_in_this_process(self, tmp_cron_dir, monkeypatch):
+        """TARS review, P2: a re-null after the pre-advance must not double-fire.
+
+        next_run_at can be lost AGAIN between advance_next_run and
+        mark_job_run — last_run_at still points at the slot that is executing
+        right now, so the recovery would hand out the same slot a second time.
+        The execution ledger does not deduplicate per schedule slot.
+        """
+        now = datetime(2026, 7, 26, 12, 2, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        monkeypatch.setattr(
+            "cron.jobs._job_running_in_this_process",
+            lambda job_id: job_id == "interval-inflight",
+        )
+
+        save_jobs([{
+            "id": "interval-inflight",
+            "name": "Still running",
+            "prompt": "...",
+            "schedule": {"kind": "interval", "minutes": 360, "display": "every 360m"},
+            "schedule_display": "every 6h",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-07-01T00:00:00+00:00",
+            "next_run_at": None,          # nulled again mid-run
+            "last_run_at": "2026-07-26T05:58:00+00:00",
+            "last_status": "ok",
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        assert get_due_jobs() == [], "a slot that is executing must not be recovered"
+
+    def test_recovered_job_is_dispatched_exactly_once(self, tmp_cron_dir, monkeypatch):
+        """TARS review, P3: prove single execution over the WHOLE chain.
+
+        The other tests stop at get_due_jobs(). This one walks
+        due -> advance_next_run -> mark_job_run -> due again, which is where a
+        second dispatch of the same slot would actually show up.
+        """
+        now = datetime(2026, 7, 26, 5, 15, 41, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "weekly-once",
+            "name": "Kanban GC",
+            "prompt": "...",
+            "schedule": {"kind": "cron", "expr": "15 5 * * 0", "display": "15 5 * * 0"},
+            "schedule_display": "15 5 * * 0",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-07-01T00:00:00+00:00",
+            "next_run_at": None,
+            "last_run_at": "2026-07-19T05:15:02+00:00",
+            "last_status": "ok",
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        assert [j["id"] for j in get_due_jobs()] == ["weekly-once"]
+        advance_next_run("weekly-once")
+        mark_job_run("weekly-once", success=True)
+
+        assert get_due_jobs() == [], "the slot is consumed — no second dispatch"
+        job = get_job("weekly-once")
+        assert job["repeat"]["completed"] == 1, "exactly one run consumed"
+        after = datetime.fromisoformat(job["next_run_at"])
+        if after.tzinfo is None:
+            after = after.replace(tzinfo=timezone.utc)
+        assert after > now, "re-anchored into the future"
 
     def test_cron_next_run_offset_migration_is_rescheduled_not_fired(self, tmp_cron_dir, monkeypatch):
         current_tz = timezone(timedelta(hours=2))
