@@ -1971,10 +1971,41 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # Recurring jobs reach here only when something — typically a
                 # direct jobs.json edit that bypassed add_job() — left
                 # next_run_at unset.  Without this branch, such jobs are
-                # silently skipped forever; recompute next_run_at from the
-                # schedule so they pick up at their next scheduled tick.
+                # silently skipped forever.
+                #
+                # The recovery must be anchored on the job's OWN history, not on
+                # `now`: compute_next_run(schedule, now) returns the first
+                # occurrence STRICTLY AFTER now, so the occurrence that just came
+                # due was skipped without firing — and for a weekly job that is a
+                # whole week. Measured 2026-07-27: 43 of 57 jobs had never fired,
+                # and the split was clean — every job with a period >= ~2 h. Short-period jobs
+                # survived only because a forward jump of a few minutes is undone
+                # by the next tick's fresh chance; a weekly job has exactly one
+                # window per week and loses the whole period. Evidence in the GC
+                # job's history: on 2026-07-26 at 06:49 — after its 05:15 window —
+                # next_run_at was recomputed to 2026-08-02, and it had not run
+                # since 2026-06-28.
+                #
+                # Anchoring on last_run_at yields the occurrence that FOLLOWS the
+                # last real execution. If that lies in the past the job becomes
+                # due now and the stale-grace branch below collapses any backlog
+                # to a single run — exactly the contract a stale (rather than
+                # missing) next_run_at already gets, see this function's docstring.
                 if not recovered_next and kind in {"cron", "interval"}:
-                    recovered_next = compute_next_run(schedule, now.isoformat())
+                    anchor = job.get("last_run_at")
+                    if anchor:
+                        recovered_next = compute_next_run(schedule, anchor)
+                    if not recovered_next:
+                        # Never ran, or unparsable history: look back one grace
+                        # window so an occurrence inside it is still honoured
+                        # instead of jumped over. Outside the window this is
+                        # identical to computing from `now`.
+                        lookback = now - timedelta(
+                            seconds=_compute_grace_seconds(schedule)
+                        )
+                        recovered_next = compute_next_run(
+                            schedule, lookback.isoformat()
+                        ) or compute_next_run(schedule, now.isoformat())
                     if recovered_next:
                         recovery_kind = kind
 

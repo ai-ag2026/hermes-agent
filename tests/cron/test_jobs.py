@@ -1334,6 +1334,172 @@ class TestGetDueJobs:
         assert recovered_dt > now
 
 
+    def test_weekly_job_losing_next_run_at_fires_the_missed_slot(self, tmp_cron_dir, monkeypatch):
+        """The 2026-07-27 scheduler anomaly: 43 of 57 jobs had never fired.
+
+        Every job with a period >= ~2 h was affected. Mechanism: when a tick
+        found ``next_run_at`` missing, the recovery recomputed it from NOW —
+        which is by definition the occurrence AFTER now, so the slot that had
+        just come due was skipped silently. A weekly job has one window per
+        week, so it lost the entire period, every time, forever. The GC job
+        (``dbace64f3600``) had not run since 2026-06-28 for exactly this reason.
+        """
+        # Sunday 05:15:41 — 41 seconds into the job's weekly window.
+        now = datetime(2026, 7, 26, 5, 15, 41, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "weekly-gc",
+            "name": "Kanban GC",
+            "prompt": "...",
+            "schedule": {"kind": "cron", "expr": "15 5 * * 0", "display": "15 5 * * 0"},
+            "schedule_display": "15 5 * * 0",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-07-01T00:00:00+00:00",
+            # The defining condition: lost by whatever writes jobs.json.
+            "next_run_at": None,
+            # It ran on schedule the week before.
+            "last_run_at": "2026-07-19T05:15:02+00:00",
+            "last_status": "ok",
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == ["weekly-gc"], (
+            "the occurrence 41 s ago is this week's run — it must fire, not be "
+            "silently rescheduled to the next Sunday"
+        )
+        recovered = datetime.fromisoformat(get_job("weekly-gc")["next_run_at"])
+        if recovered.tzinfo is None:
+            recovered = recovered.replace(tzinfo=timezone.utc)
+        assert recovered <= now, "the recovered slot is the missed one, not next week's"
+
+    def test_long_dark_weekly_job_fires_once_and_reanchors(self, tmp_cron_dir, monkeypatch):
+        """A job dark for weeks fires ONCE now; the backlog is not burst-fired."""
+        now = datetime(2026, 7, 26, 6, 49, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "weekly-dark",
+            "name": "Kanban GC",
+            "prompt": "...",
+            "schedule": {"kind": "cron", "expr": "15 5 * * 0", "display": "15 5 * * 0"},
+            "schedule_display": "15 5 * * 0",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "next_run_at": None,
+            "last_run_at": "2026-06-28T05:15:03+00:00",   # four windows ago
+            "last_status": "ok",
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == ["weekly-dark"], "must not stay dark"
+        # The stale-grace branch fast-forwards: one run now, no four-run burst.
+        provisional = datetime.fromisoformat(get_job("weekly-dark")["next_run_at"])
+        if provisional.tzinfo is None:
+            provisional = provisional.replace(tzinfo=timezone.utc)
+        assert provisional > now, "the backlog is collapsed, not queued up"
+
+    def test_interval_losing_next_run_at_keeps_its_cadence(self, tmp_cron_dir, monkeypatch):
+        """An interval job resumes on its own cadence instead of losing a period."""
+        now = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "interval-lost",
+            "name": "Six-hourly sweep",
+            "prompt": "...",
+            "schedule": {"kind": "interval", "minutes": 360, "display": "every 360m"},
+            "schedule_display": "every 6h",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-07-01T00:00:00+00:00",
+            "next_run_at": None,
+            "last_run_at": "2026-07-26T05:58:00+00:00",   # due again at 11:58
+            "last_status": "ok",
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        assert [j["id"] for j in get_due_jobs()] == ["interval-lost"], (
+            "the slot two minutes ago is this cycle's run"
+        )
+
+    def test_never_run_recurring_job_still_waits_for_its_slot(self, tmp_cron_dir, monkeypatch):
+        """Negative control: no history + no due slot must NOT invent a run."""
+        now = datetime(2026, 7, 26, 10, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "fresh-daily",
+            "name": "Fresh daily",
+            "prompt": "...",
+            "schedule": {"kind": "cron", "expr": "0 12 * * *", "display": "0 12 * * *"},
+            "schedule_display": "0 12 * * *",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-07-26T09:00:00+00:00",
+            "next_run_at": None,
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        assert get_due_jobs() == [], "a job whose window has not come must not fire"
+        recovered = datetime.fromisoformat(get_job("fresh-daily")["next_run_at"])
+        if recovered.tzinfo is None:
+            recovered = recovered.replace(tzinfo=timezone.utc)
+        assert recovered == datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
+
+    def test_disabled_job_losing_next_run_at_is_not_fired(self, tmp_cron_dir, monkeypatch):
+        """Negative control: recovery must not resurrect a disabled job."""
+        now = datetime(2026, 7, 26, 5, 15, 41, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "weekly-off",
+            "name": "Disabled weekly",
+            "prompt": "...",
+            "schedule": {"kind": "cron", "expr": "15 5 * * 0", "display": "15 5 * * 0"},
+            "schedule_display": "15 5 * * 0",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": False,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-07-01T00:00:00+00:00",
+            "next_run_at": None,
+            "last_run_at": "2026-07-19T05:15:02+00:00",
+            "last_status": "ok",
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        assert get_due_jobs() == []
+
     def test_cron_next_run_offset_migration_is_rescheduled_not_fired(self, tmp_cron_dir, monkeypatch):
         current_tz = timezone(timedelta(hours=2))
         now = datetime(2026, 5, 19, 13, 2, 0, tzinfo=current_tz)
