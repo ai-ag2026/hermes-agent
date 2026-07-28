@@ -1242,6 +1242,11 @@ def create_job(
         "paused_at": None,
         "paused_reason": None,
         "created_at": now,
+        # Cadence anchor for interval schedules: created here, re-stamped on
+        # every schedule change and on resume. created_at is the AUDIT time and
+        # drifts away from the cadence as soon as a job is edited, so recovery
+        # of a lost next_run_at must not lean on it (TARS re-review, round 2).
+        "schedule_anchor_at": now,
         "next_run_at": next_run_at,
         "last_run_at": None,
         "last_status": None,
@@ -1404,6 +1409,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                             f"{ONESHOT_GRACE_SECONDS}s in the past and cannot be scheduled."
                         )
                     updated["next_run_at"] = updated_next_run
+                    # The cadence restarts here — keep the anchor with it, or a
+                    # later recovery would resurrect the pre-edit cadence.
+                    updated["schedule_anchor_at"] = _hermes_now().isoformat()
 
             if inference_fields_changed:
                 provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
@@ -1468,6 +1476,9 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             "paused_at": None,
             "paused_reason": None,
             "next_run_at": next_run_at,
+            # Resume restarts the cadence from now (next_run_at above is
+            # computed from now); the anchor has to follow.
+            "schedule_anchor_at": _hermes_now().isoformat(),
         },
     )
 
@@ -2026,22 +2037,62 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                             raw_anchor_dt = datetime.fromisoformat(anchor)
                         except (TypeError, ValueError):
                             raw_anchor_dt = None
-                        if raw_anchor_dt is None or _timezone_offset_mismatch(
-                            raw_anchor_dt, now
-                        ):
+                        if raw_anchor_dt is None:
                             anchor = None
+                        elif _timezone_offset_mismatch(raw_anchor_dt, now):
+                            # Re-read the anchor's WALL CLOCK in the current
+                            # frame rather than discarding it. Discarding also
+                            # threw away the missed slot: a Tuesday-09:00 job
+                            # with now=Tuesday 13:02 was pushed to next week
+                            # instead of catching up once, which contradicts
+                            # the stored-value path where a past wall clock
+                            # deliberately falls into the stale logic and runs
+                            # once (TARS re-review, round 2).
+                            anchor = raw_anchor_dt.replace(
+                                tzinfo=now.tzinfo
+                            ).isoformat()
                     if anchor:
                         recovered_next = compute_next_run(schedule, anchor)
                     if not recovered_next and kind == "interval":
-                        # No history: created_at is this schedule's other real
-                        # cadence anchor. The grace lookback below cannot help
-                        # an interval job at all — grace is at most half the
-                        # period, so `now - grace` always yields a FUTURE slot
-                        # and the first cadence silently slides to
-                        # `now + period - grace` (TARS review, P3).
-                        recovered_next = compute_next_run(
-                            schedule, job.get("created_at")
-                        ) if job.get("created_at") else None
+                        # No history. An interval schedule carries no phase of
+                        # its own, so it needs a cadence anchor — the grace
+                        # lookback below cannot help it at all (grace is at most
+                        # half the period, so `now - grace` always yields a
+                        # FUTURE slot and the first cadence silently slides to
+                        # `now + period - grace`).
+                        #
+                        # schedule_anchor_at is that anchor: written at creation
+                        # and re-stamped whenever the schedule changes or the
+                        # job resumes. created_at is the legacy fallback for
+                        # records written before the field existed — it is the
+                        # AUDIT time, so an updated or resumed job carries a
+                        # stale one.
+                        #
+                        # Either way a PAST slot counts only inside the grace
+                        # window. Without that bound, restoring definitions
+                        # (which carry no history) would make every interval
+                        # job instantly overdue and fire them all at once
+                        # (TARS re-review, round 2).
+                        for candidate_anchor in (
+                            job.get("schedule_anchor_at"), job.get("created_at"),
+                        ):
+                            if not candidate_anchor:
+                                continue
+                            candidate = compute_next_run(schedule, candidate_anchor)
+                            if candidate:
+                                try:
+                                    candidate_dt = _ensure_aware(
+                                        datetime.fromisoformat(candidate)
+                                    )
+                                except (TypeError, ValueError):
+                                    candidate_dt = None
+                                if candidate_dt is not None and candidate_dt >= (
+                                    now - timedelta(
+                                        seconds=_compute_grace_seconds(schedule)
+                                    )
+                                ):
+                                    recovered_next = candidate
+                            break  # the first anchor present decides
                     if not recovered_next:
                         # Never ran, no usable anchor, or unparsable history:
                         # look back one grace window so an occurrence inside it

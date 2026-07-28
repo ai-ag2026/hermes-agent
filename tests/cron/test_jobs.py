@@ -1549,6 +1549,146 @@ class TestGetDueJobs:
         assert recovered.hour == 21, "the recovered slot keeps the local intent"
         assert recovered.utcoffset() == timedelta(hours=2), "…in the CURRENT frame"
 
+    def test_migrated_tz_still_catches_up_a_past_wall_clock_slot(self, tmp_cron_dir, monkeypatch):
+        """TARS re-review round 2: the TZ guard must not eat the missed slot.
+
+        My first repair discarded the anchor on ANY offset mismatch. That also
+        discarded the catch-up: a 09:00 job seen at 13:02 was pushed to the next
+        occurrence instead of running once — the opposite of what the
+        stored-value path does, where a past wall clock falls into the stale
+        logic. The anchor's WALL CLOCK is now re-read in the current frame.
+        """
+        current_tz = timezone(timedelta(hours=2))
+        now = datetime(2026, 5, 19, 13, 2, 0, tzinfo=current_tz)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "cron-tz-catchup",
+            "name": "Morning cron",
+            "prompt": "...",
+            "schedule": {"kind": "cron", "expr": "0 9 * * *", "display": "0 9 * * *"},
+            "schedule_display": "0 9 * * *",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-05-12T09:00:00+10:00",
+            "next_run_at": None,
+            "last_run_at": "2026-05-18T09:00:00+10:00",   # old offset
+            "last_status": "ok",
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        assert [j["id"] for j in get_due_jobs()] == ["cron-tz-catchup"], (
+            "09:00 has passed today — the job catches up once instead of "
+            "waiting for tomorrow"
+        )
+
+    def test_history_less_interval_does_not_burst_after_a_definitions_restore(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A restored definition has no history — it must not be instantly overdue.
+
+        TARS re-review round 2: anchoring an interval job on an old created_at
+        without bounds would make every job of a restored jobs.definitions.json
+        overdue at once and fire the whole set on the first tick.
+        """
+        now = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "interval-restored",
+            "name": "Restored sweep",
+            "prompt": "...",
+            "schedule": {"kind": "interval", "minutes": 360, "display": "every 360m"},
+            "schedule_display": "every 6h",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-06-01T00:00:00+00:00",   # weeks ago
+            "next_run_at": None,
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        assert get_due_jobs() == [], (
+            "an anchor far outside the grace window must not make the job "
+            "instantly due"
+        )
+        recovered = datetime.fromisoformat(get_job("interval-restored")["next_run_at"])
+        if recovered.tzinfo is None:
+            recovered = recovered.replace(tzinfo=timezone.utc)
+        assert recovered > now
+
+    def test_schedule_anchor_at_wins_over_the_audit_created_at(self, tmp_cron_dir, monkeypatch):
+        """An edited job follows its NEW cadence, not its creation time.
+
+        TARS re-review round 2: update_job/resume_job recompute next_run_at from
+        now but leave created_at untouched, so recovery that leans on created_at
+        resurrects the pre-edit cadence. schedule_anchor_at is re-stamped by
+        those paths and takes precedence.
+        """
+        now = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs([{
+            "id": "interval-edited",
+            "name": "Edited sweep",
+            "prompt": "...",
+            "schedule": {"kind": "interval", "minutes": 360, "display": "every 360m"},
+            "schedule_display": "every 6h",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": "2026-07-26T05:58:00+00:00",   # would be due at 11:58
+            "schedule_anchor_at": "2026-07-26T11:30:00+00:00",  # re-scheduled since
+            "next_run_at": None,
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        assert get_due_jobs() == [], "the new cadence starts at 17:30, not 11:58"
+        recovered = datetime.fromisoformat(get_job("interval-edited")["next_run_at"])
+        if recovered.tzinfo is None:
+            recovered = recovered.replace(tzinfo=timezone.utc)
+        assert recovered == datetime(2026, 7, 26, 17, 30, tzinfo=timezone.utc)
+
+    def test_schedule_change_restamps_the_cadence_anchor(self, tmp_cron_dir, monkeypatch):
+        """The write paths must maintain the anchor, or it is fiction."""
+        now = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job("interval sweep", "every 360m", name="Anchor job")
+        assert job["schedule_anchor_at"] == now.isoformat(), "set at creation"
+
+        later = datetime(2026, 7, 26, 15, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: later)
+        updated = update_job(job["id"], {"schedule": "every 120m"})
+        assert updated["schedule_anchor_at"] == later.isoformat(), (
+            "a schedule change restarts the cadence — the anchor follows"
+        )
+
+        even_later = datetime(2026, 7, 26, 18, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: even_later)
+        pause_job(job["id"])
+        resumed = resume_job(job["id"])
+        assert resumed["schedule_anchor_at"] == even_later.isoformat(), (
+            "resume recomputes next_run_at from now — the anchor follows too"
+        )
+
     def test_history_less_interval_uses_created_at_as_cadence_anchor(self, tmp_cron_dir, monkeypatch):
         """TARS review, P3: the grace lookback can never help an interval job.
 
@@ -1620,12 +1760,13 @@ class TestGetDueJobs:
 
         assert get_due_jobs() == [], "a slot that is executing must not be recovered"
 
-    def test_recovered_job_is_dispatched_exactly_once(self, tmp_cron_dir, monkeypatch):
-        """TARS review, P3: prove single execution over the WHOLE chain.
+    def test_recovered_slot_is_consumed_by_the_state_transitions(self, tmp_cron_dir, monkeypatch):
+        """The slot must be consumed by due -> advance -> mark, not re-offered.
 
-        The other tests stop at get_due_jobs(). This one walks
-        due -> advance_next_run -> mark_job_run -> due again, which is where a
-        second dispatch of the same slot would actually show up.
+        Scope, precisely (TARS re-review, round 2, P3): this composes the state
+        transitions by hand. It does NOT exercise the real scheduler — no
+        tick(), _submit_with_guard(), running set, execution ledger or
+        run_one_job(). It proves the state sequence, not the dispatch path.
         """
         now = datetime(2026, 7, 26, 5, 15, 41, tzinfo=timezone.utc)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
