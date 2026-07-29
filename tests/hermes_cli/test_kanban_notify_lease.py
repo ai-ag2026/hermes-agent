@@ -194,8 +194,66 @@ def test_inactive_subscription_is_not_leasable(board):
     assert kb.acquire_notify_sub_lease(board, **_key(task_id), owner="B", now=2000) is None
 
 
-def test_migration_adds_the_lease_columns_to_an_old_board(board, tmp_path):
-    """An existing board DB must gain the columns without a manual step."""
-    board.execute("DROP TABLE IF EXISTS probe_old")
+def test_lease_columns_survive_a_legacy_table_rebuild(board, monkeypatch):
+    """The columns must survive the REBUILD path, not just the ADD path.
+
+    TARS' B0 review, P1 — and my own test was worthless before: it asserted the
+    columns exist on a database the fixture had just created with the current
+    schema. That can never fail. The dangerous case is a legacy board with a
+    TEXT ``last_event_id``: the migration adds the lease columns, then
+    ``_rebuild_drifted_tables`` recreates the table from a HAND-WRITTEN DDL —
+    and if that DDL does not carry them, they are gone again and the poller
+    fail-closes this board into permanent silence.
+
+    So build the legacy shape for real and drive the migration over it.
+    """
+    board.execute("DROP TABLE kanban_notify_subs")
+    board.execute(
+        "CREATE TABLE kanban_notify_subs ("
+        " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
+        " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
+        " notifier_profile TEXT, created_at INTEGER NOT NULL,"
+        " last_event_id TEXT,"                     # the legacy shape
+        " active INTEGER NOT NULL DEFAULT 1,"
+        " generation INTEGER NOT NULL DEFAULT 1,"
+        " PRIMARY KEY (task_id, platform, chat_id, thread_id))"
+    )
+    board.execute(
+        "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id,"
+        " created_at, last_event_id) VALUES ('t_legacy','webui','sess1','',1,'7')"
+    )
+    board.commit()
+
+    kb.init_db()          # runs the migration + rebuild over the legacy table
+
     cols = {row["name"] for row in board.execute("PRAGMA table_info(kanban_notify_subs)")}
-    assert {"lease_owner", "lease_until", "lease_version"} <= cols
+    assert {"lease_owner", "lease_until", "lease_version"} <= cols, (
+        "the rebuild DDL dropped the lease columns again"
+    )
+    row = board.execute(
+        "SELECT last_event_id, lease_version FROM kanban_notify_subs "
+        "WHERE task_id='t_legacy'"
+    ).fetchone()
+    assert row["last_event_id"] == 7, "the legacy TEXT cursor was carried over"
+    assert row["lease_version"] == 0
+
+    # And the lease actually works on the rebuilt table.
+    assert kb.acquire_notify_sub_lease(
+        board, task_id="t_legacy", platform="webui", chat_id="sess1",
+        owner="A", now=1000,
+    ) is not None
+
+
+def test_a_deactivated_subscription_cannot_be_committed(board):
+    """P2: remove_notify_sub must invalidate a live lease, not just deactivate."""
+    task_id = _subscribed_task(board)
+    lease = kb.acquire_notify_sub_lease(board, **_key(task_id), owner="A", now=1000)
+
+    kb.remove_notify_sub(board, **_key(task_id))
+
+    assert kb.commit_notify_sub_delivery(
+        board, **_key(task_id), owner="A",
+        generation=lease["generation"], lease_version=lease["lease_version"],
+        new_cursor=99,
+    ) is False, "a holder must not write into a deactivated generation"
+    assert _cursor(board, task_id)["last_event_id"] == 0

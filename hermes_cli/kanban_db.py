@@ -3818,6 +3818,11 @@ _REBUILD_SPECS = {
         " payload TEXT, created_at INTEGER NOT NULL)",
         (
             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
+            # Same trap, older instance: added to the schema in Welle 5
+            # (064c35b25) but not to this hand-written rebuild spec, so the
+            # parity test has been red since. Pre-existing, fixed here because
+            # the same test has to prove the lease columns survive a rebuild.
+            "CREATE INDEX idx_events_task_id ON task_events(task_id, id)",
             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
         ),
     ),
@@ -3854,6 +3859,15 @@ _REBUILD_SPECS = {
         " last_event_id INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,"
         " generation INTEGER NOT NULL DEFAULT 1,"
         " escalate_after_seconds INTEGER NOT NULL DEFAULT 0,"
+        # B0 (2026-07-28): the rebuild path is a HAND-WRITTEN DDL and does not
+        # inherit from the schema above. Leaving the lease columns out here
+        # dropped them again on exactly the legacy boards the rebuild exists
+        # for — the migration added them, the rebuild took them away, and the
+        # poller then fail-closed that board into permanent silence (TARS
+        # review of B0, P1). Anything added to kanban_notify_subs must be
+        # added HERE too; test_rebuilt_schema_matches_fresh_db is the guard.
+        " lease_owner TEXT, lease_until INTEGER,"
+        " lease_version INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -17539,7 +17553,12 @@ def remove_notify_sub(
         if row is None:
             return False
         generation = int(row['generation'])
-        conn.execute("UPDATE kanban_notify_subs SET active=0 WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? AND active=1", (task_id, platform, chat_id, thread))
+        # Invalidate any live delivery lease along with the generation: without
+        # the lease_version bump a holder could still commit a cursor or write
+        # a terminal marker into the DEACTIVATED generation (TARS B0 review,
+        # P2). generation+1 only guards a full remove→re-subscribe cycle, not
+        # this in-between window.
+        conn.execute("UPDATE kanban_notify_subs SET active=0, lease_owner=NULL, lease_until=NULL, lease_version=lease_version+1 WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? AND active=1", (task_id, platform, chat_id, thread))
         conn.execute("UPDATE kanban_attention_deliveries SET state='cancelled', lease_until=NULL, lease_version=lease_version+1, updated_at=? WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? AND subscription_generation=? AND state IN ('pending','sending')", (now, task_id, platform, chat_id, thread, generation))
         return True
 
@@ -17593,6 +17612,20 @@ def unseen_events_for_sub(
     return max_id, out
 
 
+# How long a delivery lease is held before it may be reclaimed. 300 s is
+# generous for what it covers: the WebUI turn start only confirms ADMISSION and
+# runs the agent in the background, so a lease that outlives the admission
+# risks a duplicate wakeup, never a loss.
+#
+# AUTHORITY CONTRACT (TARS B0 review, P3) — two backoffs coexist on purpose:
+#   * ``lease_until`` here is DURABLE and per subscription. It survives a
+#     restart and is what actually holds a failing subscription back.
+#   * The poller additionally keeps a per-PROCESS, per-SESSION throttle
+#     (_BACKOFF_UNTIL) and failure counter (_FAILURES). Those are lost on
+#     restart and are not shared between WebUI processes.
+# Consequence, stated rather than implied: the BACKOFF is restart-proof, the
+# five-failure cap is NOT. A restart (or a second process) starts counting
+# failures again. That costs retries, never a cursor.
 NOTIFY_LEASE_SECONDS = 300
 
 
@@ -17675,6 +17708,7 @@ def commit_notify_sub_delivery(
             "UPDATE kanban_notify_subs "
             "   SET last_event_id = ?, lease_owner = NULL, lease_until = NULL "
             " WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "   AND active = 1 "
             "   AND lease_owner = ? AND lease_version = ? AND generation = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or "",
              owner, int(lease_version), int(generation)),
@@ -17708,6 +17742,7 @@ def release_notify_sub_lease(
             "UPDATE kanban_notify_subs "
             "   SET lease_owner = NULL, lease_until = ? "
             " WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "   AND active = 1 "
             "   AND lease_owner = ? AND lease_version = ? AND generation = ?",
             (park_until, task_id, platform, chat_id, thread_id or "",
              owner, int(lease_version), int(generation)),
@@ -17739,14 +17774,28 @@ def retire_notify_sub_with_marker(
     with write_txn(conn):
         retired = conn.execute(
             "UPDATE kanban_notify_subs "
-            "   SET active = 0, lease_owner = NULL, lease_until = NULL "
+            "   SET active = 0, lease_owner = NULL, lease_until = NULL, "
+            "       lease_version = lease_version + 1 "
             " WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "   AND active = 1 "
             "   AND lease_owner = ? AND lease_version = ? AND generation = ?",
             (task_id, platform, chat_id, thread_id or "",
              owner, int(lease_version), int(generation)),
         ).rowcount == 1
         if not retired:
             return False
+        # Same cleanup the ordinary remove_notify_sub does: an attention
+        # delivery of a generation that no longer exists can never complete
+        # (TARS B0 review, P2).
+        conn.execute(
+            "UPDATE kanban_attention_deliveries "
+            "   SET state='cancelled', lease_until=NULL, "
+            "       lease_version=lease_version+1, updated_at=? "
+            " WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? "
+            "   AND subscription_generation=? AND state IN ('pending','sending')",
+            (int(time.time()), task_id, platform, chat_id, thread_id or "",
+             int(generation)),
+        )
         marker = dict(payload or {})
         marker.setdefault("reason", reason)
         marker.setdefault("platform", platform)
