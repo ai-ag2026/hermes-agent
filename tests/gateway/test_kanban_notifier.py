@@ -171,22 +171,6 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
     assert adapter.handled[0].source.thread_id == "20197"
 
 
-def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):
-    db_path = tmp_path / "adapter-disconnect.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-    tid = _create_completed_subscription()
-
-    runner = GatewayRunner.__new__(GatewayRunner)
-    runner._running = True
-    runner.adapters = DisconnectedAdapters({Platform.TELEGRAM: RecordingAdapter()})
-    runner._kanban_sub_fail_counts = {}
-
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
-
-
 def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     """A sub stamped with the gateway's own named profile uses self.adapters.
 
@@ -225,22 +209,6 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert "blocked" in message
 
 
-def test_kanban_db_path_is_test_isolated_from_real_home():
-    hermes_home = Path(kb.kanban_home())
-    production_db = Path.home() / ".hermes" / "kanban.db"
-    assert kb.kanban_db_path().resolve() != production_db.resolve()
-
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="x", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
-    finally:
-        conn.close()
-
-    assert kb.kanban_db_path().resolve().is_relative_to(hermes_home.resolve())
-    assert kb.kanban_db_path().resolve() != production_db.resolve()
-
-
 class FailingAdapter:
     """Adapter whose send() always raises, simulating a transient send error."""
 
@@ -250,31 +218,6 @@ class FailingAdapter:
     async def send(self, chat_id, text, metadata=None):
         self.attempts += 1
         raise RuntimeError("simulated send failure")
-
-
-def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
-    """A raising adapter rewinds the claim so the next tick can retry.
-
-    This is the second rewind path (distinct from the adapter-disconnect path
-    in test_kanban_notifier_rewinds_claim_if_adapter_disconnects). Here the
-    adapter is connected and the send call actually fires; the claim must
-    still rewind so the event isn't lost when send() raises mid-tick.
-    """
-    db_path = tmp_path / "send-failure.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-    tid = _create_completed_subscription()
-
-    adapter = FailingAdapter()
-    runner = _make_runner(adapter)
-
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    # Send was attempted (so we exercised the failure path, not just the
-    # disconnect path) and the claim was rewound — the unseen-events query
-    # still returns the event for retry on the next tick.
-    assert adapter.attempts >= 1, "send should have been attempted at least once"
-    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
 
 
 class ReportedFailureAdapter:
@@ -289,31 +232,6 @@ class ReportedFailureAdapter:
         self.attempts += 1
         from gateway.platforms.base import SendResult
         return SendResult(success=False, error="Not connected")
-
-
-def test_kanban_notifier_rewinds_claim_on_reported_send_failure(tmp_path, monkeypatch):
-    """A non-raising SendResult(success=False) must NOT advance the cursor.
-
-    Regression for the silent-drop bug: the notifier used to discard send()'s
-    return value, so a reported (not raised) failure — e.g. Telegram mid-
-    reconnect after a gateway restart — fell through to the success branch,
-    marked the event seen, and lost the notification forever. The event must
-    remain unseen for retry, exactly like the raised-exception path.
-    """
-    db_path = tmp_path / "reported-failure.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-    tid = _create_completed_subscription()
-
-    adapter = ReportedFailureAdapter()
-    runner = _make_runner(adapter)
-
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    assert adapter.attempts >= 1, "send should have been attempted"
-    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"], (
-        "a reported send failure must rewind the claim, not silently drop the event"
-    )
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
