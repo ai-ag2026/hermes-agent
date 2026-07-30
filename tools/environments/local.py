@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
@@ -531,7 +532,51 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     _apply_windows_msys_bash_env_defaults(sanitized)
 
+    sanitized = _scrub_delegated_child_kanban_env(sanitized)
+
     return sanitized
+
+
+
+
+# fork(tars), Manfred-Entscheid 30.07.2026: TASK/DB/BOARD BLEIBEN.
+#
+# Upstreams ``scrub_kanban_env`` nimmt einem delegate_task-Kind die komplette
+# Kanban-Env. Wir strippen nur die EIGENTUMS-Marker. Grund steht ausführlich in
+# tools/kanban_tools.py: wird ``HERMES_KANBAN_TASK`` mitgestrippt, kippt
+# ``_check_kanban_mode`` die Einstufung des Kindes von „worker-scoped" auf
+# „orchestrator" — und das gäbe ihm MEHR Board-Zugriff, nicht weniger.
+# Das Kind soll lesen dürfen (TASK/DB/BOARD), aber nichts besitzen.
+#
+# Bewusst hier und nicht in agent/delegation_context.py: deren Modul gehört
+# upstream, eine Änderung dort kollidiert bei jedem künftigen Merge.
+DELEGATED_CHILD_OWNERSHIP_ENV_KEYS: tuple[str, ...] = (
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_BRANCH",
+)
+
+
+def scrub_delegated_child_ownership_env(env):
+    """``env`` ohne die Eigentums-Marker; Lesezugang bleibt."""
+    cleaned = dict(env)
+    for key in DELEGATED_CHILD_OWNERSHIP_ENV_KEYS:
+        cleaned.pop(key, None)
+    return cleaned
+
+
+def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
+    """Strip dispatcher-OWNED Kanban env from delegate_task child subprocesses."""
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        if is_delegated_child_process_context():
+            return scrub_delegated_child_ownership_env(env)
+    except Exception:
+        pass
+    return env
 
 
 # Tier-1 secrets: stripped from EVERY spawned subprocess unconditionally —
@@ -653,6 +698,75 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # happen; single uniform policy across every spawn surface.
     _inject_session_context_env(env)
 
+    # Non-terminal subprocess helpers (browser, lazy-deps, TUI/ACP hosts, etc.)
+    # also need the delegate_task child lineage marker.  Otherwise a child
+    # context that later imports Kanban DB code in the spawned process would
+    # still see the parent's HERMES_HOME but lose the DB mutation guard.
+    env = _scrub_delegated_child_kanban_env(env)
+
+    return env
+
+
+def build_subprocess_env(
+    base: "Mapping[str, str] | None" = None,
+    *,
+    inherit_profile_home: bool = True,
+    scrub_secrets: bool = True,
+    extra: "Mapping[str, str] | None" = None,
+) -> dict[str, str]:
+    """Single factory for building a child-process environment.
+
+    Every spawn site in the codebase should build its env through this
+    function (or :func:`hermes_subprocess_env` for the model-driving-CLI
+    surface) instead of copying ``os.environ`` directly, so profile-home
+    propagation (``HERMES_HOME`` / subprocess ``HOME`` contract) and the
+    Hermes secret-scrub policy have a single owner.  History: ~11 separate
+    commits each fixed one more spawn site that missed profile-HOME or
+    secret-scrub propagation; this factory is the fix for the class.
+
+    Parameters:
+
+    * ``base`` — starting environment.  ``None`` (default) snapshots
+      ``os.environ``.  Pass an explicit mapping to build on a caller-prepared
+      env instead.
+    * ``scrub_secrets=True`` (default) — delegate to
+      :func:`_sanitize_subprocess_env`, the long-standing owner of the scrub
+      list (provider blocklist + ``_is_hermes_internal_secret`` dynamic
+      patterns + kanban/venv-marker/session-context guards) **and** of
+      ``HERMES_HOME`` / subprocess-HOME propagation.  On this path profile
+      home propagation is inherent — ``inherit_profile_home`` is ignored
+      (always applied), exactly matching today's sanitize semantics.
+    * ``scrub_secrets=False`` — preserve the base env content byte-for-byte
+      (no key is removed).  Use for children that intentionally receive
+      secrets (git credential flows, ``bws``/``op`` secret CLIs) or where
+      scrubbing could change behavior.  The site is still a win: it becomes
+      grep-able and future-fixable.
+    * ``inherit_profile_home`` — on the non-scrub path, when True, bridge the
+      context-local Hermes home override into ``HERMES_HOME`` and apply the
+      subprocess HOME contract (``hermes_constants.apply_subprocess_home_env``).
+      Pass False to keep the inherited env untouched (exact legacy
+      ``os.environ.copy()`` behavior).
+    * ``extra`` — applied **last** on the non-scrub path so explicit caller
+      overrides (e.g. a session-scoped ``HERMES_HOME``) always win.  On the
+      scrub path it is forwarded as ``_sanitize_subprocess_env``'s
+      ``extra_env`` (same force-prefix / blocklist handling as today).
+    """
+    if scrub_secrets:
+        # _sanitize_subprocess_env already performs HERMES_HOME override
+        # bridging + apply_subprocess_home_env unconditionally; delegating
+        # wholesale keeps one owner and zero drift.
+        return _sanitize_subprocess_env(
+            dict(base) if base is not None else os.environ.copy(),
+            dict(extra) if extra else None,
+        )
+
+    env: dict[str, str] = dict(base) if base is not None else os.environ.copy()
+    if inherit_profile_home:
+        _inject_context_hermes_home(env)
+        from hermes_constants import apply_subprocess_home_env
+        apply_subprocess_home_env(env)
+    if extra:
+        env.update(extra)
     return env
 
 
@@ -782,7 +896,7 @@ def _mandatory_aslr_enabled() -> "bool | None":
                 "(Get-ProcessMitigation -System).Aslr.ForceRelocateImages.ToString()",
             ],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=10,
             creationflags=windows_hide_flags(),
         )
@@ -848,7 +962,7 @@ def _bash_starts(bash: str) -> bool:
         result = subprocess.run(
             [bash, "--noprofile", "--norc", "-c", _BASH_EXTERNAL_PROGRAM_PROBE],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=15,
             creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
         )
@@ -1216,6 +1330,8 @@ def _make_run_env(env: dict) -> dict:
     _strip_delegated_subagent_kanban_env(run_env)
 
     _apply_windows_msys_bash_env_defaults(run_env)
+
+    run_env = _scrub_delegated_child_kanban_env(run_env)
 
     return run_env
 

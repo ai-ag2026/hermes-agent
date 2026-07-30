@@ -579,7 +579,19 @@ def main() -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"hermetic-{stamp}.log"
 
-    sandbox = Path(tempfile.mkdtemp(prefix="hermetic-", dir="/tmp"))
+    # Ablageort des Sandkastens überschreibbar. Vorgabe bleibt /tmp, damit sich
+    # für niemanden etwas ändert.
+    #
+    # Warum es den Schalter braucht (30.07.2026): /tmp ist hier ein tmpfs mit
+    # 16 GB, also RAM-gedeckt. Ein Volllauf der Agent-Suite füllt das — und ein
+    # per SIGTERM abgebrochener Lauf lässt seinen basetemp liegen, weil pytest
+    # das Aufräumen dann überspringt. Zwei solcher Leichen plus ein laufender
+    # Lauf haben /tmp zum Überlaufen gebracht; die Suite kippte ab 71 % in eine
+    # reine ENOSPC-Fehlerkaskade, das Ergebnis war wertlos. Mit
+    # HERMETIC_SANDBOX_ROOT=/var/tmp landet der Sandkasten auf echter Platte.
+    _sandbox_root = os.environ.get("HERMETIC_SANDBOX_ROOT") or "/tmp"
+    os.makedirs(_sandbox_root, exist_ok=True)
+    sandbox = Path(tempfile.mkdtemp(prefix="hermetic-", dir=_sandbox_root))
     sub = {name: sandbox / name for name in
            ("home", "hermes", "xdg-config", "xdg-data", "xdg-state",
             "xdg-cache", "xdg-runtime", "tmp", "basetemp")}

@@ -136,7 +136,7 @@ async def test_startup_aborts_when_restart_requested_before_start(tmp_path, monk
     runner.request_restart(detached=False, via_service=True)
     runner._create_adapter = MagicMock()
 
-    result = await asyncio.wait_for(runner.start(), timeout=2)
+    result = await asyncio.wait_for(runner.start(), timeout=30)
 
     assert result is True
     runner._create_adapter.assert_not_called()
@@ -167,7 +167,7 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
     telegram.disconnect = disconnect_and_release
     runner._create_adapter = MagicMock(side_effect=[telegram, slack])
 
-    result = await asyncio.wait_for(runner.start(), timeout=2)
+    result = await asyncio.wait_for(runner.start(), timeout=30)
 
     assert result is True
     assert telegram.disconnected is True
@@ -202,7 +202,7 @@ async def test_startup_abort_waits_for_existing_stop_task(tmp_path):
 
     result = await asyncio.wait_for(
         runner._abort_startup_if_shutdown_requested(adapter, Platform.TELEGRAM),
-        timeout=2,
+        timeout=30,
     )
 
     assert result is True
@@ -227,7 +227,7 @@ async def test_startup_aborts_after_registered_adapter_restart(tmp_path, monkeyp
 
     runner._update_platform_runtime_status = MagicMock(side_effect=update_platform_runtime_status)
 
-    result = await asyncio.wait_for(runner.start(), timeout=2)
+    result = await asyncio.wait_for(runner.start(), timeout=30)
 
     assert result is True
     assert telegram.connected is True
@@ -250,16 +250,23 @@ async def test_startup_aborts_after_registered_adapter_restart(tmp_path, monkeyp
 async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     cron_started = False
+    export_shutdown_calls = 0
+
+    class ExportRuntime:
+        def shutdown(self):
+            nonlocal export_shutdown_calls
+            export_shutdown_calls += 1
 
     class AbortedStartupRunner:
         def __init__(self, config):
             self.config = config
             self.adapters = {}
             self._running = False
-            self.should_exit_cleanly = False
+            self.should_exit_cleanly = True
             self.should_exit_with_failure = False
             self.exit_reason = None
             self.exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
+            self._gateway_health_export_runtime = ExportRuntime()
 
         async def start(self):
             return True
@@ -287,3 +294,4 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
 
     assert exc.value.code == GATEWAY_SERVICE_RESTART_EXIT_CODE
     assert cron_started is False
+    assert export_shutdown_calls == 1

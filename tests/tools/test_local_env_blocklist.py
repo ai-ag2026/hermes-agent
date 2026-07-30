@@ -793,17 +793,17 @@ class TestDelegatedSubagentKanbanEnvStrip:
 
         Mirrors tests/tools/test_kanban_tools.py's fixture of the same name
         (the S4b reference tests) -- marks via the real
-        mark_delegated_subagent_context() entry point, not by poking the
+        delegated_child_context() entry point, not by poking the
         private contextvar directly, and resets in a finally block so it
         can't leak into unrelated tests sharing this worker's Context.
         """
-        from tools import kanban_tools as kt
+        from agent.delegation_context import _DELEGATED_CHILD_CONTEXT
 
-        kt.mark_delegated_subagent_context()
+        token = _DELEGATED_CHILD_CONTEXT.set(True)
         try:
             yield
         finally:
-            kt._delegated_subagent_ctx.set(False)
+            _DELEGATED_CHILD_CONTEXT.reset(token)
 
     def test_make_run_env_strips_workspace_branch_for_delegated_subagent(
         self, delegated_subagent_ctx

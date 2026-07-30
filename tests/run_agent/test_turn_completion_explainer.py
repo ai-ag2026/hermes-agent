@@ -52,7 +52,6 @@ def _make_agent(max_iterations: int = 10, config: dict | None = None) -> AIAgent
     agent.client = MagicMock()
     agent._cached_system_prompt = "You are helpful."
     agent._use_prompt_caching = False
-    agent.tool_delay = 0
     agent.compression_enabled = False
     agent.save_trajectories = False
     # No fallback chain so empty responses exhaust deterministically.
@@ -104,6 +103,16 @@ def test_explanation_for_all_retries_exhausted():
         "all_retries_exhausted_no_response"
     )
     assert "retries" in out.lower()
+
+
+def test_explanation_for_session_persistence_failed():
+    """Fail-closed persistence exits (#72425) must explain themselves."""
+    out = AIAgent._format_turn_completion_explanation(
+        "session_persistence_failed"
+    )
+    assert out  # non-empty
+    assert "session storage" in out.lower()
+    assert "disk space" in out.lower()
 
 
 # --------------------------------------------------------------------------

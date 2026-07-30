@@ -3900,19 +3900,25 @@ class TestSharedBoardPaths:
         assert kb.kanban_db_path() == default_home / "kanban.db"
         assert kb.workspaces_root() == default_home / "kanban" / "workspaces"
 
-    def test_dispatcher_spawn_injects_kanban_db_and_workspaces_root(
+    def test_dispatcher_spawn_injects_kanban_paths_without_stale_session(
         self, tmp_path, monkeypatch
     ):
-        # The dispatcher's `_default_spawn` must inject HERMES_KANBAN_DB
-        # and HERMES_KANBAN_WORKSPACES_ROOT into the worker env so the
-        # worker converges on the dispatcher's paths even when the
-        # `-p <profile>` flag rewrites HERMES_HOME.
+        # The dispatcher must pin board paths while stripping any unrelated
+        # HERMES_SESSION_* identity inherited from the long-lived gateway.
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
         shared_gh_config = tmp_path / "broker" / "gh"
         shared_gh_config.mkdir(parents=True)
         self._set_home(monkeypatch, tmp_path, default_home)
         monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+
+        from gateway import session_context as sc
+
+        # A dispatcher can launch before the gateway binds its first session.
+        monkeypatch.setattr(sc, "_session_context_engaged", False)
+        sc.reset_session_vars()
+        for key in sc._VAR_MAP:
+            monkeypatch.setenv(key, "stale-routing-value")
 
         captured = {}
 
@@ -3951,6 +3957,8 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        for key in sc._VAR_MAP:
+            assert key not in env
         # Operator ~/.config/gh is not discovered or injected implicitly.
         assert "GH_CONFIG_DIR" not in env
 
@@ -4063,6 +4071,17 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     import sqlite3 as _sqlite3
     from unittest.mock import patch as _patch
 
+    import hermes_state as _hs
+
+    # The fallback warning is deduped process-globally ("once per process per
+    # database" — _log_wal_fallback_once / _log_wal_reset_bug_once). Any earlier
+    # test in this file that opened a kanban.db already consumed the one-shot
+    # for that label, so without clearing it this test sees zero warnings and
+    # fails only when run as part of the file (it passes in isolation). Clear
+    # both dedup sets so the warning is emitted for this connect().
+    _hs._wal_fallback_warned_paths.clear()
+    _hs._wal_reset_bug_warned_paths.clear()
+
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -4080,6 +4099,9 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
             return super().execute(sql, *args, **kwargs)
 
     def wal_blocking_connect(*args, **kwargs):
+        # connect_tracked passes a tracking-augmented factory; drop it and
+        # substitute the double, which connect_tracked will re-augment.
+        kwargs.pop("factory", None)
         return real_connect(
             *args, factory=_WalBlockingConnection, **kwargs
         )
@@ -5355,6 +5377,8 @@ def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
 # Corruption guard (issue #30687)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.requires_wal  # upstream-Marker (Merge 30.07.): übersprungen,
+# wo Hermes wegen des SQLite-WAL-Reset-Bugs auf journal_mode=DELETE ausweicht.
 def test_file_length_invariant_is_skipped_in_wal_mode(tmp_path, monkeypatch):
     """Main-file length checks are invalid while committed frames live in WAL."""
     db_path = tmp_path / "kanban.db"
@@ -5869,12 +5893,20 @@ def test_write_txn_healthy_commit_no_exception(tmp_path):
     conn.close()
 
 
-def test_write_txn_skips_main_file_length_false_positive_in_wal(tmp_path):
-    """A mocked smaller main DB file must not fail a WAL-mode write."""
+def test_write_txn_raises_on_truncated_file(tmp_path):
+    """A mocked smaller file size triggers the torn-extend check.
+
+    The check now reads the header side via ``PRAGMA page_count`` over the
+    existing connection instead of ``open()``-ing the database file (an
+    open/close would cancel this process's POSIX locks). The on-disk side is
+    still ``stat()``, so that is what this test fakes. The invariant only
+    applies under a rollback journal — in WAL a committed page may still be
+    in the -wal file, so the main file legitimately lags.
+    """
     from hermes_cli.kanban_db import connect, write_txn
     db = tmp_path / "test.db"
     conn = connect(db_path=db)
-    # Get actual page size so we can fake a smaller file
+    conn.execute("PRAGMA journal_mode=DELETE")
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
     original_getsize = os.path.getsize
 
@@ -5883,15 +5915,25 @@ def test_write_txn_skips_main_file_length_false_positive_in_wal(tmp_path):
         real_size = original_getsize(path)
         return max(0, real_size - page_size)
 
-    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-    with unittest.mock.patch("hermes_cli.kanban_db.os.path.getsize", side_effect=fake_getsize):
-        with write_txn(conn) as c:
-            c.execute(
-                "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
-                "VALUES ('t_test02', 'test task 2', 'tester', 'todo', 0, 1234567890)"
-            )
-    row = conn.execute("SELECT title FROM tasks WHERE id='t_test02'").fetchone()
-    assert row["title"] == "test task 2"
+    # fork(tars): unser write_txn verpackt eine NACH dem COMMIT gerissene
+    # Integritätsprüfung in PostCommitIntegrityError (RuntimeError) — die
+    # Mutation ist bereits dauerhaft und darf nicht blind wiederholt werden.
+    # Upstreams Test kennt diesen Wrapper nicht und erwartet nur den nackten
+    # sqlite3.DatabaseError; beide Typen sind hier zulässig, die Ursache steht
+    # in der verketteten Ausnahme.
+    from hermes_cli.kanban_db import PostCommitIntegrityError
+
+    with pytest.raises((sqlite3.DatabaseError, PostCommitIntegrityError)) as excinfo:
+        with unittest.mock.patch(
+            "hermes_cli.sqlite_safe_read.os.path.getsize", side_effect=fake_getsize
+        ):
+            with write_txn(conn) as c:
+                c.execute(
+                    "INSERT INTO tasks (id, title, assignee, status, priority, created_at) "
+                    "VALUES ('t_test02', 'test task 2', 'tester', 'todo', 0, 1234567890)"
+                )
+    chain = str(excinfo.value) + str(excinfo.value.__cause__ or "")
+    assert "torn-extend" in chain or "page count mismatch" in chain
     conn.close()
 
 
@@ -5966,31 +6008,39 @@ def test_fast_path_keeps_default_wal_autocheckpoint_1000(tmp_path):
 
 
 def test_write_txn_check_reads_correct_header_fields(tmp_path):
-    """Synthetic DB file with mismatched header page_count triggers the check."""
+    """A genuinely truncated DB is never reported as passing the invariant.
+
+    The check no longer opens the database file to read header bytes (that
+    open/close would cancel this process's POSIX advisory locks — the
+    corruption route in sqlite.org/howtocorrupt.html §2.2). It asks SQLite for
+    ``page_count`` instead. On a truncated file SQLite refuses that pragma, so
+    the helper reports "not healthy" rather than a page-count mismatch; either
+    way the file must never come back clean.
+    """
     import struct
-    from hermes_cli.kanban_db import connect, _check_file_length_invariant
+    from hermes_cli.kanban_db import connect
+    from hermes_cli.sqlite_safe_read import file_length_matches_header
+
     db = tmp_path / "synthetic.db"
     conn = connect(db_path=db)
+    conn.execute("PRAGMA journal_mode=DELETE")
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
     conn.close()
-    # Now corrupt the file: claim N pages but truncate to N-1 pages
+
     with open(db, "rb") as f:
         data = bytearray(f.read())
-    # Read current page_count from header bytes 28-31
     real_page_count = struct.unpack(">I", data[28:32])[0]
     if real_page_count < 2:
-        # Need at least 2 pages to fake a truncation
         pytest.skip("DB too small for synthetic truncation test")
-    # Truncate to N-1 pages
     truncated = bytes(data[: (real_page_count - 1) * page_size])
     with open(db, "wb") as f:
         f.write(truncated)
-    # Now open and check — should raise
-    # We can't use connect() because _validate_sqlite_header may block; use a raw connection
+
     raw_conn = sqlite3.connect(str(db), isolation_level=None)
-    with pytest.raises(sqlite3.DatabaseError, match="database disk image is malformed|torn-extend|page count mismatch"):
-        _check_file_length_invariant(raw_conn)
-    raw_conn.close()
+    try:
+        assert file_length_matches_header(raw_conn) is not True
+    finally:
+        raw_conn.close()
 
 
 # ---------------------------------------------------------------------------

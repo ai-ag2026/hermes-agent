@@ -63,7 +63,8 @@ logger = logging.getLogger(__name__)
 # with a second writer active.
 #
 # Fix: ``tools.delegate_tool`` marks the child's dedicated run-thread via
-# ``mark_delegated_subagent_context()`` *before* the child's conversation
+# ``agent.delegation_context.delegated_child_context()`` (upstream) *before*
+# the child's conversation
 # starts. Tool dispatch for that conversation — including tool calls the
 # agent loop offloads onto further worker threads via
 # ``tools.thread_context.propagate_context_to_thread`` — runs inside a
@@ -90,46 +91,11 @@ BOARD_OWNERSHIP_ENV_KEYS = frozenset(
     }
 )
 
-_delegated_subagent_ctx: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "kanban_delegated_subagent", default=False
-)
-
-
-def mark_delegated_subagent_context() -> None:
-    """Mark the current contextvars.Context as a delegated subagent.
-
-    Call once, on a delegate_task child's dedicated run thread, before its
-    conversation starts (see ``tools.delegate_tool._run_single_child``).
-    Logs the stripped key *names* only — never values — for auditability.
-    """
-    _delegated_subagent_ctx.set(True)
-    logger.info(
-        "kanban: delegated subagent context marked — board-ownership env "
-        "hidden for tool dispatch (%s)",
-        ", ".join(sorted(BOARD_OWNERSHIP_ENV_KEYS)),
-    )
-
-
-def _is_delegated_subagent() -> bool:
-    return _delegated_subagent_ctx.get()
-
-
-def _reject_if_delegated_subagent(tool_name: str) -> Optional[str]:
-    """Hard-deny board-lifecycle mutation from a delegate_task subagent.
-
-    Independent of any env value: a subagent never carries board-worker
-    lifecycle ownership, even if it guesses/echoes the parent's task id.
-    """
-    if _is_delegated_subagent():
-        return tool_error(
-            f"{tool_name} is unavailable to delegated subagents: agents "
-            "spawned via delegate_task never carry board-worker lifecycle "
-            "ownership, regardless of task_id. If a delegated worker "
-            "genuinely needs to drive board state, that requires an "
-            "explicit, validated delegation path — not implicit toolset/"
-            "env inheritance from the parent board worker."
-        )
-    return None
+# fork(tars) 30.07.2026: Unsere eigene Delegations-Schutzschicht ist hier
+# ERSATZLOS ENTFALLEN — upstream hat sie mit agent/delegation_context.py und
+# _reject_delegated_child_mutation() (weiter unten) selbst gebaut, semantisch
+# deckungsgleich und breiter (Contextmanager mit Reset + Env-Scrubbing für
+# Subprozesse). Geblieben ist nur _board_env: dafür gibt es kein Äquivalent.
 
 
 def _board_env(name: str) -> Optional[str]:
@@ -139,7 +105,7 @@ def _board_env(name: str) -> Optional[str]:
     reads (``HERMES_SESSION_ID``, ``HERMES_PROFILE``, ...) are unaffected and
     should keep using ``os.environ.get`` directly.
     """
-    if _is_delegated_subagent() and name in BOARD_OWNERSHIP_ENV_KEYS:
+    if _is_delegated_child_context() and name in BOARD_OWNERSHIP_ENV_KEYS:
         return None
     return os.environ.get(name)
 
@@ -165,6 +131,33 @@ def _profile_has_kanban_toolset() -> bool:
         return False
 
 
+def _is_delegated_child_context() -> bool:
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        return is_delegated_child_context()
+    except Exception:
+        return False
+
+
+def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
+    """Deny Kanban mutations from delegate_task children.
+
+    A delegate_task child runs in the same process as its parent, so stale or
+    inherited HERMES_KANBAN_* env vars are not proof of dispatcher ownership.
+    The child may summarize findings to its parent, but it must not complete,
+    block, heartbeat, comment, create, link, or unblock board tasks directly.
+    """
+    if not _is_delegated_child_context():
+        return None
+    return tool_error(
+        f"{tool_name} refused: delegate_task child agents are not Kanban "
+        "run owners. Return findings to the parent agent; the dispatcher "
+        "worker or an explicitly configured Kanban orchestrator must perform "
+        "board mutations."
+    )
+
+
 def _check_kanban_mode() -> bool:
     """Task-lifecycle tools are available when:
 
@@ -177,6 +170,8 @@ def _check_kanban_mode() -> bool:
     embedded by default) and orchestrator profiles with the kanban
     toolset enabled see the Kanban lifecycle tool surface.
     """
+    if _is_delegated_child_context():
+        return False
     if os.environ.get("HERMES_KANBAN_TASK"):
         return True
     return _profile_has_kanban_toolset()
@@ -191,6 +186,8 @@ def _check_kanban_orchestrator_mode() -> bool:
     board state. Profiles that explicitly opt into the kanban toolset
     and are NOT scoped to a single task are the orchestrator surface.
     """
+    if _is_delegated_child_context():
+        return False
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
     return _profile_has_kanban_toolset()
@@ -204,11 +201,13 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
     """Resolve ``task_id`` arg or fall back to the env var the dispatcher set.
 
     Uses ``_board_env`` so a delegated subagent (see
-    ``mark_delegated_subagent_context``) never silently inherits the
+    ``delegated_child_context``) never silently inherits the
     parent board worker's task id as a default.
     """
     if arg:
         return arg
+    if _is_delegated_child_context():
+        return None
     env_tid = _board_env("HERMES_KANBAN_TASK")
     return env_tid or None
 
@@ -319,7 +318,7 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     one task.
 
     Note: every current caller of this function is a mutating handler
-    that calls ``_reject_if_delegated_subagent`` first (see below), so a
+    that calls ``_reject_delegated_child_mutation`` first (see below), so a
     delegated subagent never reaches here at all — the ``not env_tid``
     branch below would otherwise (wrongly) treat a stripped env as
     "orchestrator, no restriction". This function's own env read is
@@ -438,7 +437,7 @@ def heartbeat_current_worker_from_env() -> bool:
     required (see t_591dd454).
     """
     global _auto_heartbeat_last_attempt
-    if _is_delegated_subagent():
+    if _is_delegated_child_context():
         return False
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
@@ -787,9 +786,9 @@ def _handle_list(args: dict, **kw) -> str:
 
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
-    guard = _reject_if_delegated_subagent("kanban_complete")
-    if guard:
-        return guard
+    delegated_err = _reject_delegated_child_mutation("kanban_complete")
+    if delegated_err:
+        return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -1033,7 +1032,7 @@ def _redact_review_payload(summary: Any, metadata: Any):
 
 
 def _handle_request_review(args: dict, **kw) -> str:
-    guard = _reject_if_delegated_subagent("kanban_request_review")
+    guard = _reject_delegated_child_mutation("kanban_request_review")
     if guard:
         return guard
     tid = _default_task_id(args.get("task_id"))
@@ -1079,7 +1078,7 @@ def _handle_request_review(args: dict, **kw) -> str:
 
 
 def _handle_review_decide(args: dict, **kw) -> str:
-    guard = _reject_if_delegated_subagent("kanban_review_decide")
+    guard = _reject_delegated_child_mutation("kanban_review_decide")
     if guard:
         return guard
     tid = _default_task_id(args.get("task_id"))
@@ -1132,9 +1131,9 @@ def _handle_review_decide(args: dict, **kw) -> str:
 
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
-    guard = _reject_if_delegated_subagent("kanban_block")
-    if guard:
-        return guard
+    delegated_err = _reject_delegated_child_mutation("kanban_block")
+    if delegated_err:
+        return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -1248,9 +1247,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     by ``release_stale_claims`` — which is exactly the trap that
     ``heartbeat_claim``'s docstring warns against.
     """
-    guard = _reject_if_delegated_subagent("kanban_heartbeat")
-    if guard:
-        return guard
+    delegated_err = _reject_delegated_child_mutation("kanban_heartbeat")
+    if delegated_err:
+        return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -1298,9 +1297,9 @@ def _handle_comment(args: dict, **kw) -> str:
     # commenting is the deliberate handoff channel between legitimate
     # workers), so the delegated-subagent reject must be explicit here;
     # nothing else in this handler would otherwise stop it.
-    guard = _reject_if_delegated_subagent("kanban_comment")
-    if guard:
-        return guard
+    delegated_err = _reject_delegated_child_mutation("kanban_comment")
+    if delegated_err:
+        return delegated_err
     tid = args.get("task_id")
     if not tid:
         return tool_error(
@@ -1349,11 +1348,14 @@ def _handle_attach(args: dict, **kw) -> str:
     # restriction" — without this reject a subagent could attach bytes to ANY
     # card (documented invariant in _enforce_worker_task_ownership; gap found
     # in audit 2026-07-27).
-    guard = _reject_if_delegated_subagent("kanban_attach")
+    guard = _reject_delegated_child_mutation("kanban_attach")
     if guard:
         return guard
     from hermes_cli import kanban_db as kb
 
+    delegated_err = _reject_delegated_child_mutation("kanban_attach")
+    if delegated_err:
+        return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -1473,11 +1475,14 @@ def _handle_attach_url(args: dict, **kw) -> str:
     """
     # Same reasoning as kanban_attach — and stricter here, because this
     # variant performs a server-side download on the agent's behalf.
-    guard = _reject_if_delegated_subagent("kanban_attach_url")
+    guard = _reject_delegated_child_mutation("kanban_attach_url")
     if guard:
         return guard
     from hermes_cli import kanban_db as kb
 
+    delegated_err = _reject_delegated_child_mutation("kanban_attach_url")
+    if delegated_err:
+        return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -1760,9 +1765,9 @@ def _handle_create(args: dict, **kw) -> str:
     # Board mutation stays with workers/orchestrators; a delegated subagent
     # hands results back to its parent, it does not spawn board work itself
     # (same gap family as attach/link, audit 2026-07-27).
-    guard = _reject_if_delegated_subagent("kanban_create")
-    if guard:
-        return guard
+    delegated_err = _reject_delegated_child_mutation("kanban_create")
+    if delegated_err:
+        return delegated_err
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -1778,19 +1783,31 @@ def _handle_create(args: dict, **kw) -> str:
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
-    session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
+    # Prefer the request-scoped api_server origin binding: HERMES_SESSION_ID
+    # is clobbered with a subagent's internal id whenever a child agent is
+    # constructed in-process (agent_init calls set_current_session_id), which
+    # would stamp — and later wake — the wrong session.
+    from tools.async_delegation import _current_origin_session_id
+
+    session_id = (
+        args.get("session_id")
+        or _current_origin_session_id()
+        or os.environ.get("HERMES_SESSION_ID")
+    )
     priority = args.get("priority")
-    # Resolve workspace. If the caller passed one explicitly, honor it.
-    # Otherwise, a dispatcher-spawned worker (HERMES_KANBAN_TASK set)
-    # inherits its own running task's workspace, so a worker editing a
-    # dir:/worktree project that spawns a follow-up child keeps the child
-    # in that project instead of a throwaway scratch dir. Orchestrators
-    # (kanban toolset, no HERMES_KANBAN_TASK) and CLI/dashboard callers
-    # fall back to scratch as before. Explicit None path stays None.
+    # Resolve workspace. Workspace sharing is always explicit: omitted fields
+    # mean a fresh scratch workspace, even when a dispatcher-spawned worker
+    # creates the task. Reusing a parent's literal path would let a child
+    # mutate review evidence or race the parent's checkout (#67567).
+    #
+    # Project identity is the one safe context to inherit implicitly. The DB
+    # resolves a project-linked scratch request into a fresh per-task worktree,
+    # preserving the repository/branch convention without sharing a checkout.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
-    _inherit_workspace = workspace_kind is None and workspace_path is None
+    project_source_task_id = None
+    _inherit_project = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
     triage, bool_error = _parse_bool_arg(args, "triage")
@@ -1836,19 +1853,16 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Inherit the spawning worker's own task workspace when the
-            # caller didn't specify one (see resolution note above).
-            if _inherit_workspace:
+            # A project link is safe to inherit because ``create_task`` turns
+            # it into a fresh per-task worktree. Never inherit the parent's
+            # literal workspace kind/path; directory sharing must be explicit.
+            if _inherit_project and project_id is None:
                 _self_tid = os.environ.get("HERMES_KANBAN_TASK")
                 if _self_tid:
                     _self_task = kb.get_task(conn, _self_tid)
-                    if _self_task is not None and _self_task.workspace_kind:
-                        workspace_kind = _self_task.workspace_kind
-                        workspace_path = _self_task.workspace_path
-                        # Keep follow-up children inside the same project so the
-                        # whole subtree shares one repo + branch convention.
-                        if project_id is None and _self_task.project_id:
-                            project_id = _self_task.project_id
+                    if _self_task is not None and _self_task.project_id:
+                        project_id = _self_task.project_id
+                        project_source_task_id = _self_task.id
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1860,6 +1874,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
                 project_id=project_id,
+                project_source_task_id=project_source_task_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(
@@ -1892,6 +1907,9 @@ def _handle_create(args: dict, **kw) -> str:
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                workspace_kind=new_task.workspace_kind if new_task else None,
+                workspace_path=new_task.workspace_path if new_task else None,
+                project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
             )
         finally:
@@ -2008,10 +2026,10 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
     Subscription paths:
 
-    - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``
-      and ``HERMES_SESSION_CHAT_ID`` are set in ContextVars by the
-      messaging gateway before agent dispatch. The gateway notifier
-      already keys off these, so we just register a row.
+    - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``,
+      ``HERMES_SESSION_CHAT_ID``, and ``HERMES_SESSION_CHAT_TYPE`` are set in
+      ContextVars by the messaging gateway before agent dispatch. The
+      notification poller already keys off these, so we just register a row.
 
     - **WebUI**: sessions run with ``HERMES_SESSION_PLATFORM=webui`` and the
       session id as chat_id; the WebUI's in-process poller
@@ -2080,18 +2098,43 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             return False
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
+        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
         notifier_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
         )
+        if not notifier_profile:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                notifier_profile = get_active_profile_name() or "default"
+            except Exception:
+                notifier_profile = "default"
+        delivery_metadata: dict[str, Any] = {}
+        if thread_id:
+            delivery_metadata["thread_id"] = thread_id
+        if chat_type:
+            delivery_metadata["chat_type"] = chat_type
+        if (
+            platform.lower() == "telegram"
+            and thread_id
+            and (chat_type or "").lower() in {"dm", "direct", "private"}
+        ):
+            delivery_metadata["telegram_dm_topic_reply_fallback"] = True
+            if str(thread_id) not in {"", "1"}:
+                delivery_metadata["direct_messages_topic_id"] = str(thread_id)
+            if message_id:
+                delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
+            chat_type=chat_type,
             thread_id=thread_id, user_id=user_id,
             notifier_profile=notifier_profile,
+            delivery_metadata=delivery_metadata or None,
         )
         return True
     except Exception as _exc:
@@ -2104,9 +2147,9 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
 def _handle_unblock(args: dict, **kw) -> str:
     """Transition a blocked task to ready, or todo while parents remain open."""
-    guard = _reject_if_delegated_subagent("kanban_unblock")
-    if guard:
-        return guard
+    delegated_err = _reject_delegated_child_mutation("kanban_unblock")
+    if delegated_err:
+        return delegated_err
     guard = _require_orchestrator_tool("kanban_unblock")
     if guard:
         return guard
@@ -2160,9 +2203,9 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
-    guard = _reject_if_delegated_subagent("kanban_link")
-    if guard:
-        return guard
+    delegated_err = _reject_delegated_child_mutation("kanban_link")
+    if delegated_err:
+        return delegated_err
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:

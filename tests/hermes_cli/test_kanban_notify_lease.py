@@ -40,6 +40,18 @@ def _subscribed_task(conn, *, chat_id="sess1"):
     return task_id
 
 
+def _start_cursor(conn, task_id, chat_id="sess1"):
+    """Der Cursor, mit dem ein frisches Abo startet.
+
+    Seit dem Upstream-Merge 30.07. schnappt ``add_notify_sub`` den Cursor auf
+    ``MAX(task_events.id)`` — ein neues Abo ist AUFGEHOLT und spielt die
+    Vorgeschichte der Task nicht nach (Boot-Burst #29905). Die Lease-Tests
+    prüfen Bewegungen des Cursors, nicht seinen Absolutwert; also hier fragen
+    statt 0 zu unterstellen.
+    """
+    return _cursor(conn, task_id, chat_id)["last_event_id"]
+
+
 def _key(task_id, chat_id="sess1"):
     return {"task_id": task_id, "platform": "webui", "chat_id": chat_id}
 
@@ -56,9 +68,10 @@ def _cursor(conn, task_id, chat_id="sess1"):
 def test_acquire_is_single_owner(board):
     task_id = _subscribed_task(board)
 
+    start = _start_cursor(board, task_id)
     first = kb.acquire_notify_sub_lease(board, **_key(task_id), owner="A", now=1000)
     assert first is not None
-    assert first["last_event_id"] == 0
+    assert first["last_event_id"] == start
 
     second = kb.acquire_notify_sub_lease(board, **_key(task_id), owner="B", now=1001)
     assert second is None, "a live lease must not be handed out twice"
@@ -80,7 +93,7 @@ def test_acquiring_does_not_move_the_cursor(board):
     """The whole point of B0."""
     task_id = _subscribed_task(board)
     kb.acquire_notify_sub_lease(board, **_key(task_id), owner="A", now=1000)
-    assert _cursor(board, task_id)["last_event_id"] == 0
+    assert _cursor(board, task_id)["last_event_id"] == _start_cursor(board, task_id)
 
 
 def test_commit_advances_the_cursor_and_frees_the_lease(board):
@@ -112,7 +125,7 @@ def test_commit_is_fenced(board, wrong):
     assert kb.commit_notify_sub_delivery(
         board, **_key(task_id), new_cursor=42, **args
     ) is False
-    assert _cursor(board, task_id)["last_event_id"] == 0, "cursor untouched"
+    assert _cursor(board, task_id)["last_event_id"] == _start_cursor(board, task_id), "cursor untouched"
 
 
 def test_release_parks_without_consuming(board):
@@ -126,7 +139,7 @@ def test_release_parks_without_consuming(board):
         retry_after_seconds=120, now=1000,
     ) is True
     state = _cursor(board, task_id)
-    assert state["last_event_id"] == 0
+    assert state["last_event_id"] == _start_cursor(board, task_id)
     assert state["lease_owner"] is None
     assert state["lease_until"] == 1120, "parked, not free"
 
@@ -256,4 +269,4 @@ def test_a_deactivated_subscription_cannot_be_committed(board):
         generation=lease["generation"], lease_version=lease["lease_version"],
         new_cursor=99,
     ) is False, "a holder must not write into a deactivated generation"
-    assert _cursor(board, task_id)["last_event_id"] == 0
+    assert _cursor(board, task_id)["last_event_id"] == _start_cursor(board, task_id)
