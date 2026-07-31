@@ -811,7 +811,10 @@ def _handle_complete(args: dict, **kw) -> str:
     # the operator, who unblocks (with reason) or completes via CLI.
     try:
         from hermes_cli import kanban_db as _kb_gate
-        with _kb_gate.connect_closing() as _conn_gate:
+        # Open the SAME board the completion targets, else get_task reads the
+        # default board's DB, returns None for a named-board card, and the gate
+        # silently does not fire (D4).
+        with _kb_gate.connect_closing(board=args.get("board")) as _conn_gate:
             _task_gate = _kb_gate.get_task(_conn_gate, tid)
         if (
             _task_gate is not None
