@@ -1734,8 +1734,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         return 2
     with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
+        _cli_create_kwargs = dict(
             title=args.title,
             body=args.body,
             assignee=args.assignee,
@@ -1748,7 +1747,6 @@ def _cmd_create(args: argparse.Namespace) -> int:
             priority=args.priority,
             parents=tuple(args.parent or ()),
             triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
             task_class=getattr(args, "task_class", None),
@@ -1759,10 +1757,34 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
             allow_workspace_refs=bool(getattr(args, "allow_workspace_refs", False)),
-            acceptance_required=(
-                True if getattr(args, "acceptance_required", False) else None
-            ),
         )
+        _idem_key = getattr(args, "idempotency_key", None)
+        _acceptance = True if getattr(args, "acceptance_required", False) else None
+        if _idem_key:
+            # Keyed CLI creates (cron scripts and other retrying automation) go
+            # through the D1 idempotent promotion: dedup via the unique origin
+            # index instead of create_task's racy check-then-insert, and a key
+            # reused with a different payload fails loudly.
+            from hermes_cli import work_promotion as _wp
+            try:
+                _promo = _wp.promote(
+                    conn,
+                    origin_kind="cron",
+                    origin_key=str(_idem_key),
+                    payload={"title": args.title, "body": args.body},
+                    acceptance_required=bool(_acceptance) if _acceptance else False,
+                    **_cli_create_kwargs,
+                )
+            except _wp.OriginKeyConflict as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 2
+            task_id = _promo.task_id
+            if _promo.deduplicated and not getattr(args, "json", False):
+                print(f"(idempotent: existing card {task_id} returned, nothing created)")
+        else:
+            task_id = kb.create_task(
+                conn, acceptance_required=_acceptance, **_cli_create_kwargs
+            )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))

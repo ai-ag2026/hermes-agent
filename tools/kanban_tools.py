@@ -1897,8 +1897,7 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
-            new_tid = kb.create_task(
-                conn,
+            _create_kwargs = dict(
                 title=str(title).strip(),
                 body=body,
                 assignee=str(assignee),
@@ -1910,7 +1909,6 @@ def _handle_create(args: dict, **kw) -> str:
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,
                 triage=triage,
-                idempotency_key=idempotency_key,
                 max_runtime_seconds=(
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
@@ -1926,16 +1924,43 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
                 completion_contract=args.get("completion_contract"),
-                acceptance_required=(
-                    bool(args["acceptance_required"])
-                    if args.get("acceptance_required") is not None else None
-                ),
                 task_class=task_class,
                 max_retries=(
                     int(max_retries) if max_retries is not None else None
                 ),
                 allow_workspace_refs=allow_workspace_refs,
             )
+            _acceptance = (
+                bool(args["acceptance_required"])
+                if args.get("acceptance_required") is not None else None
+            )
+            deduplicated = False
+            if idempotency_key:
+                # Idempotent promotion (D1, audit 2026-07-31): a keyed create
+                # goes through work_promotion.promote(), whose single INSERT is
+                # deduplicated by the unique origin index — replacing
+                # create_task's racy check-then-insert for this surface. The
+                # same key retried returns the existing card; the same key with
+                # a DIFFERENT payload fails loudly instead of silently
+                # discarding the new request.
+                from hermes_cli import work_promotion as _wp
+                try:
+                    promo = _wp.promote(
+                        conn,
+                        origin_kind="conversation",
+                        origin_key=str(idempotency_key),
+                        payload={"title": _create_kwargs["title"], "body": body},
+                        acceptance_required=bool(_acceptance) if _acceptance else False,
+                        **_create_kwargs,
+                    )
+                except _wp.OriginKeyConflict as conflict:
+                    return tool_error(f"kanban_create: {conflict}")
+                new_tid = promo.task_id
+                deduplicated = promo.deduplicated
+            else:
+                new_tid = kb.create_task(
+                    conn, acceptance_required=_acceptance, **_create_kwargs
+                )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
@@ -1945,6 +1970,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                deduplicated=deduplicated,
             )
         finally:
             conn.close()
