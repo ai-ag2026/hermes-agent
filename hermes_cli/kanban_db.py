@@ -12179,6 +12179,12 @@ def block_task(
     undifferentiated ``blocked`` bucket:
 
     * ``dependency`` — the task is only waiting on another task. It does NOT
+      escalate while an open parent link gates the card (self-resolving; the
+      recurrence counter stays 0). A PARENTLESS dependency block counts
+      through ``block_recurrences`` like every other kind, and at
+      :data:`BLOCK_RECURRENCE_LIMIT` the generic loop breaker routes the card
+      to ``triage`` — closing the silent block→todo→ready→respawn loop
+      (audit 2026-07-31). Below the limit it does NOT
       sit in ``blocked`` (where a cron would keep "unblocking" it); it goes to
       ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
       promotes it automatically once its parents finish. No human, no cron, no
@@ -12272,68 +12278,106 @@ def block_task(
 
     # Dependency waits are a complete transition of their own. Keep the hook
     # outside ``write_txn`` so subscribers can only observe committed state.
+    #
+    # Loop breaker (audit 2026-07-31): the todo route is self-resolving ONLY
+    # when an open parent gates the card — recompute_ready keeps it in todo
+    # until the parent completes. WITHOUT an open parent (external blocker not
+    # modeled as a link) the card is re-promoted immediately and the worker
+    # loops block→todo→ready→respawn with nobody notified. Count exactly those
+    # parentless dependency re-blocks via the same block_recurrences chain as
+    # every other kind (the counter survives promotion; done resets it) and at
+    # BLOCK_RECURRENCE_LIMIT fall through to the generic branch below, whose
+    # loop breaker routes to triage with the block_loop_detected event and
+    # attention projection. A parent-gated wait never increments, so a task
+    # may wait on any number of sequential parents without ever escalating.
     if kind == "dependency":
-        # Dependencies deliberately have no attention projection or recurrence
-        # fingerprint, but callers may still supply a typed cause for audit
-        # classification. Validate it before treating its code as safe output.
-        if typed_cause:
-            _block_cause_fingerprint(
-                conn, task_id=task_id, attention_type=attention_type,
-                reason_code=reason_code, scope=cause_scope,
-            )
-        with write_txn(conn):
-            if expected_run_id is None:
-                params = (kind, task_id)
-                run_guard = ""
-            else:
-                params = (kind, task_id, int(expected_run_id))
-                run_guard = " AND current_run_id = ?"
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status = 'todo', claim_lock = NULL,
-                       claim_expires = NULL, worker_pid = NULL, block_kind = ?
-                 WHERE id = ? AND status IN ('running', 'ready')
-                """ + run_guard + unclaimed_guard,
-                params,
-            )
-            if cur.rowcount != 1:
-                return False
-            run_id = _end_run(
-                conn,
-                task_id,
-                outcome="blocked",
-                status="blocked",
-                summary=persisted_summary,
-            )
-            _cancel_approved_pending_action(
-                conn,
-                task_id,
-                now=int(time.time()),
-                reason="resumed_run_reblocked",
-                run_id=run_id,
-            )
-            if run_id is None and reason:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=persisted_summary,
-                )
-            _append_event(
-                conn,
-                task_id,
-                "dependency_wait",
-                _typed_event_payload(recurrences=0) if typed_cause else _with_human_fields({"reason": reason, "kind": kind}),
-                run_id=run_id,
-            )
-            blocked_task = get_task(conn, task_id)
-        _fire_kanban_lifecycle_hook(
-            "kanban_task_blocked",
-            task_id,
-            board=get_current_board(),
-            assignee=blocked_task.assignee if blocked_task else None,
-            run_id=run_id,
-            reason=reason_code if typed_cause else reason,
+        _dep_row = conn.execute(
+            "SELECT block_kind, block_recurrences FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        _dep_prev_kind = _dep_row["block_kind"] if _dep_row is not None else None
+        _dep_prev_rec = (
+            int(_dep_row["block_recurrences"] or 0) if _dep_row is not None else 0
         )
-        return True
+        _dep_has_open_parent = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
+        ).fetchone() is not None
+        if _dep_has_open_parent:
+            _dep_recurrences = 0
+        elif _dep_prev_kind == "dependency":
+            _dep_recurrences = _dep_prev_rec + 1
+        else:
+            _dep_recurrences = 1
+        if not _dep_has_open_parent and _dep_recurrences >= BLOCK_RECURRENCE_LIMIT:
+            # Parentless dependency loop at the limit: do NOT take the todo
+            # shortcut — the generic branch below re-derives the same count
+            # (prev_kind == kind) and routes to triage via its loop breaker.
+            pass
+        else:
+            # Dependencies deliberately have no attention projection or recurrence
+            # fingerprint, but callers may still supply a typed cause for audit
+            # classification. Validate it before treating its code as safe output.
+            if typed_cause:
+                _block_cause_fingerprint(
+                    conn, task_id=task_id, attention_type=attention_type,
+                    reason_code=reason_code, scope=cause_scope,
+                )
+            with write_txn(conn):
+                if expected_run_id is None:
+                    params = (kind, _dep_recurrences, task_id)
+                    run_guard = ""
+                else:
+                    params = (kind, _dep_recurrences, task_id, int(expected_run_id))
+                    run_guard = " AND current_run_id = ?"
+                cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status = 'todo', claim_lock = NULL,
+                           claim_expires = NULL, worker_pid = NULL, block_kind = ?,
+                           block_recurrences = ?
+                     WHERE id = ? AND status IN ('running', 'ready')
+                    """ + run_guard + unclaimed_guard,
+                    params,
+                )
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn,
+                    task_id,
+                    outcome="blocked",
+                    status="blocked",
+                    summary=persisted_summary,
+                )
+                _cancel_approved_pending_action(
+                    conn,
+                    task_id,
+                    now=int(time.time()),
+                    reason="resumed_run_reblocked",
+                    run_id=run_id,
+                )
+                if run_id is None and reason:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked", summary=persisted_summary,
+                    )
+                _append_event(
+                    conn,
+                    task_id,
+                    "dependency_wait",
+                    _typed_event_payload(recurrences=0) if typed_cause else _with_human_fields({"reason": reason, "kind": kind}),
+                    run_id=run_id,
+                )
+                blocked_task = get_task(conn, task_id)
+            _fire_kanban_lifecycle_hook(
+                "kanban_task_blocked",
+                task_id,
+                board=get_current_board(),
+                assignee=blocked_task.assignee if blocked_task else None,
+                run_id=run_id,
+                reason=reason_code if typed_cause else reason,
+            )
+            return True
 
     # upstream (Merge 30.07.): ``routed_to`` ist in dieser Funktion tot — es
     # wird zugewiesen und nie gelesen. Genau das war upstreams EINZIGE
