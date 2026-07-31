@@ -154,16 +154,50 @@ class SuppressionLedger:
 
     def is_suppressed(self, coalesce_key: str, now: Optional[float] = None) -> bool:
         now = time.time() if now is None else now
+        # Compare the LATEST event of either kind: a resolve newer than the
+        # escalation clears suppression. Querying only 'executive_escalated'
+        # made resolve() a no-op (it stayed suppressed for the full TTL even
+        # after recovery).
         row = self.conn.execute(
-            """SELECT created_at FROM task_events
-                WHERE kind = 'executive_escalated'
+            """SELECT kind, created_at FROM task_events
+                WHERE kind IN ('executive_escalated', 'executive_resolved')
                   AND payload LIKE ?
                 ORDER BY id DESC LIMIT 1""",
             (f'%"coalesce_key": "{coalesce_key}"%',),
         ).fetchone()
         if row is None:
             return False
-        return (now - float(row[0])) < self.ttl
+        kind, created_at = row[0], row[1]
+        if kind != "executive_escalated":
+            return False
+        return (now - float(created_at)) < self.ttl
+
+    def open_escalations(self, now: Optional[float] = None) -> List[tuple]:
+        """``(coalesce_key, task_id)`` for each escalation still within TTL
+        whose latest event is the escalation itself (not a later resolve).
+
+        Used to drive resolve() when a previously-escalated problem no longer
+        appears in the scan.
+        """
+        now = time.time() if now is None else now
+        rows = self.conn.execute(
+            """SELECT task_id, payload, created_at, kind FROM task_events
+                WHERE kind IN ('executive_escalated', 'executive_resolved')
+                ORDER BY id DESC"""
+        ).fetchall()
+        seen: set = set()
+        out: List[tuple] = []
+        for task_id, payload, created_at, kind in rows:
+            try:
+                key = json.loads(payload).get("coalesce_key")
+            except Exception:
+                continue
+            if not key or key in seen:
+                continue
+            seen.add(key)  # first (newest) event per key decides
+            if kind == "executive_escalated" and (now - float(created_at)) < self.ttl:
+                out.append((key, task_id))
+        return out
 
     def record(self, task_id: str, package: DecisionPackage) -> None:
         self.conn.execute(
@@ -334,9 +368,45 @@ def build_decision_package(findings: Sequence[Finding]) -> DecisionPackage:
         f"{len(findings)} Work Item(s) in Zustand "
         f"{', '.join(sorted(c.value for c in conditions))}"
     )
+    # Fill the fields is_well_formed() requires, from the findings themselves.
+    # An empty package renders as the bare "wie soll ich weitermachen?" this
+    # module exists to prevent, and run_once escalated it anyway.
+    attempts = [
+        f"{f.work_uid}: {f.detail} (bisher {f.attempts} Versuch(e))"
+        for f in findings
+    ]
+    uids = ", ".join(f.work_uid for f in findings)
+    if primary.condition is Condition.BLOCKED:
+        options = [
+            "Blocker auflösen und Item entsperren (kanban_unblock)",
+            "Aufgabe abbrechen bzw. archivieren, falls obsolet",
+        ]
+        recommendation = (
+            "Blocker prüfen und entsperren; nur archivieren, wenn die Aufgabe "
+            "nicht mehr gebraucht wird."
+        )
+        impact = f"Ohne Entscheidung bleibt {uids} blockiert und hält abhängige Arbeit auf."
+    else:  # STALE / LOST / FAILED with an exhausted retry budget
+        options = [
+            "Neu zuweisen mit geänderter Strategie (frischer Versuch)",
+            "Aufgabe abbrechen bzw. archivieren",
+            "Manuell übernehmen und selbst abschließen",
+        ]
+        recommendation = (
+            "Das Retry-Budget ist erschöpft — nur mit geänderter Strategie neu "
+            "zuweisen, sonst abbrechen; ein identischer Neuversuch wäre eine Schleife."
+        )
+        impact = (
+            f"Ohne Entscheidung hängt {uids} weiter und bindet Ressourcen ohne "
+            "Fortschritt."
+        )
     return DecisionPackage(
         coalesce_key=primary.coalesce_key,
         situation=situation,
+        attempts=attempts,
+        options=options,
+        recommendation=recommendation,
+        impact=impact,
         work_uids=[f.work_uid for f in findings],
     )
 
@@ -399,7 +469,22 @@ def run_once(conn: sqlite3.Connection, *, now: Optional[float] = None,
             continue
 
         package = build_decision_package(group)
+        if not package.is_well_formed():
+            # Fail closed: never escalate a bare "how should I proceed?" — the
+            # exact output this module exists to stop. Treat it as waiting
+            # rather than sending the person an empty question.
+            result.waiting.extend(group)
+            continue
         result.escalated.append(package)
         ledger.record(group[0].task_id, package)
+
+    # Clear suppression for problems that have since recovered: a coalesce_key
+    # escalated within the TTL but absent from this scan is gone. Without this,
+    # suppression outlives the problem and the item stays silent if it breaks
+    # the same way again (resolve() otherwise had no caller).
+    active_keys = {f.coalesce_key for f in scan(conn, now=now, stale_after=stale_after)}
+    for key, task_id in ledger.open_escalations(now=now):
+        if key not in active_keys:
+            ledger.resolve(task_id, key)
 
     return result
