@@ -27,6 +27,8 @@ Design constraints:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -66,6 +68,29 @@ _ANSWER_TTL_SECONDS = 48 * 3600
 def state_path() -> Path:
     home = Path(os.environ.get("HERMES_HOME", "") or (Path.home() / ".hermes"))
     return home / "kanban" / "telegram_kanban_pings.json"
+
+
+@contextlib.contextmanager
+def _state_lock():
+    """Cross-process exclusive lock around a load-modify-save cycle.
+
+    os.replace makes the WRITE atomic, not the cycle: the cron relay
+    (register_ping) and the gateway (handle_callback/try_handle_text) mutate
+    the same file from different processes, so a concurrent read-modify-write
+    lost entries. Callers wrap their whole cycle in ``with _state_lock():``.
+    """
+    path = state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.parent / (path.name + ".lock")
+    lf = open(lock_path, "w")
+    try:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        finally:
+            lf.close()
 
 
 def _load_state() -> Dict[str, Any]:
@@ -116,25 +141,27 @@ def register_ping(
     chat_id: Optional[str] = None, gated: bool = False,
 ) -> int:
     """Persist a ping mapping and return its short index number."""
-    state = _load_state()
-    state["seq"] = int(state.get("seq") or 0) + 1
-    n = state["seq"]
-    state.setdefault("items", {})[str(n)] = {
-        "board": board, "tid": task_id, "title": title[:120],
-        "message_id": message_id, "chat_id": chat_id,
-        "gated": bool(gated), "ts": time.time(),
-    }
-    _prune(state)
-    _save_state(state)
+    with _state_lock():
+        state = _load_state()
+        state["seq"] = int(state.get("seq") or 0) + 1
+        n = state["seq"]
+        state.setdefault("items", {})[str(n)] = {
+            "board": board, "tid": task_id, "title": title[:120],
+            "message_id": message_id, "chat_id": chat_id,
+            "gated": bool(gated), "ts": time.time(),
+        }
+        _prune(state)
+        _save_state(state)
     return n
 
 
 def record_message_id(index: int, message_id: int) -> None:
-    state = _load_state()
-    item = (state.get("items") or {}).get(str(index))
-    if item is not None:
-        item["message_id"] = message_id
-        _save_state(state)
+    with _state_lock():
+        state = _load_state()
+        item = (state.get("items") or {}).get(str(index))
+        if item is not None:
+            item["message_id"] = message_id
+            _save_state(state)
 
 
 def lookup_index(index: int) -> Optional[Dict[str, Any]]:
@@ -448,9 +475,10 @@ async def handle_callback(query: Any, data: str) -> bool:
             await _finish("Ungültige Antwort-Daten.")
             return True
         _, answer_id, verb = parts
-        state = _load_state()
-        pending = (state.get("answers") or {}).pop(answer_id, None)
-        _save_state(state)
+        with _state_lock():
+            state = _load_state()
+            pending = (state.get("answers") or {}).pop(answer_id, None)
+            _save_state(state)
         if not pending:
             await _finish("Diese Antwort wurde schon verarbeitet.")
             return True
@@ -589,13 +617,14 @@ async def try_handle_text(msg: Any) -> bool:
                 _op_comment, board, tid,
                 f"Antwort/Nachfrage via Telegram-Reply: {text}",
             )
-            state = _load_state()
-            state.setdefault("answers", {})[answer_id] = {
-                "board": board, "tid": tid, "text": text,
-                "gated": bool(item.get("gated")), "ts": time.time(),
-            }
-            _prune(state)
-            _save_state(state)
+            with _state_lock():
+                state = _load_state()
+                state.setdefault("answers", {})[answer_id] = {
+                    "board": board, "tid": tid, "text": text,
+                    "gated": bool(item.get("gated")), "ts": time.time(),
+                }
+                _prune(state)
+                _save_state(state)
             try:
                 await msg.reply_text(
                     f"Notiert auf „{item['title'][:60]}“. Wie weiter?",
