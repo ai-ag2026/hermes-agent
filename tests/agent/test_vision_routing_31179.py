@@ -60,9 +60,17 @@ def _write_config(home: str, text: str) -> None:
         fp.write(text)
 
 
+# Kopplungs-Backlog 31.07.: ``hermes_cli.config`` steht NICHT mehr in der
+# Reload-Liste. Seine Lade-Caches sind pfadbasiert (per-HERMES_HOME) mit
+# mtime-Schlüsseln — ein frisches Home braucht keinen Modul-Reload. Der
+# Reload erzeugte dagegen Split-Brain über die Datei hinaus: Konsumenten,
+# die während des Fensters importierten, hielten Funktionsrefs auf die
+# frische Kopie, spätere Tests patchten das restaurierte Original — die
+# Save/Restore-Fixture unten (#61597) kann genau das prinzipiell nicht
+# einfangen. Beleg: Halbierungssuche 31.07., Paar mit
+# tests/cli/test_cli_provider_resolution.py: 4 failed -> 0 nach diesem Fix.
 _RELOAD_PREFIXES = ("agent.auxiliary_client", "agent.image_routing",
-                    "tools.vision_tools", "tools.browser_tool",
-                    "hermes_cli.config")
+                    "tools.vision_tools", "tools.browser_tool")
 
 
 def _drop_reload_targets():
