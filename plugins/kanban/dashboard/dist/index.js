@@ -998,7 +998,9 @@
 
    const deleteTask = useCallback(function (taskId) {
      if (!window.confirm(tx(t, "trash.confirm", FALLBACK_TRASH.confirm))) return Promise.resolve();
-     return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
+     const _u = withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, board);
+     const _sep = _u.indexOf("?") >= 0 ? "&" : "?";
+     return SDK.fetchJSON(`${_u}${_sep}reason=${encodeURIComponent("dashboard delete")}`, {
        method: "DELETE",
      }).then(function () {
        loadBoard();
@@ -1016,7 +1018,9 @@
       const ids = Array.from(selectedIds);
       setSelectedIds(new Set());
       return Promise.all(ids.map(function (id) {
-        return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
+        const _u = withBoard(`${API}/tasks/${encodeURIComponent(id)}`, board);
+        const _sep = _u.indexOf("?") >= 0 ? "&" : "?";
+        return SDK.fetchJSON(`${_u}${_sep}reason=${encodeURIComponent("dashboard delete")}`, { method: "DELETE" });
       })).then(function () {
         loadBoard();
       }).catch(function (e) { setError(String(e.message || e)); });

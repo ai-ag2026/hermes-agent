@@ -1362,7 +1362,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 def delete_task(
     task_id: str,
     board: Optional[str] = Query(None),
-    reason: str = Query(..., min_length=1),
+    # Default rather than required: the shipped dashboard bundle deletes without
+    # a reason, so a required param 422'd every UI deletion (F3). An authenticated
+    # operator acting through the dashboard is itself the audit context; record
+    # a stable default when the client omits one.
+    reason: str = Query("dashboard delete", min_length=1),
 ):
     board = _resolve_board(board)
     conn = _conn(board=board)
