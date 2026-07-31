@@ -173,22 +173,10 @@ def test_a_promoted_card_with_acceptance_required_cannot_self_complete(board):
     assert kanban_db.complete_task(board, result.task_id, result="done") is False
 
 
-def test_promoted_work_is_resolvable_by_work_uid(tmp_path):
-    """Promotion and resolution have to line up end to end."""
-    from hermes_cli import board_resolver
-
-    db = tmp_path / "b" / "kanban.db"
-    db.parent.mkdir(parents=True)
-    conn = kanban_db.connect(db)
-    result = work_promotion.promote(
-        conn, origin_kind="process", origin_key="proc-1",
-        title="background work", payload={})
-    work_uid = board_resolver.work_uid_for(conn, result.task_id)
-    conn.close()
-
-    resolved = board_resolver.resolve(work_uid, roots=[tmp_path])
-    assert resolved.db_path == db
-    assert resolved.task_id == result.task_id
+# test_promoted_work_is_resolvable_by_work_uid was removed with
+# hermes_cli/board_resolver.py (audit decision 2026-07-31: the module had zero
+# production consumers and its only production entry was broken; git history
+# preserves both). Promotion itself stays covered by every other test here.
 
 
 # ----------------------------------------------------------------- the race
