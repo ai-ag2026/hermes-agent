@@ -47,7 +47,17 @@ class _MockHandler(BaseHTTPRequestHandler):
         req = json.loads(self.rfile.read(length).decode())
         type(self).captured_requests.append(req)
         is_stream = req.get("stream") is True
-        if type(self).response_queue:
+        # Kopplungs-Backlog 31.07.: der Agent im KINDPROZESS initialisiert sich
+        # erst beim Testaufruf — sein Init-Probe-POST kommt mit LEEREN
+        # ``messages`` und darf die vom Test vorbereitete Antwort-Queue nicht
+        # auffressen (im alten In-Prozess-Aufbau entstand der Agent vor dem
+        # Befüllen der Queue, da war die Reihenfolge zufällig richtig). Die
+        # Queue wird nur für echte Konversations-Requests bedient.
+        has_user = any(
+            isinstance(m, dict) and m.get("role") == "user"
+            for m in (req.get("messages") or [])
+        )
+        if type(self).response_queue and has_user:
             resp = type(self).response_queue.pop(0)
         else:
             resp = _text_resp("DONE")
@@ -131,34 +141,61 @@ def agent_env():
 
     test_home = tempfile.mkdtemp(prefix="hermes_e2e_47967_")
     os.makedirs(os.path.join(test_home, ".hermes"))
-    prev_home = os.environ.get("HERMES_HOME")
-    os.environ["HERMES_HOME"] = os.path.join(test_home, ".hermes")
 
-    # Import fresh so the patched conversation_loop is exercised even when the
-    # module was imported earlier in the same worker.
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
-    from run_agent import AIAgent
+    # Kopplungs-Backlog 31.07.: der Agent läuft in einem KINDPROZESS statt
+    # nach einem sys.modules-Purge im geteilten Worker. Der Purge vergiftete
+    # nachweislich Nachbardateien (Paar mit test_skill_commands: 6 failed auf
+    # unberührtem Baum), und der Versuch, die Originalmodule danach
+    # zurückzutauschen, hat es verdoppelt (12 failed) — Modul-Rücktausch
+    # repariert kein Split-Brain. Ein frischer Prozess hat den frischen
+    # Importgraphen per Definition; der Mock-Server bleibt hier im Eltern-
+    # prozess, das Kind spricht ihn über HTTP an und liefert das
+    # run_conversation-Ergebnis als JSON über stdout zurück.
+    class _SubprocessAgent:
+        def __init__(self):
+            self.valid_tool_names = {
+                "terminal", "read_file", "write_file", "execute_code", "session_search"
+            }
 
-    agent = AIAgent(
-        api_key="test-key", base_url=f"http://127.0.0.1:{port}/v1",
-        provider="openai-compat", model="test-model",
-        max_iterations=10, enabled_toolsets=[],
-        quiet_mode=True, skip_context_files=True, skip_memory=True,
-        save_trajectories=False, platform="cli",
-    )
-    agent.valid_tool_names = {"terminal", "read_file", "write_file", "execute_code", "session_search"}
+        def run_conversation(self, prompt, conversation_history=None, task_id="t"):
+            import subprocess
+            script = (
+                "import json, os, sys\n"
+                f"os.environ['HERMES_HOME'] = {os.path.join(test_home, '.hermes')!r}\n"
+                f"sys.path.insert(0, {_REPO_ROOT!r})\n"
+                "from run_agent import AIAgent\n"
+                "agent = AIAgent(\n"
+                f"    api_key='test-key', base_url='http://127.0.0.1:{port}/v1',\n"
+                "    provider='openai-compat', model='test-model',\n"
+                "    max_iterations=10, enabled_toolsets=[],\n"
+                "    quiet_mode=True, skip_context_files=True, skip_memory=True,\n"
+                "    save_trajectories=False, platform='cli',\n"
+                ")\n"
+                f"agent.valid_tool_names = set({sorted(self.valid_tool_names)!r})\n"
+                f"result = agent.run_conversation({prompt!r}, conversation_history=[], task_id={task_id!r})\n"
+                "print('\\n__RESULT__' + json.dumps("
+                "{'partial': bool(result.get('partial', False)), 'messages': result.get('messages') or [], 'err': str(result.get('error') or '')[:300]}"
+                ", default=str))\n"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True, text=True, timeout=180,
+            )
+            assert proc.returncode == 0, (
+                f"agent child failed rc={proc.returncode}\n"
+                f"stdout tail: {proc.stdout[-2000:]}\nstderr tail: {proc.stderr[-2000:]}"
+            )
+            marker = proc.stdout.rsplit("__RESULT__", 1)
+            assert len(marker) == 2, f"no result marker in child stdout: {proc.stdout[-500:]}"
+            return json.loads(marker[1])
+
+    agent = _SubprocessAgent()
 
     try:
         yield agent, _MockHandler
     finally:
         srv.shutdown()
         shutil.rmtree(test_home, ignore_errors=True)
-        if prev_home is None:
-            os.environ.pop("HERMES_HOME", None)
-        else:
-            os.environ["HERMES_HOME"] = prev_home
 
 
 def _tool_results(handler) -> list[str]:
