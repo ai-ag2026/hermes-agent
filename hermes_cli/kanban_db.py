@@ -3743,15 +3743,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # transaction an I/O, lock or disk error between the two statements
         # would leave the table with NO uniqueness constraint at all -- worse
         # than the wrong one it replaced.
-        conn.execute("BEGIN IMMEDIATE")
+        #
+        # Open our own transaction only when none is active: a caller already
+        # holding one (a test connection in an implicit transaction, or a
+        # future migration wrapper) satisfies the same atomicity — both
+        # statements commit or roll back with the enclosing transaction — and
+        # a nested BEGIN would raise "cannot start a transaction within a
+        # transaction" (3+1-Bestandsfehler, audit 2026-07-31).
+        _own_txn = not conn.in_transaction
+        if _own_txn:
+            conn.execute("BEGIN IMMEDIATE")
         try:
             if current_sql is not None:
                 conn.execute("DROP INDEX idx_tasks_origin_key")
             conn.execute(_ORIGIN_INDEX_SQL)
         except BaseException:
-            conn.execute("ROLLBACK")
+            if _own_txn:
+                conn.execute("ROLLBACK")
             raise
-        conn.execute("COMMIT")
+        if _own_txn:
+            conn.execute("COMMIT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_owner_core "
         "ON tasks(owner_core_id) WHERE owner_core_id IS NOT NULL"
