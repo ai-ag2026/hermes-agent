@@ -1598,6 +1598,17 @@ def _handle_artifacts(args: dict, **kw) -> str:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
+    # Reading a foreign task's artifact bytes is a cross-tenant information
+    # leak: without these guards any worker could pass an arbitrary task_id and
+    # read up to 60k chars of another tenant's durable artifact. The reject
+    # must precede the ownership check — per its contract, the latter treats a
+    # delegated child's stripped env as "orchestrator, no restriction".
+    delegated_err = _reject_delegated_child_mutation("kanban_artifacts")
+    if delegated_err:
+        return delegated_err
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
     board = args.get("board")
     read_id = args.get("read")
     max_chars = args.get("max_chars")
