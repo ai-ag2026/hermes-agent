@@ -734,6 +734,7 @@ class ProcessRegistry:
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
+            _pty_live = False
             try:
                 if _IS_WINDOWS:
                     from winpty import PtyProcess as _PtyProcessCls
@@ -752,6 +753,10 @@ class ProcessRegistry:
                 session.host_start_time = self._safe_host_start_time(session.pid)
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
+                # The OS process is now live: from here a failure must NOT fall
+                # through to the pipe path (that would orphan pty_proc AND spawn
+                # the command a second time).
+                _pty_live = True
 
                 # Same ordering rule as the pipe path: registry membership
                 # and the durable spawn row before the reader exists.
@@ -775,6 +780,17 @@ class ProcessRegistry:
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                if _pty_live:
+                    # Post-spawn failure (ledger/checkpoint/reader). Kill the
+                    # live PTY process and drop the half-registered session,
+                    # then propagate — never fall through to a second spawn.
+                    try:
+                        pty_proc.terminate(force=True)
+                    except Exception:
+                        pass
+                    with self._lock:
+                        self._running.pop(session.id, None)
+                    raise
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
@@ -1038,6 +1054,11 @@ class ProcessRegistry:
 
             if session.termination_source:
                 state = "killed"
+            elif session.exit_code is None:
+                # No exit status (signal death, or a recycled host PID cleared
+                # it): the ledger contract forbids inventing success, so record
+                # 'unknown' rather than letting None fall into 'completed'.
+                state = "unknown"
             elif session.exit_code:
                 state = "failed"
             else:

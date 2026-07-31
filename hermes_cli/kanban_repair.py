@@ -58,6 +58,24 @@ from typing import Any, Callable, Optional
 
 from hermes_cli import kanban_db as kb
 
+
+def _configured_failure_limit() -> int:
+    """The dispatcher's effective failure limit (``kanban.failure_limit``).
+
+    Audit and repair MUST use the same limit as the running dispatcher, else a
+    card with 2-5 failures is promoted by the dispatcher (config 6) yet skipped
+    by an audit hard-coded to DEFAULT_FAILURE_LIMIT (2). Fails safe to DEFAULT.
+    """
+    try:
+        from hermes_cli.config import load_config
+        return int(
+            (load_config().get("kanban") or {}).get(
+                "failure_limit", kb.DEFAULT_FAILURE_LIMIT
+            )
+        )
+    except Exception:
+        return kb.DEFAULT_FAILURE_LIMIT
+
 # ---------------------------------------------------------------------------
 # Typed findings / reports
 # ---------------------------------------------------------------------------
@@ -419,7 +437,7 @@ def _audit_stale_promotable(conn) -> list[Finding]:
             failures = int(row["consecutive_failures"] or 0)
             task_limit = row["max_retries"]
             effective_limit = (
-                int(task_limit) if task_limit is not None else kb.DEFAULT_FAILURE_LIMIT
+                int(task_limit) if task_limit is not None else _configured_failure_limit()
             )
             if failures >= effective_limit:
                 continue
@@ -1090,7 +1108,7 @@ def _repair_promote_stale_task(conn, finding: Finding, *, actor: str, reason: st
     # re-implementing the CAS/eligibility logic here. It re-derives
     # eligibility from scratch (including the sticky-block and
     # failure-limit exclusions) and is itself idempotent.
-    kb.recompute_ready(conn)
+    kb.recompute_ready(conn, failure_limit=_configured_failure_limit())
     after = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
     if after is None or after["status"] == before["status"]:
         return False, "recompute_ready did not promote this task (precondition changed)"
@@ -1182,7 +1200,7 @@ def _repair_reconcile_task_done_from_completed_run(conn, finding: Finding, *, ac
             return False, "precondition changed"
         _append_repair_event(conn, task_id, finding, actor=actor, reason=reason)
     kb._clear_failure_counter(conn, task_id)
-    kb.recompute_ready(conn)
+    kb.recompute_ready(conn, failure_limit=_configured_failure_limit())
     return True, None
 
 
