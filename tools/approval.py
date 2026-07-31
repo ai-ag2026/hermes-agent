@@ -2755,9 +2755,15 @@ def _tiers_enabled() -> bool:
 # Any of these disqualifies both Tier 0 (read-only) and Tier 1 (workspace-
 # contained write) classification: without a real shell parse, containment
 # and "this is really just one read-only command" cannot be proven across
-# pipes, chains, substitutions, or redirection. Falling back to Tier 3 (ping)
+# pipes, chains, substitutions, redirection, or a newline (a second command
+# line hidden behind a read-only first line). Falling back to Tier 3 (ping)
 # is always safe; auto-approving a compound command on a partial parse is not.
-_TIER_SHELL_METACHAR_RE = re.compile(r"[;&|`]|\$\(|<\(|>\(|>|<")
+_TIER_SHELL_METACHAR_RE = re.compile(r"[;&|`\n\r]|\$\(|<\(|>\(|>|<")
+
+# A path token the shell will expand or glob before rm/mv/cp sees it. Such a
+# token cannot be proven workspace-internal by literal path resolution, so it
+# must never qualify a command for Tier-1 auto-approval.
+_TIER1_EXPANSION_RE = re.compile(r"[~$*?\[]")
 
 # Tier 0 is "reading cannot mutate anything". Test runners, build tools and
 # interpreters do NOT belong here even though their names look innocuous: a
@@ -2858,6 +2864,12 @@ def _looks_like_tier1_workspace_write(command: str, workspace: str) -> bool:
         return False
     path_args = [t for t in tokens[1:] if not t.startswith("-")]
     if not path_args:
+        return False
+    # A token carrying a shell expansion or glob (~, $VAR, *, ?, [) is NOT the
+    # literal path it appears to be: pathlib treats "~/.hermes" as a workspace-
+    # internal name, but the shell expands it to the real home first. Refuse to
+    # prove containment for anything the shell will rewrite -- fall to Tier 3.
+    if any(_TIER1_EXPANSION_RE.search(t) for t in path_args):
         return False
     return all(_path_within_workspace(t, ws) for t in path_args)
 
