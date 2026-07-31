@@ -50,6 +50,25 @@ def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Pat
     return external_category
 
 
+def _reset_session_context(tokens):
+    """Testseitiger Gegenspieler zu ``set_session_vars`` mit ECHTEM Reset.
+
+    Kopplungs-Backlog 31.07.: ``clear_session_vars`` setzt die Session-Vars
+    absichtlich auf "" (bewusst-geleert vs. nie-gesetzt) — im Gateway richtig,
+    im Test-Worker Gift: ``get_session_env`` fällt danach für den REST DES
+    PROZESSES nie mehr auf os.environ zurück, und ``_session_context_engaged``
+    bleibt prozessweit True. Hier stattdessen: Tokens zurückrollen (stellt den
+    unberührten Vorzustand wieder her) und das Engaged-Flag zurücksetzen.
+    """
+    from gateway import session_context as sc
+    for t in tokens:
+        try:
+            t.var.reset(t)
+        except Exception:
+            pass
+    sc._session_context_engaged = False
+
+
 class TestScanSkillCommands:
 
 
@@ -181,7 +200,7 @@ class TestScanSkillCommands:
             try:
                 telegram_commands = dict(get_skill_commands())
             finally:
-                clear_session_vars(tokens)
+                _reset_session_context(tokens)
 
             assert "/shared" in telegram_commands
             assert "/discord-only" in telegram_commands
@@ -194,7 +213,7 @@ class TestScanSkillCommands:
             try:
                 discord_commands = dict(get_skill_commands())
             finally:
-                clear_session_vars(tokens)
+                _reset_session_context(tokens)
 
             assert "/shared" in discord_commands
             assert "/telegram-only" in discord_commands
@@ -435,7 +454,7 @@ class TestBuildSkillInvocationMessage:
                 scan_skill_commands()
                 msg = build_skill_invocation_message("/test-skill", "do stuff")
             finally:
-                clear_session_vars(tokens)
+                _reset_session_context(tokens)
 
         assert msg is not None
         assert "local cli" in msg.lower()
