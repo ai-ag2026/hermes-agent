@@ -1352,6 +1352,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # response closes. Keep one pullable background result per configured
         # Rabbit source. This remains entirely outside ACP and unmatched API clients.
         self._rabbit_fast_mailboxes: Dict[str, "asyncio.Task[Any]"] = {}
+        # Creation timestamps parallel to the mailboxes above, so a result the
+        # client never pulls (its key carries an X-Hermes-Session-Id and is
+        # never revisited) does not pin a finished Task + payload forever.
+        self._rabbit_fast_mailbox_created: Dict[str, float] = {}
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -1610,6 +1614,24 @@ class APIServerAdapter(BasePlatformAdapter):
         ctx = self._request_audit_context(request)
         fields = [f"{key}={value!r}" for key, value in ctx.items() if value]
         return " ".join(fields) if fields else "source='unknown'"
+
+    _RABBIT_MAILBOX_TTL_SECONDS = 900
+
+    def _purge_stale_rabbit_mailboxes(self) -> None:
+        """Drop mailboxes older than the TTL that the client never pulled.
+
+        Called before inserting a new mailbox. A finished-but-unpulled result
+        would otherwise pin its Task and full completion payload forever; a
+        still-running stale task is cancelled rather than leaked.
+        """
+        now = time.time()
+        stale = [k for k, t in list(self._rabbit_fast_mailbox_created.items())
+                 if now - t > self._RABBIT_MAILBOX_TTL_SECONDS]
+        for key in stale:
+            task = self._rabbit_fast_mailboxes.pop(key, None)
+            self._rabbit_fast_mailbox_created.pop(key, None)
+            if task is not None and not task.done():
+                task.cancel()
 
     def _rabbit_fast_request_key(
         self, request: "web.Request", session_id: str,
@@ -4174,6 +4196,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         state="ready",
                     )
                 self._rabbit_fast_mailboxes.pop(rabbit_key, None)
+                self._rabbit_fast_mailbox_created.pop(rabbit_key, None)
                 try:
                     rabbit_result = mailbox.result()
                 except Exception as exc:
@@ -4199,8 +4222,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
 
             else:
+                self._purge_stale_rabbit_mailboxes()
                 mailbox = asyncio.create_task(_compute_completion())
                 self._rabbit_fast_mailboxes[rabbit_key] = mailbox
+                self._rabbit_fast_mailbox_created[rabbit_key] = time.time()
                 try:
                     rabbit_result = await asyncio.wait_for(
                         asyncio.shield(mailbox),
@@ -4217,6 +4242,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     self._rabbit_fast_mailboxes.pop(rabbit_key, None)
+                    self._rabbit_fast_mailbox_created.pop(rabbit_key, None)
                     rabbit_state = "immediate"
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -6466,51 +6492,60 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         if idem_key:
             _run_idem_registry.reserve(idem_key, idem_fp, run_id)
-        session_id = session_id or run_id
-        # Approval queues gate host-side tool execution and must be isolated
-        # per API run.  Client-provided session IDs and memory session keys are
-        # conversation/memory scopes, not authorization namespaces: multiple
-        # concurrent runs can intentionally share them, and resolving an
-        # approval for one run must not unblock another run's dangerous command.
-        approval_session_key = run_id
-        ephemeral_system_prompt = instructions
-        loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-        created_at = time.time()
-        self._run_streams[run_id] = q
-        self._run_streams_created[run_id] = created_at
-        self._run_approval_sessions[run_id] = approval_session_key
+        try:
+            session_id = session_id or run_id
+            # Approval queues gate host-side tool execution and must be isolated
+            # per API run.  Client-provided session IDs and memory session keys are
+            # conversation/memory scopes, not authorization namespaces: multiple
+            # concurrent runs can intentionally share them, and resolving an
+            # approval for one run must not unblock another run's dangerous command.
+            approval_session_key = run_id
+            ephemeral_system_prompt = instructions
+            loop = asyncio.get_running_loop()
+            q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+            created_at = time.time()
+            self._run_streams[run_id] = q
+            self._run_streams_created[run_id] = created_at
+            self._run_approval_sessions[run_id] = approval_session_key
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+            event_cb = self._make_run_event_callback(run_id, loop)
 
-        def _put_event_if_active(event: Optional[Dict]) -> None:
-            """Enqueue only while this run still owns live transport state."""
-            if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
+            def _put_event_if_active(event: Optional[Dict]) -> None:
+                """Enqueue only while this run still owns live transport state."""
+                if self._run_streams.get(run_id) is q:
+                    q.put_nowait(event)
 
-        # Also wire stream_delta_callback so message.delta events flow through.
-        def _text_cb(delta: Optional[str]) -> None:
-            if delta is None:
-                return
-            if run_id not in self._run_streams:
-                return
-            try:
-                loop.call_soon_threadsafe(_put_event_if_active, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
-            except Exception:
-                pass
+            # Also wire stream_delta_callback so message.delta events flow through.
+            def _text_cb(delta: Optional[str]) -> None:
+                if delta is None:
+                    return
+                if run_id not in self._run_streams:
+                    return
+                try:
+                    loop.call_soon_threadsafe(_put_event_if_active, {
+                        "event": "message.delta",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "delta": delta,
+                    })
+                except Exception:
+                    pass
 
-        self._set_run_status(
-            run_id,
-            "queued",
-            created_at=created_at,
-            session_id=session_id,
-            model=body.get("model", self._model_name),
-        )
+            self._set_run_status(
+                run_id,
+                "queued",
+                created_at=created_at,
+                session_id=session_id,
+                model=body.get("model", self._model_name),
+            )
+        except BaseException:
+            # A failure between reserving the idempotency key and
+            # registering the run would leave the key bound 900s to a
+            # run_id that never started, so a retry gets a false
+            # {"status": "running"} for a nonexistent run.
+            if idem_key:
+                _run_idem_registry.release(idem_key)
+            raise
 
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.

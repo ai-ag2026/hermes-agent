@@ -275,21 +275,28 @@ def _prune_durable_records() -> None:
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
+            "DELETE FROM async_delegations "
+            "WHERE delivery_state IN ('delivered','dropped') AND updated_at < ?",
             (cutoff,),
         )
+        # Count and cap only the DELETABLE terminal history. 'dropped' is a
+        # terminal give-up state (an unroutable row converges here and is never
+        # replayed), so it is retention-eligible just like 'delivered'; leaving
+        # it out let dropped rows accumulate past every rule (state.db growth).
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
+            "SELECT COUNT(*) FROM async_delegations "
+            "WHERE state NOT IN ('running','finalizing') "
+            "AND delivery_state IN ('delivered','dropped')"
         ).fetchone()[0]
         excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
-            # Only acknowledged history is deletable; undelivered records are
-            # skipped even when that leaves the table above the cap.
+            # Acknowledged or given-up history is deletable; a still-'pending'
+            # record is skipped even when that leaves the table above the cap.
             conn.execute(
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
-                       AND delivery_state='delivered'
+                       AND delivery_state IN ('delivered','dropped')
                      ORDER BY updated_at ASC LIMIT ?
                    )""",
                 (excess,),

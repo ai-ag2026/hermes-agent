@@ -2781,6 +2781,12 @@ class GatewayKanbanWatchersMixin:
                 same P1 the first repair round meant to close (TARS re-review).
                 """
                 future = maintenance_executor.submit(fn, *fn_args)
+                # Prune only genuinely finished futures before appending, so the
+                # list tracks in-flight work instead of growing unbounded (one
+                # per round, wochenlang -> tens of thousands). Never drop an
+                # unfinished one: a cancelled awaiter's executor thread keeps
+                # writing and the drain must still see it (the P1 above).
+                maintenance_inflight[:] = [f for f in maintenance_inflight if not f.done()]
                 maintenance_inflight.append(future)
                 return await asyncio.wrap_future(future)
 
