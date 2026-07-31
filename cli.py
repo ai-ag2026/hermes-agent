@@ -4493,7 +4493,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from hermes_constants import resolve_reasoning_config
         _env_effort = os.environ.get("HERMES_REASONING_EFFORT", "").strip()
         if _env_effort:
-            self.reasoning_config = _parse_reasoning_config(_env_effort)
+            # A malformed env value must not swallow the config: _parse returns
+            # None on an unknown value (after a warning), so fall back to the
+            # normal resolution instead of leaving reasoning unconfigured.
+            self.reasoning_config = (
+                _parse_reasoning_config(_env_effort)
+                or resolve_reasoning_config(CLI_CONFIG, self.model)
+            )
         else:
             self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
         self.service_tier = _parse_service_tier_config(

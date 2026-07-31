@@ -2167,13 +2167,18 @@ def run_kanban_goal_loop(
                 except Exception as exc:
                     _log(f"kanban goal loop: progress_fn failed ({exc})")
                     extra = {}
+            # Deliberately excludes the judge's free-text ``reason``: two
+            # rephrasings of the same "still stuck" verdict would otherwise
+            # reset no_progress_count and the stagnation guard would never fire.
+            # The response hash, verdict and the three state signals carry the
+            # actual progress signal; the free text belongs only in the block
+            # message.
             fingerprint = (
                 _response_fingerprint(last_response),
                 extra.get("task_event_count"),
                 extra.get("workspace_fingerprint"),
                 extra.get("test_manifest_fingerprint"),
                 verdict,
-                _truncate(reason, 120),
             )
             if fingerprint == last_fingerprint:
                 no_progress_count += 1
