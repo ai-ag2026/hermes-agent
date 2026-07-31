@@ -139,6 +139,13 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     execution with a ContextVar, while execute_code used to scrub plain
     ``os.environ`` and therefore never wrote HERMES_DELEGATED_CHILD_CONTEXT into
     the sandbox env.
+
+    The Kanban scrub is ownership-only, per the fork decision (2026-07-30, see
+    ``DELEGATED_CHILD_OWNERSHIP_ENV_KEYS`` in tools/environments/local.py): a
+    delegate_task child keeps read access (TASK/DB/BOARD) but loses the
+    ownership markers (RUN_ID/CLAIM_LOCK/WORKSPACE/BRANCH). Stripping TASK would
+    flip _check_kanban_mode from worker-scoped to orchestrator and *widen*
+    board access, the opposite of the intent.
     """
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -163,9 +170,10 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     assert os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT") is None
     assert env["HERMES_HOME"] == str(home)
     assert env["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
-    assert "HERMES_KANBAN_TASK" not in env
+    # Read access is retained (TASK/DB); only ownership markers are stripped.
+    assert env["HERMES_KANBAN_TASK"] == "t_parent"
+    assert env["HERMES_KANBAN_DB"] == str(home / "kanban.db")
     assert "HERMES_KANBAN_RUN_ID" not in env
-    assert "HERMES_KANBAN_DB" not in env
     assert "HERMES_KANBAN_WORKSPACE" not in env
     assert "HERMES_KANBAN_CLAIM_LOCK" not in env
 
