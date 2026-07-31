@@ -1224,27 +1224,6 @@ def _handle_block(args: dict, **kw) -> str:
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
             )
-        # 'dependency' is exempt from the human-notification contract because a
-        # real parent dependency resolves itself and never reaches a human. But
-        # with NO open parent it is a silent no-op: block_task sets status='todo'
-        # and recompute_ready re-promotes a parentless card to 'ready' at once,
-        # so the worker loops block->todo->ready->respawn, unnotified. Require a
-        # genuine open (non-terminal) parent before allowing the exemption.
-        if kind == "dependency":
-            has_open_parent = conn.execute(
-                "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
-                "WHERE l.child_id = ? AND p.status NOT IN ('done','archived') LIMIT 1",
-                (tid,),
-            ).fetchone()
-            if has_open_parent is None:
-                conn.close()
-                return tool_error(
-                    "kind='dependency' requires an open (non-done) parent task, "
-                    "but this card has none — it would just loop "
-                    "(todo->ready->respawn) with no human notified. Call "
-                    "kanban_complete if finished, or block with a human-facing "
-                    "kind plus human_summary and human_action."
-                )
         try:
             try:
                 ok = kb.block_task(

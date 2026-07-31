@@ -279,14 +279,13 @@ def _prune_durable_records() -> None:
             "WHERE delivery_state IN ('delivered','dropped') AND updated_at < ?",
             (cutoff,),
         )
-        # Count and cap only the DELETABLE terminal history. 'dropped' is a
-        # terminal give-up state (an unroutable row converges here and is never
-        # replayed), so it is retention-eligible just like 'delivered'; leaving
-        # it out let dropped rows accumulate past every rule (state.db growth).
+        # Cap counts ALL terminal history (the cap bounds the whole table); the
+        # delete below removes only the DELETABLE ones. 'dropped' is a terminal
+        # give-up state (an unroutable row converges here and is never
+        # replayed), so it is retention-eligible just like 'delivered' — leaving
+        # it out of the delete let dropped rows accumulate past every rule.
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations "
-            "WHERE state NOT IN ('running','finalizing') "
-            "AND delivery_state IN ('delivered','dropped')"
+            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
         ).fetchone()[0]
         excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
