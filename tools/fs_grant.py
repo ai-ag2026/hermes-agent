@@ -1,5 +1,16 @@
 """``fs_workspace_grant``: typed, descriptor-enforced filesystem capability.
 
+.. warning:: **NOT WIRED — enforces nothing in production** (audit 2026-07-31,
+   decision recorded in ``~/hermes-audit/27-agent-audit-20260731/``).
+   No production code calls ``check_write_access``/``open_for_write``, and the
+   ``HERMES_FS_GRANTS`` env var is set nowhere (``.env``, systemd units), so
+   even a caller would land in "no fs_workspace_grant configured". The module
+   is kept — correct, tested, fork-only (no merge cost) — as the enforcement
+   layer for a future write-containment phase (H1): the Tier-1
+   workspace-write classification in ``tools/approval.py`` is its intended
+   consumer. Until that wiring exists, do not describe this module as a
+   protection layer anywhere.
+
 Why this is not a path check
 ----------------------------
 The obvious implementation is ``realpath(candidate).startswith(root)``. It is
