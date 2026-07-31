@@ -1972,13 +1972,17 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
 
     # Never send the real MiniMax cloud key to a config-overridden private/LAN
     # base_url; a config tts.minimax.api_key wins for self-hosted-with-auth.
-    api_key = _guard_provider_key(mm_config.get("api_key"), api_key, base_url)
+    # The resolved cloud key is runtime.api_key -- unlike xAI/Gemini this
+    # function has no api_key parameter, so reading a bare `api_key` here was an
+    # UnboundLocalError on every call, and the header still sent the unguarded
+    # runtime.api_key past the guard.
+    api_key = _guard_provider_key(mm_config.get("api_key"), runtime.api_key, base_url)
     if not api_key:
         raise ValueError("MINIMAX_API_KEY not set. Get one at https://platform.minimax.io/")
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {runtime.api_key}",
+        "Authorization": f"Bearer {api_key}",
     }
 
     # Detect endpoint from URL
