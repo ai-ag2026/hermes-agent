@@ -1062,6 +1062,20 @@ def _handle_request_review(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=args.get("board"))
         try:
+            # Third exit from the goal loop, same class as kanban_block (#38696):
+            # request_task_review sets status='review', which run_kanban_goal_loop
+            # treats as terminal, and _accept_task_review then writes the
+            # completion in SQL past the judge. A goal_mode worker that fails the
+            # completion judge must not escape this way — route it back through
+            # kanban_complete (judge-gated) or kanban_block (allowed kinds).
+            gate_task = kb.get_task(conn, tid)
+            if gate_task is not None and gate_task.goal_mode:
+                return tool_error(
+                    "goal_mode tasks cannot request review to leave the loop. "
+                    "Call kanban_complete instead — the completion judge evaluates "
+                    "it; or kanban_block with an allowed kind if an external "
+                    "blocker genuinely prevents progress."
+                )
             ok = kb.request_task_review(
                 conn,
                 tid,
@@ -1209,6 +1223,27 @@ def _handle_block(args: dict, **kw) -> str:
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
             )
+        # 'dependency' is exempt from the human-notification contract because a
+        # real parent dependency resolves itself and never reaches a human. But
+        # with NO open parent it is a silent no-op: block_task sets status='todo'
+        # and recompute_ready re-promotes a parentless card to 'ready' at once,
+        # so the worker loops block->todo->ready->respawn, unnotified. Require a
+        # genuine open (non-terminal) parent before allowing the exemption.
+        if kind == "dependency":
+            has_open_parent = conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? AND p.status NOT IN ('done','archived') LIMIT 1",
+                (tid,),
+            ).fetchone()
+            if has_open_parent is None:
+                conn.close()
+                return tool_error(
+                    "kind='dependency' requires an open (non-done) parent task, "
+                    "but this card has none — it would just loop "
+                    "(todo->ready->respawn) with no human notified. Call "
+                    "kanban_complete if finished, or block with a human-facing "
+                    "kind plus human_summary and human_action."
+                )
         try:
             try:
                 ok = kb.block_task(

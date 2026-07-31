@@ -1234,11 +1234,8 @@ def _patch_skill(
     except Exception:
         review_write = False
 
-    if review_write:
-        backup_failure = _run_self_improvement_backup(f"skill-patch-{name}")
-        if backup_failure:
-            return backup_failure
-        _append_self_improvement_diff_log(name, target, original_content, new_content)
+    # The catalog backup now runs once centrally in skill_manage() for every
+    # review-fork write (delete/write_file included), so it is not repeated here.
 
     # fork(tars): upstream hat _atomic_write_text -> atomic_write_text umbenannt.
     atomic_write_text(target, new_content)
@@ -1248,6 +1245,12 @@ def _patch_skill(
     if scan_error:
         atomic_write_text(target, original_content)
         return {"success": False, "error": scan_error}
+
+    # Record the diff ONLY after the write survived the security scan; logging
+    # it before (as it used to) left an audit trail for a blocked, rolled-back
+    # patch as if it had been applied.
+    if review_write:
+        _append_self_improvement_diff_log(name, target, original_content, new_content)
 
     result = {
         "success": True,
@@ -1639,6 +1642,20 @@ def skill_manage(
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
+
+    # Snapshot the skill catalog before ANY autonomous background-review write,
+    # not just patch: delete/write_file/remove_file previously ran with no
+    # restore point (the gap #29912/2026-07-10 found). One point here covers
+    # every review-fork mutation.
+    try:
+        from tools.skill_provenance import is_background_review
+        _review_write = is_background_review()
+    except Exception:
+        _review_write = False
+    if _review_write and action in {"edit", "patch", "delete", "write_file", "remove_file"}:
+        _backup_failure = _run_self_improvement_backup(f"skill-{action}-{name}")
+        if _backup_failure:
+            return json.dumps(_backup_failure, ensure_ascii=False)
 
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off
