@@ -564,10 +564,22 @@ DELEGATED_CHILD_OWNERSHIP_ENV_KEYS: tuple[str, ...] = (
 
 
 def scrub_delegated_child_ownership_env(env):
-    """``env`` ohne die Eigentums-Marker; Lesezugang bleibt."""
+    """``env`` ohne die Eigentums-Marker; Lesezugang bleibt.
+
+    Setzt zugleich den Abstammungs-Marker ``HERMES_DELEGATED_CHILD_CONTEXT``,
+    damit ein über diese Env gespawnter Subprozess (und dessen Kinder)
+    ``is_delegated_child_process_context()`` weiterhin mit True beantwortet.
+    Ohne diesen Marker verlöre der local-Terminal-Pfad -- anders als der
+    ``delegated_child_subprocess_env``-Pfad über ``scrub_kanban_env`` -- die
+    Kind-Abstammung an der Prozessgrenze, und die Kanban-Guards im Subprozess
+    (``_reject_delegated_child_mutation`` / Ownership-Enforcement) griffen nicht.
+    """
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+
     cleaned = dict(env)
     for key in DELEGATED_CHILD_OWNERSHIP_ENV_KEYS:
         cleaned.pop(key, None)
+    cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
     return cleaned
 
 

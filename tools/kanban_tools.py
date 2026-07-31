@@ -132,10 +132,15 @@ def _profile_has_kanban_toolset() -> bool:
 
 
 def _is_delegated_child_context() -> bool:
+    # Process-variant, not the ContextVar-only one: a delegate_task child that
+    # spawns a subprocess loses the ContextVar across the fork but carries the
+    # HERMES_DELEGATED_CHILD_CONTEXT env marker (set by the scrub helpers). The
+    # ContextVar-only check returned False there, handing the subprocess the
+    # full orchestrator surface (kanban_unblock/kanban_complete on any card).
     try:
-        from agent.delegation_context import is_delegated_child_context
+        from agent.delegation_context import is_delegated_child_process_context
 
-        return is_delegated_child_context()
+        return is_delegated_child_process_context()
     except Exception:
         return False
 
