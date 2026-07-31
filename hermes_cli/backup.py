@@ -262,10 +262,11 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
     a valid backup. The destination is replaced only after validation.
     """
     conn = backup_conn = None
-    fd, temp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=dst.parent)
-    os.close(fd)
-    temp_path = Path(temp_name)
+    temp_path = None
     try:
+        fd, temp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=dst.parent)
+        os.close(fd)
+        temp_path = Path(temp_name)
         conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
         backup_conn = sqlite3.connect(str(temp_path))
         conn.backup(backup_conn)
@@ -288,7 +289,8 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
             backup_conn.close()
         if conn is not None:
             conn.close()
-        temp_path.unlink(missing_ok=True)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def is_zeroed_sqlite_file(
