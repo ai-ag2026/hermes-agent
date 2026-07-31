@@ -24,6 +24,20 @@ def _ensure_telegram_mock():
     if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
         return
 
+    # Prefer the REAL library whenever it is importable: the fakes below are
+    # process-wide and permanent, and they broke every later test that needs
+    # genuine PTB classes (tests/test_telegram_polling_progress_ptb.py) when
+    # this file ran first. Fakes remain only for environments without PTB.
+    try:
+        import telegram  # noqa: F401
+        import telegram.constants  # noqa: F401
+        import telegram.error  # noqa: F401
+        import telegram.ext  # noqa: F401
+        import telegram.request  # noqa: F401
+        return
+    except ImportError:
+        pass
+
     mod = MagicMock()
     mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
     mod.constants.ParseMode.MARKDOWN = "Markdown"

@@ -6242,7 +6242,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # --- Kanban quick actions (kb…: unblock/details/archive/gate) ---
         if data.startswith("kb"):
-            if not self._kanban_actions_enabled:
+            # getattr, fail-closed — fork attribute, see _handle_text_message.
+            if not getattr(self, "_kanban_actions_enabled", False):
                 await query.answer(text="Kanban-Aktionen sind deaktiviert.")
                 return
             caller_id = str(getattr(query.from_user, "id", ""))
@@ -8748,8 +8749,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Kanban quick actions: replies to a blocker ping and short commands
         # ("unblock 1", "unblock alle", "details 2") are consumed here and
         # never reach the agent loop. Everything else falls through so the
-        # normal conversation stays untouched.
-        if self._kanban_actions_enabled:
+        # normal conversation stays untouched. getattr, fail-closed: this is a
+        # fork attribute set in __init__ — a partially constructed adapter
+        # (test stubs, unusual upstream paths) must skip the fork feature, not
+        # crash the shared text handler.
+        if getattr(self, "_kanban_actions_enabled", False):
             try:
                 try:
                     from . import kanban_actions

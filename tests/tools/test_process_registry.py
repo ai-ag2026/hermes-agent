@@ -463,7 +463,7 @@ class TestPruning:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
-    def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
+    def test_spawn_local_strips_blocked_vars_from_background_env(self, registry, tmp_path):
         captured = {}
 
         def fake_popen(cmd, **kwargs):
@@ -480,6 +480,12 @@ class TestSpawnEnvSanitization:
         with patch.dict(os.environ, {
             "PATH": "/usr/bin:/bin",
             "HOME": "/home/user",
+            # spawn_local now binds the process-ledger store at spawn time
+            # (_bind_ledger_store); without HERMES_HOME the resolution falls
+            # back to ~/.hermes under the fake HOME above, which is unwritable
+            # in the sandbox. Point it at a real tmpdir — the env-stripping
+            # assertions below are unaffected.
+            "HERMES_HOME": str(tmp_path),
             "USER": "tester",
             "TELEGRAM_BOT_TOKEN": "bot-secret",
             "FIRECRAWL_API_KEY": "fc-secret",

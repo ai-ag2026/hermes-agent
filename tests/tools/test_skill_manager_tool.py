@@ -279,16 +279,30 @@ class TestSelfImprovementBackup:
         )
         from tools.skill_manager_tool import mark_background_review_skill_read
 
+        # These tests exercise the BACKUP gate specifically. The (newer)
+        # curator-adoption guard runs before it and would refuse the write for
+        # a skill with no usage record — stub the skill as curator-managed
+        # (same pattern as test_adopted_skill_becomes_writable) so execution
+        # actually reaches the gate under test.
         with patch("tools.skill_manager_tool.get_hermes_home", return_value=home), \
-             patch("tools.skill_manager_tool.subprocess.run", mock_run):
+             patch("tools.skill_manager_tool.subprocess.run", mock_run), \
+             patch("tools.skill_usage.load_usage",
+                   return_value={"my-skill": {"created_by": "agent"}}), \
+             patch("tools.skill_usage.get_record",
+                   side_effect=lambda n: {"created_by": "agent", "pinned": False}):
             with _skill_dir(skills_root):
                 _create_skill("my-skill", VALID_SKILL_CONTENT)
                 token = set_current_write_origin(BACKGROUND_REVIEW)
                 try:
                     mark_background_review_skill_read(skills_root / "my-skill" / "SKILL.md")
-                    result = _patch_skill(
-                        "my-skill", "Do the thing.", "Do the new thing."
-                    )
+                    # Through the real entry point: the catalog backup runs
+                    # centrally in skill_manage() for every review-fork write
+                    # (A5 audit fix); calling _patch_skill directly would
+                    # bypass exactly the gate these tests exercise.
+                    result = json.loads(skill_manage(
+                        action="patch", name="my-skill",
+                        old_string="Do the thing.", new_string="Do the new thing.",
+                    ))
                 finally:
                     reset_current_write_origin(token)
         return result
@@ -766,6 +780,13 @@ class TestBackgroundOwnershipPolicyConsistency:
     def test_adopted_skill_becomes_writable_by_autonomous_curation(self, tmp_path, monkeypatch):
         """Adoption is the documented path from refused to allowed."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        # The backup gate (fail-closed since 2026-07-10) runs after adoption
+        # and requires the catalog-backup script in THIS test's home — the
+        # suite conftest's stub lives in a different HERMES_HOME.
+        _script = tmp_path / ".hermes" / "system" / "backup-skills.sh"
+        _script.parent.mkdir(parents=True, exist_ok=True)
+        _script.write_text("#!/usr/bin/env bash\nexit 0\n")
+        _script.chmod(0o755)
         with _skill_dir(tmp_path):
             _create_skill("adopt-me", VALID_SKILL_CONTENT)
             with patch("tools.skill_usage.load_usage", return_value={}):
