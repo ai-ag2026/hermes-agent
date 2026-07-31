@@ -1229,7 +1229,7 @@ class GatewayKanbanWatchersMixin:
                         )
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
-                        return deliveries
+                        return {"events": [], "attentions": [], "duplicate_suppressed_by_board": {}}
 
                     attention_deliveries: list[dict] = []
                     # Enumerate every board on disk, but poll each resolved DB
