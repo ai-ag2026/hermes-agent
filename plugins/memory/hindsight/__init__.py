@@ -1540,14 +1540,27 @@ class HindsightMemoryProvider(MemoryProvider):
                                 bank_id=self._bank_id, detail="content"
                             )
                         )
+                        # list_mental_models returns a MentalModelListResponse
+                        # whose models live under .items; iterating the response
+                        # object itself yields (field, value) tuples, so the old
+                        # `for mm in (mms or [])` filtered everything out and the
+                        # feature was a silent no-op since it shipped.
+                        mm_items = getattr(mms, "items", None) or []
                         mm_parts = [
                             f"### {mm.name}\n{mm.content.strip()}"
-                            for mm in (mms or [])
+                            for mm in mm_items
                             if getattr(mm, "content", None)
                             and not mm.content.startswith("Generating content")
                         ]
                         if mm_parts:
                             mm_block = "## Mental Models (curated syntheses)\n" + "\n\n".join(mm_parts)
+                            # This block is prepended outside arecall, so it does
+                            # not pass through the recall max_tokens budget. Cap
+                            # it (~4 chars/token) so an unbounded model set cannot
+                            # crowd out the actual recall content.
+                            _cap = max(0, self._recall_max_tokens) * 4
+                            if _cap and len(mm_block) > _cap:
+                                mm_block = mm_block[:_cap] + "\n…(mental models truncated)"
                             text = f"{mm_block}\n\n{text}" if text else mm_block
                             logger.debug("Prefetch: prepended %d mental model(s)", len(mm_parts))
                     except Exception as e:
