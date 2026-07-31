@@ -594,6 +594,21 @@ def _audit_orphaned_completed_runs(conn) -> list[Finding]:
             # (or was) in flight. Leave it alone entirely.
             continue
 
+        # An operator reopen (reopen_task) nulls current_run_id but leaves the
+        # completed run row and its 'completed' event in place, so the guard
+        # above does not catch it. If a 'reopened' event is newer than this
+        # run's 'completed' event, the non-terminal status is a deliberate
+        # reopen, not an orphan — never reconcile it back to done (incident
+        # 2026-07-15). The repair CAS enforces the same predicate to stay
+        # TOCTOU-safe against a reopen landing between audit and repair.
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'reopened' "
+            "AND id > (SELECT MAX(id) FROM task_events "
+            "WHERE task_id = ? AND kind = 'completed' AND run_id = ?) LIMIT 1",
+            (task_id, task_id, run_id),
+        ).fetchone() is not None:
+            continue
+
         manifest = _completed_event_manifest(conn, task_id)
         invalid_entries = []
         for entry in manifest:
@@ -1153,8 +1168,15 @@ def _repair_reconcile_task_done_from_completed_run(conn, finding: Finding, *, ac
              WHERE id = ?
                AND status NOT IN ('done', 'archived')
                AND (current_run_id IS NULL OR current_run_id = ?)
+               AND NOT EXISTS (
+                   SELECT 1 FROM task_events
+                    WHERE task_id = ? AND kind = 'reopened'
+                      AND id > (SELECT MAX(id) FROM task_events
+                                 WHERE task_id = ? AND kind = 'completed'
+                                   AND run_id = ?)
+               )
             """,
-            (now, task_id, run_id),
+            (now, task_id, run_id, task_id, task_id, run_id),
         )
         if cur.rowcount != 1:
             return False, "precondition changed"
