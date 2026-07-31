@@ -2647,6 +2647,15 @@ def _completion_artifact_lock(conn: sqlite3.Connection):
             handle.close()
 
 
+# D2 plausibility floor on the reference set (not the DB↔root identity, which
+# is proven separately above). A sweep that would remove more than the absolute
+# cap AND more than this fraction of the tree looks like wholesale loss from a
+# stale reference set (e.g. a PBS restore of an older kanban.db next to a newer
+# artifact tree), not incremental GC — refuse it and let a human look.
+_SCAVENGER_MAX_DELETIONS_PER_SWEEP = 10
+_SCAVENGER_MAX_DELETION_FRACTION = 0.25
+
+
 def _scavenge_completion_artifacts(
     conn: sqlite3.Connection,
     *,
@@ -2728,6 +2737,49 @@ def _scavenge_completion_artifacts_locked(
         str(row[0]) for row in conn.execute("SELECT durable_path FROM task_artifacts")
     }
     cutoff = (time.time() if now is None else now) - max(0, grace_seconds)
+
+    # D2: count deletion candidates before touching anything, and refuse a
+    # sweep that looks like wholesale loss rather than incremental GC. Same
+    # candidate predicate as the delete walk below (stale AND unreferenced).
+    total_files = 0
+    candidates = 0
+    count_fd = _open_directory_path_nofollow(root, create=False)
+    try:
+        for _rel, _dirs, _file_names, _dir_fd in os.fwalk(
+            ".", topdown=False, follow_symlinks=False, dir_fd=count_fd
+        ):
+            for name in _file_names:
+                try:
+                    info = os.stat(name, dir_fd=_dir_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                total_files += 1
+                if info.st_mtime <= cutoff and str(root / _rel / name) not in referenced:
+                    candidates += 1
+    finally:
+        os.close(count_fd)
+    if candidates:
+        if not referenced and total_files:
+            _log.warning(
+                "kanban artifact scavenger: reference set is empty but %d file(s) "
+                "exist under %s — refusing to sweep (stale/restored DB?)",
+                total_files, root,
+            )
+            return 0
+        if (
+            candidates > _SCAVENGER_MAX_DELETIONS_PER_SWEEP
+            and candidates > total_files * _SCAVENGER_MAX_DELETION_FRACTION
+        ):
+            _log.warning(
+                "kanban artifact scavenger: %d of %d file(s) under %s would be "
+                "removed (> %d and > %.0f%%) — refusing wholesale deletion, "
+                "leaving the tree intact for inspection",
+                candidates, total_files, root,
+                _SCAVENGER_MAX_DELETIONS_PER_SWEEP,
+                _SCAVENGER_MAX_DELETION_FRACTION * 100,
+            )
+            return 0
+
     removed = 0
     root_fd = _open_directory_path_nofollow(root, create=False)
     try:
