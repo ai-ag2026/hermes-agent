@@ -90,6 +90,12 @@ def _resolve_provider_key(env_var: str, provider_id: str) -> str:
     return resolve_provider_secret(env_var, provider_id, env_getter=get_env_value)
 
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
+from tools.audio_key_guard import (
+    CANONICAL_AUDIO_HOSTS,
+    AudioEndpointCredentialPolicyError,
+    require_canonical_audio_endpoint,
+    select_audio_provider_key,
+)
 from tools.tool_backend_helpers import (
     managed_nous_tools_enabled,
     nous_tool_gateway_unavailable_message,
@@ -534,16 +540,6 @@ def _resolve_minimax_tts_runtime(
     if not isinstance(mm_config, dict):
         mm_config = {}
 
-    credentials = {
-        "global": (
-            "MINIMAX_API_KEY",
-            str(_resolve_provider_key("MINIMAX_API_KEY", "minimax") or "").strip(),
-        ),
-        "cn": (
-            "MINIMAX_CN_API_KEY",
-            str(_resolve_provider_key("MINIMAX_CN_API_KEY", "minimax") or "").strip(),
-        ),
-    }
     endpoints = {
         "global": DEFAULT_MINIMAX_BASE_URL,
         "cn": DEFAULT_MINIMAX_CN_BASE_URL,
@@ -553,26 +549,82 @@ def _resolve_minimax_tts_runtime(
     if configured_region and configured_region not in endpoints:
         raise ValueError("tts.minimax.region must be 'global' or 'cn'")
 
-    if configured_region:
-        region = configured_region
-    elif credentials["global"][1]:
-        region = "global"
-    elif credentials["cn"][1]:
-        region = "cn"
+    configured_api_key = mm_config.get("api_key")
+    configured_endpoint = str(mm_config.get("base_url") or "").strip()
+    if str(configured_api_key or "").strip():
+        # A provider-local key deliberately owns the configured endpoint. The
+        # default region is global unless the operator selected China's API.
+        region = configured_region or "global"
+        credential_source = "tts.minimax.api_key"
+        endpoint = configured_endpoint or endpoints[region]
+        api_key = select_audio_provider_key(
+            configured_key=configured_api_key,
+            resolve_fallback=lambda: "",
+            endpoint=endpoint,
+            canonical_hosts=CANONICAL_AUDIO_HOSTS[f"minimax-{region}"],
+            allowed_schemes=frozenset({"https"}),
+            key_setting="tts.minimax.api_key",
+            endpoint_setting="tts.minimax.base_url",
+        )
     else:
-        region = "global"
+        # A configured endpoint can be checked before touching either
+        # region's shared fallback credential. Without an explicit region,
+        # accept only one of the documented exact provider hosts and resolve
+        # the credential/region below as before.
+        if configured_endpoint:
+            allowed_hosts = (
+                CANONICAL_AUDIO_HOSTS[f"minimax-{configured_region}"]
+                if configured_region
+                else CANONICAL_AUDIO_HOSTS["minimax-global"]
+                | CANONICAL_AUDIO_HOSTS["minimax-cn"]
+            )
+            require_canonical_audio_endpoint(
+                configured_endpoint,
+                allowed_hosts,
+                frozenset({"https"}),
+                endpoint_setting="tts.minimax.base_url",
+                key_setting="tts.minimax.api_key",
+            )
 
-    credential_source, api_key = credentials[region]
+        credentials = {
+            "global": (
+                "MINIMAX_API_KEY",
+                str(_resolve_provider_key("MINIMAX_API_KEY", "minimax") or "").strip(),
+            ),
+            "cn": (
+                "MINIMAX_CN_API_KEY",
+                str(_resolve_provider_key("MINIMAX_CN_API_KEY", "minimax") or "").strip(),
+            ),
+        }
+        if configured_region:
+            region = configured_region
+        elif credentials["global"][1]:
+            region = "global"
+        elif credentials["cn"][1]:
+            region = "cn"
+        else:
+            region = "global"
+        credential_source, fallback_key = credentials[region]
+        endpoint = configured_endpoint or endpoints[region]
+        api_key = select_audio_provider_key(
+            configured_key=None,
+            resolve_fallback=lambda: fallback_key,
+            endpoint=endpoint,
+            canonical_hosts=CANONICAL_AUDIO_HOSTS[f"minimax-{region}"],
+            allowed_schemes=frozenset({"https"}),
+            key_setting="tts.minimax.api_key",
+            endpoint_setting="tts.minimax.base_url",
+        )
+
     if not api_key:
         raise ValueError(
             f"{credential_source} not set for MiniMax TTS region {region!r}"
         )
 
-    endpoint = str(mm_config.get("base_url") or endpoints[region]).strip()
     endpoint_host = (urlparse(endpoint).hostname or "").lower()
     official_region_hosts = {
-        "global": frozenset({"api.minimax.io", "api.minimax.chat"}),
-        "cn": frozenset({"api.minimaxi.com"}),
+        "global": CANONICAL_AUDIO_HOSTS["minimax-global"],
+        "cn": CANONICAL_AUDIO_HOSTS["minimax-cn"],
     }
     other_region = "cn" if region == "global" else "global"
     if endpoint_host in official_region_hosts[other_region]:
@@ -660,6 +712,145 @@ def _get_provider_section(tts_config: Dict[str, Any], name: str) -> Dict[str, An
         return {}
     section = tts_config.get(name)
     return section if isinstance(section, dict) else {}
+
+
+def _has_guarded_tts_credential(tts_config: Dict[str, Any], provider: str) -> bool:
+    """Return whether a cloud TTS provider is ready for its effective endpoint.
+
+    This keeps ``check_tts_requirements`` aligned with the native generators:
+    a broad fallback key does not make a noncanonical configured endpoint
+    usable, while an explicit provider-local key remains a deliberate opt-in.
+    """
+    section = _get_provider_section(tts_config, provider)
+
+    try:
+        if provider == "openai":
+            _resolve_openai_audio_client_config()
+            return True
+
+        if provider == "elevenlabs":
+            configured_key = section.get("api_key")
+            base_url = str(section.get("base_url") or "https://api.elevenlabs.io").strip().rstrip("/")
+            wss_url = str(
+                section.get("wss_url")
+                or base_url.replace("https://", "wss://", 1)
+            ).strip().rstrip("/")
+            if not str(configured_key or "").strip():
+                require_canonical_audio_endpoint(
+                    wss_url,
+                    CANONICAL_AUDIO_HOSTS["elevenlabs"],
+                    frozenset({"wss"}),
+                    endpoint_setting="tts.elevenlabs.wss_url",
+                    key_setting="tts.elevenlabs.api_key",
+                )
+            return bool(select_audio_provider_key(
+                configured_key=configured_key,
+                resolve_fallback=lambda: _resolve_provider_key(
+                    "ELEVENLABS_API_KEY", "elevenlabs"
+                ),
+                endpoint=base_url,
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["elevenlabs"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="tts.elevenlabs.base_url",
+                key_setting="tts.elevenlabs.api_key",
+            ))
+
+        if provider == "deepinfra":
+            from hermes_cli.models import deepinfra_base_url
+
+            return bool(select_audio_provider_key(
+                configured_key=section.get("api_key"),
+                resolve_fallback=lambda: _resolve_provider_key(
+                    "DEEPINFRA_API_KEY", "deepinfra"
+                ),
+                endpoint=deepinfra_base_url(section),
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["deepinfra"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="tts.deepinfra.base_url",
+                key_setting="tts.deepinfra.api_key",
+            ))
+
+        if provider == "xai":
+            configured_key = section.get("api_key")
+            if str(configured_key or "").strip():
+                return True
+            direct_endpoint = str(
+                section.get("base_url")
+                or get_env_value("XAI_BASE_URL")
+                or DEFAULT_XAI_BASE_URL
+            )
+            from tools.xai_http import (
+                resolve_xai_api_key_credentials,
+                resolve_xai_oauth_credentials,
+            )
+
+            # OAuth owns a separately validated xAI origin and ignores direct
+            # endpoint overrides. Direct API-key fallback is resolved only
+            # after its configured endpoint passes the canonical policy.
+            oauth_creds = resolve_xai_oauth_credentials()
+            if oauth_creds is not None:
+                oauth_endpoint = str(
+                    oauth_creds.get("base_url") or DEFAULT_XAI_BASE_URL
+                ).strip().rstrip("/")
+                return bool(select_audio_provider_key(
+                    configured_key=None,
+                    resolve_fallback=lambda: str(oauth_creds.get("api_key") or "").strip(),
+                    endpoint=oauth_endpoint,
+                    canonical_hosts=CANONICAL_AUDIO_HOSTS["xai"],
+                    allowed_schemes=frozenset({"https"}),
+                    endpoint_setting="xAI OAuth resolver base URL",
+                    key_setting="tts.xai.api_key",
+                ))
+            require_canonical_audio_endpoint(
+                direct_endpoint,
+                CANONICAL_AUDIO_HOSTS["xai"],
+                frozenset({"https"}),
+                endpoint_setting="tts.xai.base_url or XAI_BASE_URL",
+                key_setting="tts.xai.api_key",
+            )
+            direct_creds = resolve_xai_api_key_credentials()
+            return bool(select_audio_provider_key(
+                configured_key=None,
+                resolve_fallback=lambda: str(direct_creds.get("api_key") or "").strip(),
+                endpoint=direct_endpoint,
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["xai"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="tts.xai.base_url or XAI_BASE_URL",
+                key_setting="tts.xai.api_key",
+            ))
+
+        if provider == "gemini":
+            endpoint = str(
+                section.get("base_url")
+                or get_env_value("GEMINI_BASE_URL")
+                or DEFAULT_GEMINI_TTS_BASE_URL
+            ).strip().rstrip("/")
+            return bool(select_audio_provider_key(
+                configured_key=section.get("api_key"),
+                resolve_fallback=lambda: _resolve_provider_key("GEMINI_API_KEY", "gemini")
+                or _resolve_provider_key("GOOGLE_API_KEY", "gemini"),
+                endpoint=endpoint,
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["gemini"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="tts.gemini.base_url",
+                key_setting="tts.gemini.api_key",
+            ))
+
+        if provider == "mistral":
+            endpoint = str(section.get("base_url") or "https://api.mistral.ai/v1")
+            return bool(select_audio_provider_key(
+                configured_key=section.get("api_key"),
+                resolve_fallback=lambda: _resolve_provider_key("MISTRAL_API_KEY", "mistral"),
+                endpoint=endpoint,
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["mistral"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="tts.mistral.base_url",
+                key_setting="tts.mistral.api_key",
+            ))
+    except Exception:
+        return False
+
+    return False
 
 
 def _get_named_provider_config(
@@ -1422,11 +1613,41 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
     Returns:
         Path to the saved audio file.
     """
-    api_key = (_resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs") or "")
+    el_config = tts_config.get("elevenlabs") or {}
+    if not isinstance(el_config, dict):
+        el_config = {}
+    configured_base_url = str(el_config.get("base_url") or "").strip().rstrip("/")
+    effective_base_url = configured_base_url or "https://api.elevenlabs.io"
+    effective_wss_url = str(el_config.get("wss_url") or "").strip().rstrip("/")
+    if not effective_wss_url:
+        effective_wss_url = re.sub(r"^http", "ws", effective_base_url)
+
+    # The ElevenLabs SDK may use both REST and WSS transports. A broad fallback
+    # key therefore needs both endpoint origins to be canonical before client
+    # construction; a configured provider-local key may intentionally use a
+    # self-hosted/proxy environment.
+    if not str(el_config.get("api_key") or "").strip():
+        require_canonical_audio_endpoint(
+            effective_wss_url,
+            CANONICAL_AUDIO_HOSTS["elevenlabs"],
+            frozenset({"wss"}),
+            endpoint_setting="tts.elevenlabs.wss_url",
+            key_setting="tts.elevenlabs.api_key",
+        )
+    api_key = select_audio_provider_key(
+        configured_key=el_config.get("api_key"),
+        resolve_fallback=lambda: _resolve_provider_key(
+            "ELEVENLABS_API_KEY", "elevenlabs"
+        ),
+        endpoint=effective_base_url,
+        canonical_hosts=CANONICAL_AUDIO_HOSTS["elevenlabs"],
+        allowed_schemes=frozenset({"https"}),
+        key_setting="tts.elevenlabs.api_key",
+        endpoint_setting="tts.elevenlabs.base_url",
+    )
     if not api_key:
         raise ValueError("ELEVENLABS_API_KEY not set. Get one at https://elevenlabs.io/")
 
-    el_config = tts_config.get("elevenlabs") or {}
     voice_id = el_config.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
     model_id = el_config.get("model_id", DEFAULT_ELEVENLABS_MODEL_ID)
 
@@ -1548,12 +1769,10 @@ def _generate_openai_tts(
         voice = oai_config.get("voice", DEFAULT_OPENAI_VOICE)
     config_base_url = oai_config.get("base_url")
     if base_url is None:
-        # Config override wins over the auth-chain fallback (restores the
-        # pre-refactor precedence, where tts.openai.base_url beat the resolved
-        # default); the auth-chain value is the last-resort default. An
-        # explicit base_url arg from an OpenAI-compatible caller (DeepInfra)
-        # skips this block entirely and always wins.
-        base_url = config_base_url or fallback_base or DEFAULT_OPENAI_BASE_URL
+        # The resolver already applies tts.openai.base_url for direct auth. Its
+        # returned managed-gateway origin must win over config, otherwise a
+        # managed token could be redirected by a stale custom base_url.
+        base_url = fallback_base or config_base_url or DEFAULT_OPENAI_BASE_URL
     if speed is None:
         speed_default = tts_config.get("speed", 1.0) if isinstance(tts_config, dict) else 1.0
         speed = float(oai_config.get("speed", speed_default))
@@ -1640,13 +1859,6 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
     the shared ``hermes_cli.models`` helpers so every DeepInfra surface
     resolves them identically.
     """
-    api_key = _resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra")
-    if not api_key:
-        raise ValueError(
-            "DEEPINFRA_API_KEY not set. Run `hermes setup` to configure, "
-            "or set the env var directly."
-        )
-
     # ``tts.deepinfra: null`` in YAML yields None, not {} — coalesce so the
     # ``.get`` calls below don't raise AttributeError (there is no
     # tts.deepinfra block in DEFAULT_CONFIG to deep-merge over the null).
@@ -1655,6 +1867,22 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
         di_config = {}
 
     from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
+
+    base_url = deepinfra_base_url(di_config)
+    api_key = select_audio_provider_key(
+        configured_key=di_config.get("api_key"),
+        resolve_fallback=lambda: _resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra"),
+        endpoint=base_url,
+        canonical_hosts=CANONICAL_AUDIO_HOSTS["deepinfra"],
+        allowed_schemes=frozenset({"https"}),
+        key_setting="tts.deepinfra.api_key",
+        endpoint_setting="tts.deepinfra.base_url",
+    )
+    if not api_key:
+        raise ValueError(
+            "DEEPINFRA_API_KEY not set. Run `hermes setup` to configure, "
+            "or set the env var directly."
+        )
 
     model = di_config.get("model")
     if not isinstance(model, str) or not model.strip():
@@ -1666,16 +1894,12 @@ def _generate_deepinfra_tts(text: str, output_path: str, tts_config: Dict[str, A
                 "api.deepinfra.com so the live catalog can be fetched."
             )
         model = candidates[0]
-    di_base_url = deepinfra_base_url(di_config)
-    # Never send the real DeepInfra cloud key to a config-overridden private
-    # base_url; a config tts.deepinfra.api_key wins for self-hosted-with-auth.
-    di_key = _guard_provider_key(di_config.get("api_key"), api_key, di_base_url)
     return _generate_openai_tts(
         text,
         output_path,
         tts_config,
-        api_key=di_key,
-        base_url=di_base_url,
+        api_key=api_key,
+        base_url=base_url,
         model=model,
         voice=di_config.get("voice", DEFAULT_DEEPINFRA_TTS_VOICE),
         speed=float(di_config.get("speed", tts_config.get("speed", 1.0))),
@@ -1804,14 +2028,44 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
     """
     import requests
 
-    from tools.xai_http import resolve_xai_http_credentials
-
-    creds = resolve_xai_http_credentials()
-    api_key = str(creds.get("api_key") or "").strip()
-    if not api_key:
-        raise ValueError("No xAI credentials found. Configure xAI OAuth in `hermes model` or set XAI_API_KEY.")
+    from tools.xai_http import (
+        resolve_xai_api_key_credentials,
+        resolve_xai_oauth_credentials,
+    )
 
     xai_config = tts_config.get("xai") or {}
+    if not isinstance(xai_config, dict):
+        xai_config = {}
+    configured_api_key = xai_config.get("api_key")
+    configured_base_url = str(
+        xai_config.get("base_url")
+        or get_env_value("XAI_BASE_URL")
+        or DEFAULT_XAI_BASE_URL
+    ).strip().rstrip("/")
+    if str(configured_api_key or "").strip():
+        # A provider-local key deliberately owns a custom endpoint.
+        creds: Dict[str, Any] = {
+            "provider": "xai",
+            "api_key": configured_api_key,
+            "base_url": configured_base_url,
+        }
+    else:
+        # OAuth owns a separately validated canonical origin and intentionally
+        # ignores direct-HTTP overrides. Direct env/profile/pool API-key
+        # resolution remains behind the canonical-endpoint guard.
+        oauth_creds = resolve_xai_oauth_credentials()
+        if oauth_creds is not None:
+            creds = oauth_creds
+        else:
+            require_canonical_audio_endpoint(
+                configured_base_url,
+                CANONICAL_AUDIO_HOSTS["xai"],
+                frozenset({"https"}),
+                endpoint_setting="tts.xai.base_url or XAI_BASE_URL",
+                key_setting="tts.xai.api_key",
+            )
+            creds = resolve_xai_api_key_credentials()
+
     voice_id = str(xai_config.get("voice_id", DEFAULT_XAI_VOICE_ID)).strip() or DEFAULT_XAI_VOICE_ID
     language = str(xai_config.get("language", DEFAULT_XAI_LANGUAGE)).strip() or DEFAULT_XAI_LANGUAGE
     sample_rate = int(xai_config.get("sample_rate", DEFAULT_XAI_SAMPLE_RATE))
@@ -1856,16 +2110,17 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
     if creds.get("provider") == "xai-oauth":
         base_url = str(creds.get("base_url") or DEFAULT_XAI_BASE_URL).strip().rstrip("/")
     else:
-        base_url = str(
-            xai_config.get("base_url")
-            or creds.get("base_url")
-            or get_env_value("XAI_BASE_URL")
-            or DEFAULT_XAI_BASE_URL
-        ).strip().rstrip("/")
-    # fork(tars): never send the real xAI cloud key to a config-overridden
-    # private/LAN base_url; a config tts.xai.api_key wins for self-hosted-with-auth.
-    # UPSTREAM-KANDIDAT (generische Credential-Härtung).
-    api_key = _guard_provider_key(xai_config.get("api_key"), api_key, base_url)
+        base_url = configured_base_url
+
+    api_key = select_audio_provider_key(
+        configured_key=configured_api_key,
+        resolve_fallback=lambda: str(creds.get("api_key") or "").strip(),
+        endpoint=base_url,
+        canonical_hosts=CANONICAL_AUDIO_HOSTS["xai"],
+        allowed_schemes=frozenset({"https"}),
+        key_setting="tts.xai.api_key",
+        endpoint_setting="tts.xai.base_url",
+    )
     if not api_key:
         raise ValueError("No xAI credentials found. Configure xAI OAuth in `hermes model` or set XAI_API_KEY.")
 
@@ -2080,16 +2335,26 @@ def _generate_mistral_tts(text: str, output_path: str, tts_config: Dict[str, Any
     and writes the raw bytes to *output_path*.
     Supports native Opus output for Telegram voice bubbles.
     """
-    api_key = (_resolve_provider_key("MISTRAL_API_KEY", "mistral") or "")
-    if not api_key:
-        raise ValueError("MISTRAL_API_KEY not set. Get one at https://console.mistral.ai/")
-
     mi_config = tts_config.get("mistral") or {}
+    if not isinstance(mi_config, dict):
+        mi_config = {}
     model = mi_config.get("model", DEFAULT_MISTRAL_TTS_MODEL)
     voice_id = mi_config.get("voice_id") or DEFAULT_MISTRAL_TTS_VOICE_ID
     # Class-level base_url parity: every cloud TTS provider section supports
     # base_url. The Mistral SDK calls it server_url.
     base_url = mi_config.get("base_url")
+    effective_base_url = base_url or "https://api.mistral.ai/v1"
+    api_key = select_audio_provider_key(
+        configured_key=mi_config.get("api_key"),
+        resolve_fallback=lambda: _resolve_provider_key("MISTRAL_API_KEY", "mistral"),
+        endpoint=effective_base_url,
+        canonical_hosts=CANONICAL_AUDIO_HOSTS["mistral"],
+        allowed_schemes=frozenset({"https"}),
+        key_setting="tts.mistral.api_key",
+        endpoint_setting="tts.mistral.base_url",
+    )
+    if not api_key:
+        raise ValueError("MISTRAL_API_KEY not set. Get one at https://console.mistral.ai/")
 
     if output_path.endswith(".ogg"):
         response_format = "opus"
@@ -2335,32 +2600,30 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     """
     import requests
 
-    api_key = (
-        _resolve_provider_key("GEMINI_API_KEY", "gemini")
-        or _resolve_provider_key("GOOGLE_API_KEY", "gemini")
+    raw_gemini_config = tts_config.get("gemini") or {}
+    gemini_config = raw_gemini_config if isinstance(raw_gemini_config, dict) else {}
+    base_url = str(
+        gemini_config.get("base_url")
+        or get_env_value("GEMINI_BASE_URL")
+        or DEFAULT_GEMINI_TTS_BASE_URL
+    ).strip().rstrip("/")
+    api_key = select_audio_provider_key(
+        configured_key=gemini_config.get("api_key"),
+        resolve_fallback=lambda: _resolve_provider_key("GEMINI_API_KEY", "gemini")
+        or _resolve_provider_key("GOOGLE_API_KEY", "gemini"),
+        endpoint=base_url,
+        canonical_hosts=CANONICAL_AUDIO_HOSTS["gemini"],
+        allowed_schemes=frozenset({"https"}),
+        key_setting="tts.gemini.api_key",
+        endpoint_setting="tts.gemini.base_url",
     )
     if not api_key:
         raise ValueError(
             "GEMINI_API_KEY not set. Get one at https://aistudio.google.com/app/apikey"
         )
 
-    raw_gemini_config = tts_config.get("gemini") or {}
-    gemini_config = raw_gemini_config if isinstance(raw_gemini_config, dict) else {}
     model = str(gemini_config.get("model", DEFAULT_GEMINI_TTS_MODEL)).strip() or DEFAULT_GEMINI_TTS_MODEL
     voice = str(gemini_config.get("voice", DEFAULT_GEMINI_TTS_VOICE)).strip() or DEFAULT_GEMINI_TTS_VOICE
-    base_url = str(
-        gemini_config.get("base_url")
-        or get_env_value("GEMINI_BASE_URL")
-        or DEFAULT_GEMINI_TTS_BASE_URL
-    ).strip().rstrip("/")
-    # Never send the real Gemini cloud key (query-param ``key``) to a config-
-    # overridden private base_url; a config tts.gemini.api_key wins for
-    # self-hosted-with-auth.
-    api_key = _guard_provider_key(gemini_config.get("api_key"), api_key, base_url)
-    if not api_key:
-        raise ValueError(
-            "GEMINI_API_KEY not set. Get one at https://aistudio.google.com/app/apikey"
-        )
     persona_prompt = _read_gemini_persona_prompt(gemini_config)
     tts_script = text
     if _gemini_audio_tags_enabled(gemini_config, model):
@@ -3262,23 +3525,19 @@ def check_tts_requirements() -> bool:
             _import_elevenlabs()
         except ImportError:
             return False
-        return bool(_resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs"))
+        return _has_guarded_tts_credential(tts_config, "elevenlabs")
     if provider == "openai":
         try:
             _import_openai_client()
         except ImportError:
             return False
-        oai_cfg = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
-        if (oai_cfg.get("base_url") or "").strip() or (oai_cfg.get("api_key") or "").strip():
-            # Self-hosted / config-credentialed OpenAI-compatible server.
-            return True
-        return _has_openai_audio_backend()
+        return _has_guarded_tts_credential(tts_config, "openai")
     if provider == "deepinfra":
         try:
             _import_openai_client()
         except ImportError:
             return False
-        return bool(_resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra"))
+        return _has_guarded_tts_credential(tts_config, "deepinfra")
     if provider == "minimax":
         try:
             _resolve_minimax_tts_runtime(tts_config)
@@ -3286,23 +3545,15 @@ def check_tts_requirements() -> bool:
             return False
         return True
     if provider == "xai":
-        try:
-            from tools.xai_http import resolve_xai_http_credentials
-
-            return bool(resolve_xai_http_credentials().get("api_key"))
-        except Exception:
-            return False
+        return _has_guarded_tts_credential(tts_config, "xai")
     if provider == "gemini":
-        return bool(
-            _resolve_provider_key("GEMINI_API_KEY", "gemini")
-            or _resolve_provider_key("GOOGLE_API_KEY", "gemini")
-        )
+        return _has_guarded_tts_credential(tts_config, "gemini")
     if provider == "mistral":
         try:
             _import_mistral_client()
         except ImportError:
             return False
-        return bool(_resolve_provider_key("MISTRAL_API_KEY", "mistral"))
+        return _has_guarded_tts_credential(tts_config, "mistral")
     if provider == "neutts":
         return _check_neutts_available()
     if provider == "kittentts":
@@ -3337,14 +3588,24 @@ def _resolve_openai_audio_client_config() -> tuple[str, str, bool]:
     """
     tts_config = _load_tts_config()
     openai_cfg = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
+    if not isinstance(openai_cfg, dict):
+        openai_cfg = {}
     cfg_api_key = openai_cfg.get("api_key") or ""
     cfg_base_url = openai_cfg.get("base_url") or ""
-    if cfg_api_key and not prefers_gateway("tts"):
-        return cfg_api_key, (cfg_base_url or DEFAULT_OPENAI_BASE_URL), False
+    effective_base_url = cfg_base_url or DEFAULT_OPENAI_BASE_URL
 
-    direct_api_key = resolve_openai_audio_api_key()
-    if direct_api_key and not prefers_gateway("tts"):
-        return direct_api_key, (cfg_base_url or DEFAULT_OPENAI_BASE_URL), False
+    if not prefers_gateway("tts"):
+        direct_api_key = select_audio_provider_key(
+            configured_key=cfg_api_key,
+            resolve_fallback=resolve_openai_audio_api_key,
+            endpoint=effective_base_url,
+            canonical_hosts=CANONICAL_AUDIO_HOSTS["openai"],
+            allowed_schemes=frozenset({"https"}),
+            key_setting="tts.openai.api_key",
+            endpoint_setting="tts.openai.base_url",
+        )
+        if direct_api_key:
+            return direct_api_key, effective_base_url, False
 
     managed_gateway = resolve_managed_tool_gateway("openai-audio")
     if managed_gateway is None:

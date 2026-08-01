@@ -132,7 +132,12 @@ class TestTranscribeCallSitesReadDotenv:
         fake_openai_module.APIConnectionError = Exception
         fake_openai_module.APITimeoutError = Exception
 
-        with patch.object(tt, "get_env_value", return_value="groq-dotenv-key"), \
+        def fake_get_env_value(name, default=None):
+            if name == "GROQ_API_KEY":
+                return "groq-dotenv-key"
+            return default
+
+        with patch.object(tt, "get_env_value", side_effect=fake_get_env_value), \
              patch.object(tt, "_HAS_OPENAI", True), \
              patch.dict("sys.modules", {"openai": fake_openai_module}), \
              patch("builtins.open", MagicMock()):
@@ -164,11 +169,12 @@ class TestTranscribeCallSitesReadDotenv:
             return None
 
         with patch.object(tt, "get_env_value", side_effect=fake_get_env_value), \
-             patch.object(xai_http, "resolve_xai_http_credentials", return_value={
-                 "provider": "xai-oauth",
-                 "api_key": "subscription-oauth-token",
+             patch.object(xai_http, "resolve_xai_api_key_credentials", return_value={
+                 "provider": "xai",
+                 "api_key": "xai-dotenv-key",
                  "base_url": "https://api.x.ai/v1",
              }), \
+             patch.object(xai_http, "resolve_xai_oauth_credentials", return_value=None), \
              patch("requests.post", side_effect=fake_post), \
              patch("builtins.open", MagicMock()):
             result = tt._transcribe_xai("/tmp/fake.mp3", "grok-stt")

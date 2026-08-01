@@ -7,7 +7,9 @@ the chunked-streamer playback path, and the universal per-sentence sync fallback
 """
 
 import queue
+import sys
 import threading
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -138,7 +140,7 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
 
     monkeypatch.setattr(ts, "resolve_openai_audio_api_key", lambda: "env-key")
     monkeypatch.setattr(ts, "get_env_value", lambda key, *args: None)
-    monkeypatch.setattr("openai.OpenAI", _OpenAI)
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_OpenAI))
 
     config = {
         "provider": "openai",

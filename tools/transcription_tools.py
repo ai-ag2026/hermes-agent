@@ -45,6 +45,12 @@ from urllib.parse import urljoin
 from hermes_cli._subprocess_compat import windows_hide_flags
 from utils import is_truthy_value
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
+from tools.audio_key_guard import (
+    CANONICAL_AUDIO_HOSTS,
+    AudioEndpointCredentialPolicyError,
+    require_canonical_audio_endpoint,
+    select_audio_provider_key,
+)
 from tools.tool_backend_helpers import (
     managed_nous_tools_enabled,
     nous_tool_gateway_unavailable_message,
@@ -993,6 +999,163 @@ def _transcribe_command_stt(
     }
 
 
+def _stt_provider_section(stt_config: dict, provider: str) -> dict:
+    section = stt_config.get(provider) or {}
+    return section if isinstance(section, dict) else {}
+
+
+def _has_guarded_stt_credential(stt_config: dict, provider: str) -> bool:
+    """Return whether an STT cloud route is selectable under key provenance.
+
+    Auto-detection must not advertise a cloud provider solely because a broad
+    environment/pool credential exists when its configured endpoint requires
+    a provider-local key. The transport functions enforce the same rule; this
+    preflight avoids selecting a route that will immediately reject.
+    """
+    section = _stt_provider_section(stt_config, provider)
+
+    try:
+        if provider == "groq":
+            endpoint = str(
+                section.get("base_url")
+                or get_env_value("GROQ_BASE_URL")
+                or GROQ_BASE_URL
+            )
+            return bool(select_audio_provider_key(
+                configured_key=section.get("api_key"),
+                resolve_fallback=lambda: _resolve_provider_key("GROQ_API_KEY", "groq"),
+                endpoint=endpoint,
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["groq"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="stt.groq.base_url or GROQ_BASE_URL",
+                key_setting="stt.groq.api_key",
+            ))
+
+        if provider == "openai":
+            endpoint = str(section.get("base_url") or OPENAI_BASE_URL)
+            direct_key = select_audio_provider_key(
+                configured_key=section.get("api_key"),
+                resolve_fallback=resolve_openai_audio_api_key,
+                endpoint=endpoint,
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["openai"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="stt.openai.base_url",
+                key_setting="stt.openai.api_key",
+            )
+            return bool(direct_key or resolve_managed_tool_gateway("openai-audio"))
+
+        if provider == "xai":
+            configured_key = section.get("api_key")
+            if str(configured_key or "").strip():
+                return True
+            direct_endpoint = str(
+                section.get("base_url")
+                or get_env_value("XAI_STT_BASE_URL")
+                or get_env_value("XAI_BASE_URL")
+                or XAI_STT_BASE_URL
+            )
+            from tools.xai_http import (
+                resolve_xai_api_key_credentials,
+                resolve_xai_oauth_credentials,
+            )
+
+            try:
+                require_canonical_audio_endpoint(
+                    direct_endpoint,
+                    CANONICAL_AUDIO_HOSTS["xai"],
+                    frozenset({"https"}),
+                    endpoint_setting="stt.xai.base_url, XAI_STT_BASE_URL, or XAI_BASE_URL",
+                    key_setting="stt.xai.api_key",
+                )
+            except AudioEndpointCredentialPolicyError:
+                # OAuth is pinned to its own auth-validated origin and does
+                # not inherit a direct STT endpoint override.
+                oauth_creds = resolve_xai_oauth_credentials()
+                if oauth_creds is None:
+                    return False
+                oauth_endpoint = str(
+                    oauth_creds.get("base_url") or XAI_STT_BASE_URL
+                ).strip().rstrip("/")
+                return bool(select_audio_provider_key(
+                    configured_key=None,
+                    resolve_fallback=lambda: str(oauth_creds.get("api_key") or "").strip(),
+                    endpoint=oauth_endpoint,
+                    canonical_hosts=CANONICAL_AUDIO_HOSTS["xai"],
+                    allowed_schemes=frozenset({"https"}),
+                    endpoint_setting="xAI OAuth resolver base URL",
+                    key_setting="stt.xai.api_key",
+                ))
+
+            # Mirror STT transport precedence at canonical endpoints: the
+            # complete direct resolver (profile scope, env/.env, then pool)
+            # wins for API billing before OAuth is considered.
+            direct_creds = resolve_xai_api_key_credentials()
+            direct_key = select_audio_provider_key(
+                configured_key=None,
+                resolve_fallback=lambda: str(direct_creds.get("api_key") or "").strip(),
+                endpoint=direct_endpoint,
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["xai"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="stt.xai.base_url, XAI_STT_BASE_URL, or XAI_BASE_URL",
+                key_setting="stt.xai.api_key",
+            )
+            if direct_key:
+                return True
+            oauth_creds = resolve_xai_oauth_credentials()
+            if oauth_creds is not None:
+                oauth_endpoint = str(
+                    oauth_creds.get("base_url") or XAI_STT_BASE_URL
+                ).strip().rstrip("/")
+                return bool(select_audio_provider_key(
+                    configured_key=None,
+                    resolve_fallback=lambda: str(oauth_creds.get("api_key") or "").strip(),
+                    endpoint=oauth_endpoint,
+                    canonical_hosts=CANONICAL_AUDIO_HOSTS["xai"],
+                    allowed_schemes=frozenset({"https"}),
+                    endpoint_setting="xAI OAuth resolver base URL",
+                    key_setting="stt.xai.api_key",
+                ))
+            return False
+
+        if provider == "elevenlabs":
+            endpoint = str(
+                section.get("base_url")
+                or get_env_value("ELEVENLABS_STT_BASE_URL")
+                or ELEVENLABS_STT_BASE_URL
+            )
+            return bool(select_audio_provider_key(
+                configured_key=section.get("api_key"),
+                resolve_fallback=lambda: _resolve_provider_key(
+                    "ELEVENLABS_API_KEY", "elevenlabs"
+                ),
+                endpoint=endpoint,
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["elevenlabs"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="stt.elevenlabs.base_url or ELEVENLABS_STT_BASE_URL",
+                key_setting="stt.elevenlabs.api_key",
+            ))
+
+        if provider == "deepinfra":
+            from hermes_cli.models import deepinfra_base_url
+
+            endpoint = deepinfra_base_url(section)
+            return bool(select_audio_provider_key(
+                configured_key=section.get("api_key"),
+                resolve_fallback=lambda: _resolve_provider_key(
+                    "DEEPINFRA_API_KEY", "deepinfra"
+                ),
+                endpoint=endpoint,
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["deepinfra"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="stt.deepinfra.base_url",
+                key_setting="stt.deepinfra.api_key",
+            ))
+    except Exception:
+        return False
+
+    return False
+
+
 def _get_provider(stt_config: dict) -> str:
     """Determine which STT provider to use.
 
@@ -1035,7 +1198,7 @@ def _get_provider(stt_config: dict) -> str:
             return "none"
 
         if provider == "groq":
-            if _HAS_OPENAI and _resolve_provider_key("GROQ_API_KEY", "groq"):
+            if _HAS_OPENAI and _has_guarded_stt_credential(stt_config, "groq"):
                 return "groq"
             logger.warning(
                 "STT provider 'groq' configured but GROQ_API_KEY not set"
@@ -1043,7 +1206,7 @@ def _get_provider(stt_config: dict) -> str:
             return "none"
 
         if provider == "openai":
-            if _HAS_OPENAI and _has_openai_audio_backend():
+            if _HAS_OPENAI and _has_guarded_stt_credential(stt_config, "openai"):
                 return "openai"
             logger.warning(
                 "STT provider 'openai' configured but no API key available"
@@ -1060,9 +1223,7 @@ def _get_provider(stt_config: dict) -> str:
             return "none"
 
         if provider == "xai":
-            from tools.xai_http import resolve_xai_http_credentials
-
-            if resolve_xai_http_credentials().get("api_key"):
+            if _has_guarded_stt_credential(stt_config, "xai"):
                 return "xai"
             logger.warning(
                 "STT provider 'xai' configured but no xAI credentials are available"
@@ -1070,7 +1231,7 @@ def _get_provider(stt_config: dict) -> str:
             return "none"
 
         if provider == "elevenlabs":
-            if _resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs"):
+            if _has_guarded_stt_credential(stt_config, "elevenlabs"):
                 return "elevenlabs"
             logger.warning(
                 "STT provider 'elevenlabs' configured but ELEVENLABS_API_KEY not set"
@@ -1078,7 +1239,7 @@ def _get_provider(stt_config: dict) -> str:
             return "none"
 
         if provider == "deepinfra":
-            if _HAS_OPENAI and _resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra"):
+            if _HAS_OPENAI and _has_guarded_stt_credential(stt_config, "deepinfra"):
                 return "deepinfra"
             logger.warning(
                 "STT provider 'deepinfra' configured but DEEPINFRA_API_KEY not set "
@@ -1103,10 +1264,10 @@ def _get_provider(stt_config: dict) -> str:
     # Try lazy-install before falling through to cloud providers
     if _try_lazy_install_stt():
         return "local"
-    if _HAS_OPENAI and _resolve_provider_key("GROQ_API_KEY", "groq"):
+    if _HAS_OPENAI and _has_guarded_stt_credential(stt_config, "groq"):
         logger.info("No local STT available, using Groq Whisper API")
         return "groq"
-    if _HAS_OPENAI and _has_openai_audio_backend():
+    if _HAS_OPENAI and _has_guarded_stt_credential(stt_config, "openai"):
         logger.info("No local STT available, using OpenAI Whisper API")
         return "openai"
     # Only auto-select Mistral if the SDK is already present — don't trigger a
@@ -1115,18 +1276,13 @@ def _get_provider(stt_config: dict) -> str:
     if _HAS_MISTRAL and _resolve_provider_key("MISTRAL_API_KEY", "mistral"):
         logger.info("No local STT available, using Mistral Voxtral Transcribe API")
         return "mistral"
-    try:
-        from tools.xai_http import resolve_xai_http_credentials
-
-        if resolve_xai_http_credentials().get("api_key"):
-            logger.info("No local STT available, using xAI Grok STT API")
-            return "xai"
-    except Exception:
-        pass
-    if _resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs"):
+    if _has_guarded_stt_credential(stt_config, "xai"):
+        logger.info("No local STT available, using xAI Grok STT API")
+        return "xai"
+    if _has_guarded_stt_credential(stt_config, "elevenlabs"):
         logger.info("No local STT available, using ElevenLabs Scribe STT API")
         return "elevenlabs"
-    if _HAS_OPENAI and _resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra"):
+    if _HAS_OPENAI and _has_guarded_stt_credential(stt_config, "deepinfra"):
         logger.info("No local STT available, using DeepInfra Whisper API")
         return "deepinfra"
     return "none"
@@ -1847,7 +2003,25 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
     ``HERMES_LOCAL_STT_LANGUAGE`` (env). When none is set, Groq
     Whisper auto-detects.
     """
-    api_key = _resolve_provider_key("GROQ_API_KEY", "groq")
+    stt_config = _load_stt_config()
+    groq_config = stt_config.get("groq") or {}
+    base_url = str(
+        groq_config.get("base_url")
+        or get_env_value("GROQ_BASE_URL")
+        or GROQ_BASE_URL
+    ).strip()
+    try:
+        api_key = select_audio_provider_key(
+            configured_key=groq_config.get("api_key"),
+            resolve_fallback=lambda: _resolve_provider_key("GROQ_API_KEY", "groq"),
+            endpoint=base_url,
+            canonical_hosts=CANONICAL_AUDIO_HOSTS["groq"],
+            allowed_schemes=frozenset({"https"}),
+            key_setting="stt.groq.api_key",
+            endpoint_setting="stt.groq.base_url or GROQ_BASE_URL",
+        )
+    except AudioEndpointCredentialPolicyError as exc:
+        return {"success": False, "transcript": "", "error": str(exc)}
     if not api_key:
         return {"success": False, "transcript": "", "error": "GROQ_API_KEY not set"}
 
@@ -1863,7 +2037,7 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
 
     try:
         from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
-        client = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=30, max_retries=0)
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
         try:
             create_kwargs = {
                 "model": model_name,
@@ -2183,33 +2357,59 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
     Supports Inverse Text Normalization, diarization, and word-level timestamps.
     Requires ``XAI_API_KEY`` environment variable.
     """
-    from tools.xai_http import resolve_xai_http_credentials
-
-    # STT is an API-billed endpoint. Prefer the explicit XAI_API_KEY over the
-    # general xAI OAuth/Grok-subscription credential; subscription OAuth may be
-    # valid for Grok while returning personal-team spending-limit errors for
-    # /v1/stt. Other xAI integrations keep their existing resolver precedence.
-    direct_api_key = str(get_env_value("XAI_API_KEY") or "").strip()
-    if direct_api_key:
-        creds = {
-            "provider": "xai",
-            "api_key": direct_api_key,
-            "base_url": str(
-                get_env_value("XAI_BASE_URL") or "https://api.x.ai/v1"
-            ).strip().rstrip("/"),
-        }
-    else:
-        creds = resolve_xai_http_credentials()
-    api_key = str(creds.get("api_key") or "").strip()
-    if not api_key:
-        return {
-            "success": False,
-            "transcript": "",
-            "error": "No xAI credentials found. Configure xAI OAuth in `hermes model` or set XAI_API_KEY",
-        }
+    from tools.xai_http import (
+        resolve_xai_api_key_credentials,
+        resolve_xai_http_credentials,
+        resolve_xai_oauth_credentials,
+    )
 
     stt_config = _load_stt_config()
     xai_config = stt_config.get("xai") or {}
+    if not isinstance(xai_config, dict):
+        xai_config = {}
+    configured_api_key = xai_config.get("api_key")
+    configured_base_url = str(
+        xai_config.get("base_url")
+        or get_env_value("XAI_STT_BASE_URL")
+        or get_env_value("XAI_BASE_URL")
+        or XAI_STT_BASE_URL
+    ).strip().rstrip("/")
+
+    # A provider-local config key deliberately owns a custom endpoint. STT
+    # normally gives a raw API key precedence over OAuth for billing semantics,
+    # but a custom direct endpoint must never trigger that broad lookup. OAuth
+    # owns a separately validated canonical origin and may safely ignore the
+    # direct-HTTP override.
+    if str(configured_api_key or "").strip():
+        creds = {
+            "provider": "xai",
+            "api_key": str(configured_api_key).strip(),
+            "base_url": configured_base_url,
+        }
+    else:
+        try:
+            require_canonical_audio_endpoint(
+                configured_base_url,
+                CANONICAL_AUDIO_HOSTS["xai"],
+                frozenset({"https"}),
+                endpoint_setting="stt.xai.base_url, XAI_STT_BASE_URL, or XAI_BASE_URL",
+                key_setting="stt.xai.api_key",
+            )
+        except AudioEndpointCredentialPolicyError as policy_error:
+            oauth_creds = resolve_xai_oauth_credentials()
+            if oauth_creds is None:
+                return {"success": False, "transcript": "", "error": str(policy_error)}
+            creds = oauth_creds
+        else:
+            # STT is API-billed: direct API credentials win before
+            # subscription OAuth, including profile-scope and pool-backed
+            # keys resolved by the direct resolver.
+            direct_creds = resolve_xai_api_key_credentials()
+            if str(direct_creds.get("api_key") or "").strip():
+                creds = direct_creds
+            else:
+                oauth_creds = resolve_xai_oauth_credentials()
+                creds = oauth_creds or direct_creds
 
     def _resolve_base_url(resolved_creds: Dict[str, str]) -> str:
         # OAuth bearers are pinned to the resolver-validated xAI origin;
@@ -2218,21 +2418,27 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
             return str(
                 resolved_creds.get("base_url") or XAI_STT_BASE_URL
             ).strip().rstrip("/")
-        return str(
-            xai_config.get("base_url")
-            or get_env_value("XAI_STT_BASE_URL")
-            or resolved_creds.get("base_url")
-            or XAI_STT_BASE_URL
-        ).strip().rstrip("/")
+        return configured_base_url
 
     base_url = _resolve_base_url(creds)
-    # fork(tars): nie den echten xAI-Cloud-Key an eine per Config gesetzte
-    # private/LAN-base_url schicken; stt.xai.api_key gewinnt für
-    # selbst-gehostet-mit-Auth. UPSTREAM-KANDIDAT.
-    api_key = _guard_provider_key(xai_config.get("api_key"), api_key, base_url)
+    try:
+        api_key = select_audio_provider_key(
+            configured_key=configured_api_key,
+            resolve_fallback=lambda: str(creds.get("api_key") or "").strip(),
+            endpoint=base_url,
+            canonical_hosts=CANONICAL_AUDIO_HOSTS["xai"],
+            allowed_schemes=frozenset({"https"}),
+            key_setting="stt.xai.api_key",
+            endpoint_setting="stt.xai.base_url, XAI_STT_BASE_URL, or XAI_BASE_URL",
+        )
+    except AudioEndpointCredentialPolicyError as exc:
+        return {"success": False, "transcript": "", "error": str(exc)}
     if not api_key:
-        return {"success": False, "transcript": "",
-                "error": "No xAI credentials found. Configure xAI OAuth in `hermes model` or set XAI_API_KEY"}
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "No xAI credentials found. Configure xAI OAuth in `hermes model` or set XAI_API_KEY",
+        }
     language = _resolve_stt_language("xai", stt_config) or ""
     # .get("format", True) already defaults to True when the key is absent;
     # is_truthy_value only normalizes truthy/falsy strings from config.
@@ -2282,11 +2488,18 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
                     api_key_hint=api_key,
                 )
                 refreshed_key = str(refreshed_creds.get("api_key") or "").strip()
+                refreshed_base_url = _resolve_base_url(refreshed_creds)
+                refreshed_key = select_audio_provider_key(
+                    configured_key=None,
+                    resolve_fallback=lambda: refreshed_key,
+                    endpoint=refreshed_base_url,
+                    canonical_hosts=CANONICAL_AUDIO_HOSTS["xai"],
+                    allowed_schemes=frozenset({"https"}),
+                    key_setting="stt.xai.api_key",
+                    endpoint_setting="xAI OAuth resolver base URL",
+                )
                 if refreshed_key and refreshed_key != api_key:
-                    response = _post_transcription(
-                        refreshed_key,
-                        _resolve_base_url(refreshed_creds),
-                    )
+                    response = _post_transcription(refreshed_key, refreshed_base_url)
             except Exception as retry_exc:
                 logger.warning(
                     "xAI STT OAuth refresh-and-retry after HTTP %d failed: %s",
@@ -2342,20 +2555,29 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 
 def _transcribe_elevenlabs(file_path: str, model_name: str) -> Dict[str, Any]:
     """Transcribe using ElevenLabs Scribe STT API."""
-    api_key = _resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs")
-    if not api_key:
-        return {"success": False, "transcript": "", "error": "ELEVENLABS_API_KEY not set"}
-
     stt_config = _load_stt_config()
     elevenlabs_config = stt_config.get("elevenlabs") or {}
+    if not isinstance(elevenlabs_config, dict):
+        elevenlabs_config = {}
     base_url = str(
         elevenlabs_config.get("base_url")
         or get_env_value("ELEVENLABS_STT_BASE_URL")
         or ELEVENLABS_STT_BASE_URL
     ).strip().rstrip("/")
-    # fork(tars): nie den echten ElevenLabs-Cloud-Key an eine per Config
-    # gesetzte private base_url; stt.elevenlabs.api_key gewinnt.
-    api_key = _guard_provider_key(elevenlabs_config.get("api_key"), api_key, base_url)
+    try:
+        api_key = select_audio_provider_key(
+            configured_key=elevenlabs_config.get("api_key"),
+            resolve_fallback=lambda: _resolve_provider_key(
+                "ELEVENLABS_API_KEY", "elevenlabs"
+            ),
+            endpoint=base_url,
+            canonical_hosts=CANONICAL_AUDIO_HOSTS["elevenlabs"],
+            allowed_schemes=frozenset({"https"}),
+            key_setting="stt.elevenlabs.api_key",
+            endpoint_setting="stt.elevenlabs.base_url or ELEVENLABS_STT_BASE_URL",
+        )
+    except AudioEndpointCredentialPolicyError as exc:
+        return {"success": False, "transcript": "", "error": str(exc)}
     if not api_key:
         return {"success": False, "transcript": "", "error": "ELEVENLABS_API_KEY not set"}
     language_code = _resolve_stt_language(
@@ -2443,10 +2665,6 @@ def _transcribe_deepinfra(file_path: str, model_name: str) -> Dict[str, Any]:
     ``hermes_cli.models`` helpers so every DeepInfra surface resolves the
     base URL and model ids identically.
     """
-    api_key = _resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra")
-    if not api_key:
-        return {"success": False, "transcript": "", "error": "DEEPINFRA_API_KEY not set"}
-
     from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
 
     stt_config = _load_stt_config()
@@ -2457,9 +2675,22 @@ def _transcribe_deepinfra(file_path: str, model_name: str) -> Dict[str, Any]:
     if not isinstance(di_config, dict):
         di_config = {}
     base_url = deepinfra_base_url(di_config)
-    # Never send the real DeepInfra cloud key to a config-overridden private
-    # base_url; a config stt.deepinfra.api_key wins for self-hosted-with-auth.
-    api_key = _guard_provider_key(di_config.get("api_key"), api_key, base_url)
+    try:
+        api_key = select_audio_provider_key(
+            configured_key=di_config.get("api_key"),
+            resolve_fallback=lambda: _resolve_provider_key(
+                "DEEPINFRA_API_KEY", "deepinfra"
+            ),
+            endpoint=base_url,
+            canonical_hosts=CANONICAL_AUDIO_HOSTS["deepinfra"],
+            allowed_schemes=frozenset({"https"}),
+            key_setting="stt.deepinfra.api_key",
+            endpoint_setting="stt.deepinfra.base_url or DEEPINFRA_BASE_URL",
+        )
+    except AudioEndpointCredentialPolicyError as exc:
+        return {"success": False, "transcript": "", "error": str(exc)}
+    if not api_key:
+        return {"success": False, "transcript": "", "error": "DEEPINFRA_API_KEY not set"}
 
     if not model_name:
         candidates = deepinfra_model_ids("stt")
@@ -2718,31 +2949,6 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
-def _is_local_or_private_url(url: str) -> bool:
-    """True when *url* points at a loopback/RFC-1918/LAN-internal host.
-
-    Used to decide whether an empty ``stt.openai.api_key`` is acceptable:
-    local OpenAI-compatible STT servers (faster-whisper-server, speaches,
-    vLLM whisper variants...) ignore the auth header, so users shouldn't
-    have to write a sham ``api_key: not-needed`` in config.yaml.
-    """
-    try:
-        from urllib.parse import urlparse
-        import ipaddress
-
-        host = (urlparse(url).hostname or "").lower()
-        if not host:
-            return False
-        if host == "localhost" or host.endswith((".local", ".lan", ".internal")):
-            return True
-        try:
-            return ipaddress.ip_address(host).is_private or ipaddress.ip_address(host).is_loopback
-        except ValueError:
-            return False
-    except Exception:
-        return False
-
-
 def transcribe_audio_local_fallback(
     file_path: str,
     model: Optional[str] = None,
@@ -2780,45 +2986,23 @@ def transcribe_audio_local_fallback(
 
 
 def _resolve_openai_audio_client_config() -> tuple[str, str]:
-    """Return direct OpenAI audio config or a managed gateway fallback.
-
-    A configured ``stt.openai.base_url`` points at a self-hosted or otherwise
-    OpenAI-compatible transcription server and is authoritative: it is honoured
-    regardless of where the API key is resolved from. Env keys
-    (``VOICE_TOOLS_OPENAI_KEY`` / ``OPENAI_API_KEY``) are commonly set for
-    *chat* against ``api.openai.com``; without this, a config that only sets
-    ``base_url`` would silently send self-hosted STT traffic to OpenAI with an
-    unrelated key. Self-hosted servers frequently need no auth, so a configured
-    ``base_url`` also makes the key optional (a placeholder Bearer is sent).
-
-    Env keys are only attached to non-private https targets: a private or
-    http base_url gets the config key or the placeholder, never an env key —
-    otherwise a real OpenAI key would be sent (in cleartext, for http) to a
-    LAN server it was not issued for.
-    """
+    """Return direct OpenAI audio config or a managed gateway fallback."""
     stt_config = _load_stt_config()
     openai_cfg = stt_config.get("openai") or {}
-    cfg_api_key = openai_cfg.get("api_key", "")
-    cfg_base_url = openai_cfg.get("base_url", "")
-    if cfg_base_url:
-        if cfg_api_key:
-            api_key = cfg_api_key
-        elif _base_url_is_private(cfg_base_url):
-            api_key = _PLACEHOLDER_OPENAI_KEY
-        else:
-            # Öffentliches Ziel: hier KEIN Platzhalter. Ein erfundener Bearer
-            # an einen echten Anbieter liefert nur ein 401, das niemand
-            # zuordnen kann — fehlt der Schlüssel, soll der Aufruf unten
-            # sauber scheitern (upstream #25193 prüft genau das).
-            api_key = resolve_openai_audio_api_key()
-        if api_key:
-            return api_key, cfg_base_url
-    if cfg_api_key:
-        return cfg_api_key, OPENAI_BASE_URL
-
-    direct_api_key = resolve_openai_audio_api_key()
+    if not isinstance(openai_cfg, dict):
+        openai_cfg = {}
+    base_url = str(openai_cfg.get("base_url") or OPENAI_BASE_URL).strip()
+    direct_api_key = select_audio_provider_key(
+        configured_key=openai_cfg.get("api_key"),
+        resolve_fallback=resolve_openai_audio_api_key,
+        endpoint=base_url,
+        canonical_hosts=CANONICAL_AUDIO_HOSTS["openai"],
+        allowed_schemes=frozenset({"https"}),
+        key_setting="stt.openai.api_key",
+        endpoint_setting="stt.openai.base_url or OPENAI_BASE_URL",
+    )
     if direct_api_key:
-        return direct_api_key, OPENAI_BASE_URL
+        return direct_api_key, base_url
 
     managed_gateway = resolve_managed_tool_gateway("openai-audio")
     if managed_gateway is None:

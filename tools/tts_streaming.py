@@ -27,6 +27,12 @@ import time
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterator, List, Optional
 
+from tools.audio_key_guard import (
+    CANONICAL_AUDIO_HOSTS,
+    AudioEndpointCredentialPolicyError,
+    require_canonical_audio_endpoint,
+    select_audio_provider_key,
+)
 from tools.tool_backend_helpers import resolve_openai_audio_api_key
 from tools.tts_tool import _get_provider, _load_tts_config, get_env_value
 
@@ -148,6 +154,14 @@ class StreamingTTSProvider(ABC):
     def stream(self, text: str) -> Iterator[bytes]:
         """Yield PCM chunks for ``text``. Raise on failure (caller logs)."""
 
+    def is_available(self) -> bool:
+        """Config-aware availability used by the dispatcher.
+
+        Subclasses with configurable endpoints override this so auto-selection
+        cannot resolve a broad fallback credential for a noncanonical route.
+        """
+        return self.available()
+
 
 _REGISTRY: Dict[str, type[StreamingTTSProvider]] = {}
 
@@ -163,10 +177,11 @@ def register(name: str) -> Callable[[type[StreamingTTSProvider]], type[Streaming
 def _try_instantiate(name: str, tts_config: Dict) -> Optional[StreamingTTSProvider]:
     """Construct the registered streamer *name* if it's usable, else None."""
     cls = _REGISTRY.get(name)
-    if cls is None or not cls.available():
+    if cls is None:
         return None
     try:
-        return cls(tts_config, tts_config.get(name) or {})
+        provider = cls(tts_config, tts_config.get(name) or {})
+        return provider if provider.is_available() else None
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("streaming provider %s init failed: %s", name, exc)
         return None
@@ -227,6 +242,34 @@ class ElevenLabsStreamer(StreamingTTSProvider):
     def available() -> bool:
         return bool(_resolve_key("ELEVENLABS_API_KEY", "elevenlabs"))
 
+    def is_available(self) -> bool:
+        section = self.section if isinstance(self.section, dict) else {}
+        base_url = str(section.get("base_url") or "").strip().rstrip("/") or "https://api.elevenlabs.io"
+        wss_url = str(section.get("wss_url") or "").strip().rstrip("/") or re.sub(
+            r"^https://", "wss://", base_url, count=1
+        )
+        configured_api_key = section.get("api_key")
+        try:
+            if not str(configured_api_key or "").strip():
+                require_canonical_audio_endpoint(
+                    wss_url,
+                    CANONICAL_AUDIO_HOSTS["elevenlabs"],
+                    frozenset({"wss"}),
+                    endpoint_setting="tts.elevenlabs.wss_url",
+                    key_setting="tts.elevenlabs.api_key",
+                )
+            return bool(select_audio_provider_key(
+                configured_key=configured_api_key,
+                resolve_fallback=lambda: _resolve_key("ELEVENLABS_API_KEY", "elevenlabs"),
+                endpoint=base_url,
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["elevenlabs"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="tts.elevenlabs.base_url",
+                key_setting="tts.elevenlabs.api_key",
+            ))
+        except AudioEndpointCredentialPolicyError:
+            return False
+
     def stream(self, text: str) -> Iterator[bytes]:
         from tools.tts_tool import (
             DEFAULT_ELEVENLABS_STREAMING_MODEL_ID,
@@ -235,12 +278,38 @@ class ElevenLabsStreamer(StreamingTTSProvider):
             _import_elevenlabs,
         )
 
-        client = _import_elevenlabs()(
-            api_key=_resolve_key("ELEVENLABS_API_KEY", "elevenlabs"),
-            **_elevenlabs_environment_kwargs(self.section),
+        section = self.section if isinstance(self.section, dict) else {}
+        configured_base_url = str(section.get("base_url") or "").strip().rstrip("/")
+        configured_wss_url = str(section.get("wss_url") or "").strip().rstrip("/")
+        base_url = configured_base_url or "https://api.elevenlabs.io"
+        wss_url = configured_wss_url or re.sub(r"^https://", "wss://", base_url, count=1)
+        configured_api_key = section.get("api_key")
+        if not str(configured_api_key or "").strip():
+            require_canonical_audio_endpoint(
+                wss_url,
+                CANONICAL_AUDIO_HOSTS["elevenlabs"],
+                frozenset({"wss"}),
+                endpoint_setting="tts.elevenlabs.wss_url",
+                key_setting="tts.elevenlabs.api_key",
+            )
+        api_key = select_audio_provider_key(
+            configured_key=configured_api_key,
+            resolve_fallback=lambda: _resolve_key("ELEVENLABS_API_KEY", "elevenlabs"),
+            endpoint=base_url,
+            canonical_hosts=CANONICAL_AUDIO_HOSTS["elevenlabs"],
+            allowed_schemes=frozenset({"https"}),
+            endpoint_setting="tts.elevenlabs.base_url",
+            key_setting="tts.elevenlabs.api_key",
         )
-        voice_id = self.section.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
-        model_id = self.section.get(
+        if not api_key:
+            raise ValueError("ELEVENLABS_API_KEY not set. Get one at https://elevenlabs.io/")
+
+        client = _import_elevenlabs()(
+            api_key=api_key,
+            **_elevenlabs_environment_kwargs(section),
+        )
+        voice_id = section.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
+        model_id = section.get(
             "streaming_model_id",
             self.section.get("model_id", DEFAULT_ELEVENLABS_STREAMING_MODEL_ID),
         )
@@ -271,19 +340,48 @@ class OpenAIStreamer(StreamingTTSProvider):
     def available() -> bool:
         return bool(_openai_config_api_key() or resolve_openai_audio_api_key())
 
+    def is_available(self) -> bool:
+        section = self.section if isinstance(self.section, dict) else {}
+        configured_base_url = str(section.get("base_url") or "").strip()
+        env_base_url = str(get_env_value("OPENAI_BASE_URL") or "").strip()
+        try:
+            return bool(select_audio_provider_key(
+                configured_key=section.get("api_key"),
+                resolve_fallback=resolve_openai_audio_api_key,
+                endpoint=configured_base_url or env_base_url or "https://api.openai.com/v1",
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["openai"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="tts.openai.base_url",
+                key_setting="tts.openai.api_key",
+            ))
+        except AudioEndpointCredentialPolicyError:
+            return False
+
     def stream(self, text: str) -> Iterator[bytes]:
+        section = self.section if isinstance(self.section, dict) else {}
+        configured_base_url = str(section.get("base_url") or "").strip()
+        env_base_url = str(get_env_value("OPENAI_BASE_URL") or "").strip()
+        effective_base_url = configured_base_url or env_base_url or "https://api.openai.com/v1"
+        api_key = select_audio_provider_key(
+            configured_key=section.get("api_key"),
+            resolve_fallback=resolve_openai_audio_api_key,
+            endpoint=effective_base_url,
+            canonical_hosts=CANONICAL_AUDIO_HOSTS["openai"],
+            allowed_schemes=frozenset({"https"}),
+            endpoint_setting="tts.openai.base_url",
+            key_setting="tts.openai.api_key",
+        )
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY not set. Run `hermes setup` to configure it.")
+
         from openai import OpenAI
 
         client = OpenAI(
-            api_key=(self.section.get("api_key") or resolve_openai_audio_api_key()),
-            base_url=(
-                self.section.get("base_url")
-                or get_env_value("OPENAI_BASE_URL")
-                or None
-            ),
+            api_key=api_key,
+            base_url=configured_base_url or env_base_url or None,
         )
-        model = self.section.get("model", "gpt-4o-mini-tts")
-        voice = self.section.get("voice", "alloy")
+        model = section.get("model", "gpt-4o-mini-tts")
+        voice = section.get("voice", "alloy")
         with client.audio.speech.with_streaming_response.create(
             model=model,
             voice=voice,
@@ -328,6 +426,29 @@ class GeminiStreamer(StreamingTTSProvider):
             or _resolve_key("GOOGLE_API_KEY", "gemini")
         )
 
+    def is_available(self) -> bool:
+        section = self.section if isinstance(self.section, dict) else {}
+        from tools.tts_tool import DEFAULT_GEMINI_TTS_BASE_URL
+
+        base_url = str(
+            section.get("base_url")
+            or get_env_value("GEMINI_BASE_URL")
+            or DEFAULT_GEMINI_TTS_BASE_URL
+        ).strip().rstrip("/")
+        try:
+            return bool(select_audio_provider_key(
+                configured_key=section.get("api_key"),
+                resolve_fallback=lambda: _resolve_key("GEMINI_API_KEY", "gemini")
+                or _resolve_key("GOOGLE_API_KEY", "gemini"),
+                endpoint=base_url,
+                canonical_hosts=CANONICAL_AUDIO_HOSTS["gemini"],
+                allowed_schemes=frozenset({"https"}),
+                endpoint_setting="tts.gemini.base_url",
+                key_setting="tts.gemini.api_key",
+            ))
+        except AudioEndpointCredentialPolicyError:
+            return False
+
     def stream(self, text: str) -> Iterator[bytes]:
         import base64
         import json as _json
@@ -340,17 +461,27 @@ class GeminiStreamer(StreamingTTSProvider):
             DEFAULT_GEMINI_TTS_VOICE,
         )
 
-        api_key = (
-            _resolve_key("GEMINI_API_KEY", "gemini")
-            or _resolve_key("GOOGLE_API_KEY", "gemini")
-        )
-        model = str(self.section.get("model", DEFAULT_GEMINI_TTS_MODEL)).strip() or DEFAULT_GEMINI_TTS_MODEL
-        voice = str(self.section.get("voice", DEFAULT_GEMINI_TTS_VOICE)).strip() or DEFAULT_GEMINI_TTS_VOICE
+        section = self.section if isinstance(self.section, dict) else {}
         base_url = str(
-            self.section.get("base_url")
+            section.get("base_url")
             or get_env_value("GEMINI_BASE_URL")
             or DEFAULT_GEMINI_TTS_BASE_URL
         ).strip().rstrip("/")
+        api_key = select_audio_provider_key(
+            configured_key=section.get("api_key"),
+            resolve_fallback=lambda: _resolve_key("GEMINI_API_KEY", "gemini")
+            or _resolve_key("GOOGLE_API_KEY", "gemini"),
+            endpoint=base_url,
+            canonical_hosts=CANONICAL_AUDIO_HOSTS["gemini"],
+            allowed_schemes=frozenset({"https"}),
+            endpoint_setting="tts.gemini.base_url",
+            key_setting="tts.gemini.api_key",
+        )
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY not set. Get one at https://aistudio.google.com/app/apikey")
+
+        model = str(section.get("model", DEFAULT_GEMINI_TTS_MODEL)).strip() or DEFAULT_GEMINI_TTS_MODEL
+        voice = str(section.get("voice", DEFAULT_GEMINI_TTS_VOICE)).strip() or DEFAULT_GEMINI_TTS_VOICE
 
         payload = {
             "contents": [{"parts": [{"text": text}]}],
@@ -421,6 +552,28 @@ class XAIStreamer(StreamingTTSProvider):
         except Exception:
             return False
 
+    def is_available(self) -> bool:
+        section = self.section if isinstance(self.section, dict) else {}
+        configured_api_key = section.get("api_key")
+        if str(configured_api_key or "").strip():
+            return True
+        ws_url = str(section.get("streaming_url") or "wss://api.x.ai/v1/tts").strip()
+        try:
+            require_canonical_audio_endpoint(
+                ws_url,
+                CANONICAL_AUDIO_HOSTS["xai"],
+                frozenset({"wss"}),
+                endpoint_setting="tts.xai.streaming_url",
+                key_setting="tts.xai.api_key",
+            )
+            from tools.xai_http import resolve_xai_http_credentials
+
+            return bool(str(resolve_xai_http_credentials().get("api_key") or "").strip())
+        except AudioEndpointCredentialPolicyError:
+            return False
+        except Exception:
+            return False
+
     def stream(self, text: str) -> Iterator[bytes]:
         yield from _capped(iter(self._collect_async(text)), "xAI streaming TTS")
 
@@ -440,20 +593,44 @@ class XAIStreamer(StreamingTTSProvider):
     async def _async_frames(self, text: str):
         import json as _json
 
-        import websockets
-
         from tools.tts_tool import DEFAULT_XAI_VOICE_ID
-        from tools.xai_http import resolve_xai_http_credentials
 
-        creds = resolve_xai_http_credentials()
-        api_key = str(creds.get("api_key") or "").strip()
+        section = self.section if isinstance(self.section, dict) else {}
+        voice = str(section.get("voice_id", DEFAULT_XAI_VOICE_ID)).strip() or DEFAULT_XAI_VOICE_ID
+        ws_url = str(
+            section.get("streaming_url") or "wss://api.x.ai/v1/tts"
+        ).strip()
+        configured_api_key = section.get("api_key")
+        if str(configured_api_key or "").strip():
+            fallback_key = ""
+        else:
+            # Check before the OAuth/API-key resolver so a custom WebSocket
+            # endpoint cannot even trigger retrieval of a broad credential.
+            require_canonical_audio_endpoint(
+                ws_url,
+                CANONICAL_AUDIO_HOSTS["xai"],
+                frozenset({"wss"}),
+                endpoint_setting="tts.xai.streaming_url",
+                key_setting="tts.xai.api_key",
+            )
+            from tools.xai_http import resolve_xai_http_credentials
+
+            creds = resolve_xai_http_credentials()
+            fallback_key = str(creds.get("api_key") or "").strip()
+
+        api_key = select_audio_provider_key(
+            configured_key=configured_api_key,
+            resolve_fallback=lambda: fallback_key,
+            endpoint=ws_url,
+            canonical_hosts=CANONICAL_AUDIO_HOSTS["xai"],
+            allowed_schemes=frozenset({"wss"}),
+            endpoint_setting="tts.xai.streaming_url",
+            key_setting="tts.xai.api_key",
+        )
         if not api_key:
             raise RuntimeError("No xAI credentials for streaming TTS")
-        voice = str(self.section.get("voice_id", DEFAULT_XAI_VOICE_ID)).strip() or DEFAULT_XAI_VOICE_ID
-        ws_url = str(
-            self.section.get("streaming_url") or "wss://api.x.ai/v1/tts"
-        ).strip()
 
+        import websockets
         async with websockets.connect(
             ws_url, extra_headers={"Authorization": f"Bearer {api_key}"}
         ) as ws:

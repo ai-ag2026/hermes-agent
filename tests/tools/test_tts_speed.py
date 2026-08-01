@@ -179,7 +179,7 @@ class TestMinimaxTtsT2aV2:
 
 
 class TestMinimaxTtsLegacyTextToSpeech:
-    """Legacy path: caller pins base_url to the old text_to_speech endpoint."""
+    """Legacy path requires an explicit endpoint-local key."""
 
     LEGACY_URL = "https://api.minimax.chat/v1/text_to_speech"
 
@@ -187,6 +187,7 @@ class TestMinimaxTtsLegacyTextToSpeech:
         monkeypatch.setenv("MINIMAX_API_KEY", "test-key")
         cfg = dict(tts_config)
         cfg.setdefault("minimax", {})["base_url"] = self.LEGACY_URL
+        cfg["minimax"].setdefault("api_key", "legacy-endpoint-key")
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.headers = {"Content-Type": "audio/mpeg"}
@@ -203,6 +204,7 @@ class TestMinimaxTtsLegacyTextToSpeech:
         assert "voice_id" in payload
         assert "voice_setting" not in payload
         assert "audio_setting" not in payload
+        assert mock_post.call_args.kwargs["headers"]["Authorization"] == "Bearer legacy-endpoint-key"
 
     def test_writes_raw_audio(self, tmp_path, monkeypatch):
         """Legacy endpoint returns raw bytes written directly to file."""

@@ -74,7 +74,12 @@ class TestDotenvFallbackPerProvider:
             response.raise_for_status = MagicMock()
             return response
 
-        with patch.object(xai_http, "get_env_value", return_value="xai-dotenv-key"), \
+        def fake_xai_env(name, default=None):
+            if name == "XAI_API_KEY":
+                return "xai-dotenv-key"
+            return default
+
+        with patch.object(xai_http, "get_env_value", side_effect=fake_xai_env), \
              patch("requests.post", side_effect=fake_post):
             tts_tool._generate_xai_tts("hi", str(tmp_path / "out.mp3"), {})
 

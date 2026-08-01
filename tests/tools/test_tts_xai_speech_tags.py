@@ -133,7 +133,7 @@ def test_generate_xai_tts_uses_oauth_pinned_base_url(tmp_path, monkeypatch):
 
     monkeypatch.setenv("XAI_BASE_URL", "https://attacker.example/v1")
     monkeypatch.setattr(
-        "tools.xai_http.resolve_xai_http_credentials",
+        "tools.xai_http.resolve_xai_oauth_credentials",
         lambda: {
             "provider": "xai-oauth",
             "api_key": "oauth-bearer-token",

@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 def _creds(api_key: str = "xai-test-key", base_url: str = "https://api.x.ai/v1") -> dict:
     return {"provider": "xai", "api_key": api_key, "base_url": base_url}
@@ -463,13 +465,26 @@ class TestXAIProviderOAuthPath:
     against a temporary auth store.
     """
 
-    def test_search_uses_oauth_bearer_token_and_base_url(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize(
+        ("override_name", "override_value"),
+        [
+            ("HERMES_XAI_BASE_URL", "https://alternate.x.ai/v1"),
+            ("XAI_BASE_URL", "https://alternate.x.ai/v1"),
+            ("HERMES_XAI_BASE_URL", "https://api.x.ai:444/v1"),
+            ("XAI_BASE_URL", "https://api.x.ai:444/v1"),
+        ],
+    )
+    def test_search_oauth_ignores_direct_base_url_overrides(
+        self, monkeypatch, tmp_path, override_name, override_value
+    ):
         from plugins.web.xai import provider as xai_provider
 
         # Force the env-var fallback to fail so resolution must go via OAuth.
         monkeypatch.delenv("XAI_API_KEY", raising=False)
+        monkeypatch.delenv("HERMES_XAI_BASE_URL", raising=False)
+        monkeypatch.delenv("XAI_BASE_URL", raising=False)
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.setenv("HERMES_XAI_BASE_URL", "https://proxy.x.ai/v1/")
+        monkeypatch.setenv(override_name, override_value)
         (tmp_path / "auth.json").write_text(json.dumps({
             "version": 1,
             "active_provider": "xai-oauth",
@@ -495,8 +510,55 @@ class TestXAIProviderOAuthPath:
             result = xai_provider.XAIWebSearchProvider().search("q", limit=3)
 
         assert result["success"] is True
-        assert captured["url"] == "https://proxy.x.ai/v1/responses"
+        assert captured["url"] == "https://api.x.ai/v1/responses"
         assert captured["headers"].get("Authorization") == "Bearer ya29.fake-oauth-access-token"
+
+    @pytest.mark.parametrize(
+        "entry_base_url",
+        [
+            "https://alternate.x.ai/v1",
+            "https://api.x.ai:444/v1",
+        ],
+    )
+    def test_search_oauth_rejects_noncanonical_pool_origin(
+        self, monkeypatch, tmp_path, entry_base_url
+    ):
+        from plugins.web.xai import provider as xai_provider
+
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        monkeypatch.delenv("HERMES_XAI_BASE_URL", raising=False)
+        monkeypatch.delenv("XAI_BASE_URL", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "active_provider": "xai-oauth",
+            "providers": {},
+            "credential_pool": {
+                "xai-oauth": [{
+                    "id": "manual-xai",
+                    "label": "pool-only",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": "manual:device_code",
+                    "access_token": "ya29.fake-oauth-access-token",
+                    "refresh_token": "fake-oauth-refresh-token",
+                    "base_url": entry_base_url,
+                }],
+            },
+        }))
+
+        captured: dict = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            return _mock_resp(_responses_payload(json.dumps({"results": []})))
+
+        with patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
+             patch("httpx.post", side_effect=fake_post):
+            result = xai_provider.XAIWebSearchProvider().search("q", limit=3)
+
+        assert result["success"] is True
+        assert captured["url"] == "https://api.x.ai/v1/responses"
 
     def test_pool_only_direct_refresh_updates_main_runtime(self, monkeypatch, tmp_path):
         """A direct 401 refresh must rotate the exact manual pool row.

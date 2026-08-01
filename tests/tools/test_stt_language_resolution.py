@@ -63,8 +63,8 @@ class TestXaiNoForcedEnglish:
 
         monkeypatch.setattr(_requests, "post", fake_post)
         with patch.object(tt, "_load_stt_config", return_value={}), \
-             patch("tools.xai_http.resolve_xai_http_credentials",
-                   return_value={"api_key": "xai-test", "base_url": "https://api.x.ai/v1"}):
+             patch("tools.xai_http.resolve_xai_oauth_credentials",
+                   return_value={"provider": "xai-oauth", "api_key": "xai-test", "base_url": "https://api.x.ai/v1"}):
             result = tt._transcribe_xai(str(audio), "grok-stt")
 
         assert result["success"] is True
@@ -91,8 +91,8 @@ class TestXaiNoForcedEnglish:
             lambda url, **kw: captured.update(data=kw.get("data")) or _Resp(),
         )
         with patch.object(tt, "_load_stt_config", return_value={"language": "he"}), \
-             patch("tools.xai_http.resolve_xai_http_credentials",
-                   return_value={"api_key": "xai-test", "base_url": "https://api.x.ai/v1"}):
+             patch("tools.xai_http.resolve_xai_oauth_credentials",
+                   return_value={"provider": "xai-oauth", "api_key": "xai-test", "base_url": "https://api.x.ai/v1"}):
             result = tt._transcribe_xai(str(audio), "grok-stt")
 
         assert result["success"] is True

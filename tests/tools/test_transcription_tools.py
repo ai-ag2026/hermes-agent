@@ -260,7 +260,7 @@ class TestTranscribeOpenAIExtended:
 
 
 # ============================================================================
-# Self-hosted / OpenAI-compatible STT (config base_url, keyless, language)
+# Self-hosted / OpenAI-compatible STT (explicit local key, language)
 # ============================================================================
 
 class TestSelfHostedOpenAISTT:
@@ -269,57 +269,45 @@ class TestSelfHostedOpenAISTT:
     def _cfg(self, **openai):
         return {"provider": "openai", "openai": {"model": "nemotron", **openai}}
 
-    def test_config_base_url_honored_keyless(self, monkeypatch):
-        """A configured base_url is used even with no key anywhere; a
-        placeholder Bearer is sent so auth-less servers work."""
+    def test_config_base_url_requires_explicit_key(self, monkeypatch):
+        """A custom endpoint cannot borrow a broad OpenAI fallback key."""
         monkeypatch.setattr(
             "tools.transcription_tools._load_stt_config",
             lambda: self._cfg(base_url=self.SELF),
         )
-        from tools.transcription_tools import (
-            _resolve_openai_audio_client_config,
-            _PLACEHOLDER_OPENAI_KEY,
-            _has_openai_audio_backend,
-        )
-        key, base = _resolve_openai_audio_client_config()
-        assert base == self.SELF
-        assert key == _PLACEHOLDER_OPENAI_KEY
-        assert _has_openai_audio_backend() is True
+        from tools.audio_key_guard import AudioEndpointCredentialPolicyError
+        from tools.transcription_tools import _resolve_openai_audio_client_config
+        with pytest.raises(AudioEndpointCredentialPolicyError, match="stt.openai.api_key"):
+            _resolve_openai_audio_client_config()
 
-    def test_stray_env_key_does_not_redirect_base_url(self, monkeypatch):
-        """A stray OPENAI_API_KEY (set for chat) must not send self-hosted
-        STT traffic to api.openai.com — base_url stays authoritative — and
-        must not be forwarded to the private target either (it was not issued
-        for that server, and http would carry it in cleartext)."""
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-chat-unrelated")
+    def test_stray_env_key_is_not_resolved_for_custom_base_url(self, monkeypatch):
         monkeypatch.setattr(
             "tools.transcription_tools._load_stt_config",
             lambda: self._cfg(base_url=self.SELF),
         )
-        from tools.transcription_tools import (
-            _resolve_openai_audio_client_config,
-            _PLACEHOLDER_OPENAI_KEY,
-        )
-        key, base = _resolve_openai_audio_client_config()
-        assert base == self.SELF
-        assert key == _PLACEHOLDER_OPENAI_KEY
+        from tools.audio_key_guard import AudioEndpointCredentialPolicyError
+        with patch(
+            "tools.transcription_tools.resolve_openai_audio_api_key",
+            return_value="broad-key",
+        ) as resolve_fallback, pytest.raises(AudioEndpointCredentialPolicyError):
+            from tools.transcription_tools import _resolve_openai_audio_client_config
+            _resolve_openai_audio_client_config()
+        resolve_fallback.assert_not_called()
 
-    def test_env_key_still_used_for_public_https_base_url(self, monkeypatch):
-        """A public https OpenAI-compatible proxy keeps the conventional
-        behaviour: the env key is attached."""
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-proxy-key")
+    def test_env_key_is_not_used_for_public_noncanonical_base_url(self, monkeypatch):
         public = "https://stt-proxy.example.com/v1"
         monkeypatch.setattr(
             "tools.transcription_tools._load_stt_config",
             lambda: self._cfg(base_url=public),
         )
-        from tools.transcription_tools import (
-            _resolve_openai_audio_client_config,
-            _PLACEHOLDER_OPENAI_KEY,
-        )
-        key, base = _resolve_openai_audio_client_config()
-        assert base == public
-        assert key == "sk-proxy-key"
+        from tools.audio_key_guard import AudioEndpointCredentialPolicyError
+        with patch(
+            "tools.transcription_tools.resolve_openai_audio_api_key",
+            return_value="broad-key",
+        ) as resolve_fallback, pytest.raises(AudioEndpointCredentialPolicyError):
+            from tools.transcription_tools import _resolve_openai_audio_client_config
+            _resolve_openai_audio_client_config()
+        resolve_fallback.assert_not_called()
 
     def test_config_key_wins_over_env_for_private_base_url(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-chat-unrelated")
@@ -357,10 +345,10 @@ class TestSelfHostedOpenAISTT:
         monkeypatch.setattr(requests, "post", _fake_post)
         monkeypatch.setattr(
             "tools.transcription_tools._load_stt_config",
-            lambda: self._cfg(base_url=self.SELF, request_format="json", timeout=45,
-                              language="de"),
+            lambda: self._cfg(base_url=self.SELF, api_key="local-only-key",
+                              request_format="json", timeout=45, language="de"),
         )
-        from tools.transcription_tools import transcribe_audio, _PLACEHOLDER_OPENAI_KEY
+        from tools.transcription_tools import transcribe_audio
         # transcribe_audio() nimmt seit dem Upstream-Merge kein language=
         # mehr — die Sprache kommt aus stt.<provider>.language.
         result = transcribe_audio(sample_wav)
@@ -369,7 +357,7 @@ class TestSelfHostedOpenAISTT:
         assert result["transcript"] == "hallo welt"
         assert captured["url"] == self.SELF.rstrip("/") + "/audio/transcriptions"
         assert captured["timeout"] == 45.0
-        assert captured["headers"]["Authorization"] == f"Bearer {_PLACEHOLDER_OPENAI_KEY}"
+        assert captured["headers"]["Authorization"] == "Bearer local-only-key"
         payload = captured["payload"]
         assert payload["model"] == "nemotron"
         assert payload["language"] == "de"
@@ -390,23 +378,13 @@ class TestSelfHostedOpenAISTT:
         monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp())
         monkeypatch.setattr(
             "tools.transcription_tools._load_stt_config",
-            lambda: self._cfg(base_url=self.SELF, request_format="json"),
+            lambda: self._cfg(base_url=self.SELF, api_key="local-only-key", request_format="json"),
         )
         from tools.transcription_tools import transcribe_audio
         result = transcribe_audio(sample_wav)
         assert result["success"] is False
         assert "500" in result["error"]
 
-    def test_base_url_is_private_classification(self):
-        from tools.transcription_tools import _base_url_is_private
-        assert _base_url_is_private("http://192.168.1.50:8000/v1") is True
-        assert _base_url_is_private("http://example.com/v1") is True  # cleartext
-        assert _base_url_is_private("https://10.0.0.5/v1") is True
-        assert _base_url_is_private("https://[::1]:8443/v1") is True
-        assert _base_url_is_private("https://localhost:8443/v1") is True
-        assert _base_url_is_private("https://api.openai.com/v1") is False
-        assert _base_url_is_private("https://stt-proxy.example.com/v1") is False
-        assert _base_url_is_private("") is False
 
     def test_response_format_and_timeout_override(self, monkeypatch, sample_wav):
         mock_client = MagicMock()
@@ -454,8 +432,8 @@ class TestSelfHostedOpenAISTT:
         OpenAI-create()-Aufruf, response_format/timeout aus der Config ebenso."""
         monkeypatch.setattr(
             "tools.transcription_tools._load_stt_config",
-            lambda: self._cfg(base_url=self.SELF, response_format="json", timeout=45,
-                              language="de"),
+            lambda: self._cfg(base_url=self.SELF, api_key="local-only-key",
+                              response_format="json", timeout=45, language="de"),
         )
         mock_client = MagicMock()
         mock_client.audio.transcriptions.create.return_value = "hallo"
@@ -929,6 +907,20 @@ def mock_xai_http_module():
     """Inject a fake tools.xai_http module for testing."""
     fake_module = MagicMock()
     fake_module.hermes_xai_user_agent = MagicMock(return_value="hermes-xai/test")
+
+    def direct_credentials():
+        return {
+            "provider": "xai",
+            "api_key": os.environ.get("XAI_API_KEY", ""),
+            "base_url": os.environ.get("XAI_BASE_URL", "https://api.x.ai/v1"),
+        }
+
+    # Model the split resolver's no-OAuth default so a bare MagicMock cannot
+    # accidentally impersonate a valid credential in unrelated STT tests.
+    fake_module.resolve_xai_api_key_credentials = MagicMock(
+        side_effect=direct_credentials
+    )
+    fake_module.resolve_xai_oauth_credentials = MagicMock(return_value=None)
     with patch.dict("sys.modules", {"tools.xai_http": fake_module}):
         yield fake_module
 
@@ -959,18 +951,16 @@ class TestTranscribeXAI:
     def test_retries_auth_rejection_with_refreshed_oauth_credentials(
         self, sample_ogg, mock_xai_http_module, rejected_status
     ):
-        mock_xai_http_module.resolve_xai_http_credentials.side_effect = [
-            {
-                "api_key": "stale-oauth-token",
-                "base_url": "https://api.x.ai/v1",
-                "provider": "xai-oauth",
-            },
-            {
-                "api_key": "fresh-oauth-token",
-                "base_url": "https://api.x.ai/v1",
-                "provider": "xai-oauth",
-            },
-        ]
+        mock_xai_http_module.resolve_xai_oauth_credentials.return_value = {
+            "api_key": "stale-oauth-token",
+            "base_url": "https://api.x.ai/v1",
+            "provider": "xai-oauth",
+        }
+        mock_xai_http_module.resolve_xai_http_credentials.return_value = {
+            "api_key": "fresh-oauth-token",
+            "base_url": "https://api.x.ai/v1",
+            "provider": "xai-oauth",
+        }
 
         rejected = MagicMock()
         rejected.status_code = rejected_status
@@ -1004,8 +994,8 @@ class TestTranscribeXAI:
         assert mock_post.call_args_list[1].kwargs["headers"]["Authorization"] == (
             "Bearer fresh-oauth-token"
         )
+        assert mock_xai_http_module.resolve_xai_oauth_credentials.call_args_list == [call()]
         assert mock_xai_http_module.resolve_xai_http_credentials.call_args_list == [
-            call(),
             call(force_refresh=True, api_key_hint="stale-oauth-token"),
         ]
 
@@ -1038,7 +1028,7 @@ class TestTranscribeXAI:
     ):
         monkeypatch.delenv("XAI_API_KEY", raising=False)
         monkeypatch.setenv("XAI_STT_BASE_URL", "https://attacker.example/v1")
-        mock_xai_http_module.resolve_xai_http_credentials.return_value = {
+        mock_xai_http_module.resolve_xai_oauth_credentials.return_value = {
             "provider": "xai-oauth",
             "api_key": "oauth-bearer-token",
             "base_url": "https://api.x.ai/v1",
@@ -1338,65 +1328,34 @@ class TestLocalModelLock:
         assert load_count == 1
 
 
-class TestLocalBaseUrlNoApiKey:
-    """#25193 — empty api_key with a local base_url should not raise.
+class TestNoncanonicalOpenAIBaseUrl:
+    """Fallback credentials never authorize a self-hosted OpenAI endpoint."""
 
-    Von upstream übernommen. Die Erwartung auf das Literal "not-needed" ist
-    hier auf ``_PLACEHOLDER_OPENAI_KEY`` umgestellt: der Platzhalter gehört
-    ``hermes_cli.audio_key_guard``, ein Test soll seinen Wert nicht doppeln.
-    """
-
-    def test_local_base_url_returns_placeholder_key(self):
-        from tools.transcription_tools import (
-            _resolve_openai_audio_client_config,
-            _PLACEHOLDER_OPENAI_KEY,
-        )
+    def test_local_base_url_requires_explicit_config_key(self):
+        from tools.audio_key_guard import AudioEndpointCredentialPolicyError
+        from tools.transcription_tools import _resolve_openai_audio_client_config
         with patch(
             "tools.transcription_tools._load_stt_config",
             return_value={"openai": {"base_url": "http://localhost:8504/v1"}},
-        ):
-            api_key, base_url = _resolve_openai_audio_client_config()
-        assert api_key == _PLACEHOLDER_OPENAI_KEY
-        assert base_url == "http://localhost:8504/v1"
+        ), pytest.raises(AudioEndpointCredentialPolicyError, match="stt.openai.api_key"):
+            _resolve_openai_audio_client_config()
 
-    def test_private_ip_base_url_returns_placeholder_key(self):
-        from tools.transcription_tools import (
-            _resolve_openai_audio_client_config,
-            _PLACEHOLDER_OPENAI_KEY,
-        )
+    def test_local_base_url_uses_explicit_config_key(self):
+        from tools.transcription_tools import _resolve_openai_audio_client_config
+
         with patch(
             "tools.transcription_tools._load_stt_config",
-            return_value={"openai": {"base_url": "http://192.168.1.10:8000/v1"}},
+            return_value={
+                "openai": {
+                    "api_key": "local-only-key",
+                    "base_url": "http://localhost:8504/v1",
+                }
+            },
         ):
-            api_key, base_url = _resolve_openai_audio_client_config()
-        assert api_key == _PLACEHOLDER_OPENAI_KEY
-
-    def test_public_base_url_still_requires_key(self):
-        from tools.transcription_tools import (
-            _resolve_openai_audio_client_config,
-            _PLACEHOLDER_OPENAI_KEY,
-        )
-        with patch(
-            "tools.transcription_tools._load_stt_config",
-            return_value={"openai": {"base_url": "https://api.example.com/v1"}},
-        ), patch(
-            "tools.transcription_tools.resolve_openai_audio_api_key", return_value="",
-        ), patch(
-            "tools.transcription_tools.resolve_managed_tool_gateway", return_value=None,
-        ), patch(
-            "tools.transcription_tools.managed_nous_tools_enabled", return_value=False,
-        ):
-            with pytest.raises(ValueError):
-                _resolve_openai_audio_client_config()
-
-    def test_is_local_or_private_url(self):
-        from tools.transcription_tools import _is_local_or_private_url
-        assert _is_local_or_private_url("http://localhost:8504/v1")
-        assert _is_local_or_private_url("http://127.0.0.1:9000")
-        assert _is_local_or_private_url("http://10.0.0.5/v1")
-        assert _is_local_or_private_url("http://stt.internal/v1")
-        assert not _is_local_or_private_url("https://api.openai.com/v1")
-        assert not _is_local_or_private_url("")
+            assert _resolve_openai_audio_client_config() == (
+                "local-only-key",
+                "http://localhost:8504/v1",
+            )
 
 
 # =====================================================================
