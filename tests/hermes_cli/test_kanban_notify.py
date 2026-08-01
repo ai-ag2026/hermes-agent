@@ -185,6 +185,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
 
     fake_adapter = MagicMock()
     fake_adapter.name = "telegram"

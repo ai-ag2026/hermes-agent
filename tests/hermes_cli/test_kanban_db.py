@@ -2416,6 +2416,9 @@ class TestSharedBoardPaths:
     ):
         # The dispatcher must pin board paths while stripping any unrelated
         # HERMES_SESSION_* identity inherited from the long-lived gateway.
+        # The one exception is HERMES_SESSION_SOURCE, which the dispatcher
+        # re-sets to its own `kanban` tag AFTER the strip — a value it owns,
+        # never one inherited from whatever the gateway last routed.
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
         shared_gh_config = tmp_path / "broker" / "gh"
@@ -2469,6 +2472,11 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
         for key in sc._VAR_MAP:
+            if key == "HERMES_SESSION_SOURCE":
+                # Re-set by the dispatcher, so what matters is that it carries
+                # the worker's own tag rather than the inherited routing value.
+                assert env[key] == "kanban"
+                continue
             assert key not in env
         # Operator ~/.config/gh is not discovered or injected implicitly.
         assert "GH_CONFIG_DIR" not in env

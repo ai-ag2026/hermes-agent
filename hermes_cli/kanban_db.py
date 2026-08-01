@@ -188,6 +188,30 @@ GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 BLOCK_RECURRENCE_LIMIT = 2
 PENDING_ACTION_OPERATOR_SUMMARY = "An exact terminal action is awaiting approval."
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+
+def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
+    """Normalize a per-task reasoning effort into a storable level.
+
+    Accepts any level in ``hermes_constants.VALID_REASONING_EFFORTS`` plus
+    ``"none"`` (thinking disabled), case-insensitively. Empty / None means
+    "inherit the worker profile's own ``agent.reasoning_effort``" and stores
+    NULL. Anything else is rejected rather than silently dropped — a typo'd
+    level must not quietly hand the task back to the profile default.
+    """
+    from hermes_constants import VALID_REASONING_EFFORTS
+
+    value = str(effort or "").strip().lower()
+    if not value:
+        return None
+    if value == "none" or value in VALID_REASONING_EFFORTS:
+        return value
+    allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
+    raise ValueError(
+        f"reasoning_effort must be one of {allowed}, got {effort!r}"
+    )
+
+
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -1101,6 +1125,12 @@ class Task:
     # model (pre-existing behaviour). Solves the "model from provider A,
     # profile configured for provider B" mismatch class.
     provider_override: Optional[str] = None
+    # Per-task reasoning effort for the worker (one of
+    # ``hermes_constants.VALID_REASONING_EFFORTS``, or ``"none"`` for thinking
+    # off). When set, the dispatcher passes ``--reasoning <level>`` so the
+    # worker runs at that depth regardless of the profile's
+    # ``agent.reasoning_effort``. NULL = the worker profile's own setting.
+    reasoning_effort: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1225,6 +1255,11 @@ class Task:
             provider_override=(
                 row["provider_override"]
                 if "provider_override" in keys and row["provider_override"]
+                else None
+            ),
+            reasoning_effort=(
+                row["reasoning_effort"]
+                if "reasoning_effort" in keys and row["reasoning_effort"]
                 else None
             ),
             max_retries=(
@@ -1529,6 +1564,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- worker resolves the model against the right backend instead of the
     -- profile's configured provider. NULL = profile provider.
     provider_override    TEXT,
+    -- Per-task reasoning effort for the worker (minimal|low|medium|high|
+    -- xhigh|max|ultra, or 'none' for thinking off). When set, the dispatcher
+    -- passes --reasoning <level> so the worker runs at that depth regardless
+    -- of the profile's agent.reasoning_effort. NULL = profile setting.
+    reasoning_effort     TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -3561,6 +3601,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "provider_override", "provider_override TEXT"
         )
 
+    if "reasoning_effort" not in cols:
+        # Per-task thinking depth for the worker. NULL = the worker profile's
+        # own agent.reasoning_effort, which is what existing rows were getting.
+        _add_column_if_missing(
+            conn, "tasks", "reasoning_effort", "reasoning_effort TEXT"
+        )
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -4357,6 +4404,7 @@ def create_task(
     max_retries: Optional[int] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
@@ -4410,6 +4458,11 @@ def create_task(
     config — passed to the worker as ``-m <model> [--provider <name>]``.
     ``provider_override`` requires ``model_override``.
 
+    ``reasoning_effort`` pins the worker's thinking depth for this task
+    (``minimal``…``ultra``, or ``none`` to disable thinking), passed as
+    ``--reasoning <level>``. It is independent of ``model_override``: a task
+    can run the profile's own model at a different depth.
+
     ``project_source_task_id`` is an internal cross-profile fallback for a
     worker-created child. When the active profile cannot resolve ``project_id``
     in its own projects.db, a matching canonical project-linked task in this
@@ -4418,6 +4471,7 @@ def create_task(
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
+    reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -4768,6 +4822,7 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
+                        reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
                         task_class, completion_contract,
                         origin_kind, origin_key, payload_digest, work_kind,
@@ -4775,7 +4830,7 @@ def create_task(
                         acceptance_required, definition_of_done, commitment,
                         commitment_due_at, route_tenant_snapshot, authority_epoch
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -4797,6 +4852,7 @@ def create_task(
                         int(max_retries) if max_retries is not None else None,
                         model_override,
                         provider_override,
+                        reasoning_effort,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
@@ -5090,6 +5146,44 @@ def set_model_override(
         _append_event(
             conn, task_id, "model_override_set",
             {"model": model, "provider": provider},
+        )
+        return True
+
+
+def set_reasoning_effort(
+    conn: sqlite3.Connection,
+    task_id: str,
+    effort: Optional[str],
+) -> bool:
+    """Set (or clear) the per-task reasoning effort.
+
+    ``effort=None`` (or empty) clears the override — the worker falls back to
+    its profile's own ``agent.reasoning_effort``. ``"none"`` is a real value,
+    not a clear: it pins thinking OFF for this task.
+
+    Deliberately independent of :func:`set_model_override`: a task may run the
+    profile's own model at a different depth, and clearing a model override
+    must not silently reset the depth the operator chose. Like the model
+    override, it takes effect on the NEXT dispatch, so it is settable on a
+    running task. Returns True on success.
+    """
+    effort = normalize_reasoning_effort(effort)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(
+                f"cannot set reasoning effort on archived task {task_id}"
+            )
+        conn.execute(
+            "UPDATE tasks SET reasoning_effort = ? WHERE id = ?",
+            (effort, task_id),
+        )
+        _append_event(
+            conn, task_id, "reasoning_effort_set", {"reasoning_effort": effort}
         )
         return True
 
@@ -17210,6 +17304,32 @@ def _resolve_board_bank(board: Optional[str]) -> Optional[str]:
         return None
 
 
+_retagged_workspace_roots: set[str] = set()
+
+
+def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
+    """Reclaim pre-tag worker rows in state.db so they leave the session lists.
+
+    Best-effort and gated — the durable ``state_meta`` gate lives in
+    ``retag_kanban_worker_sessions``; the in-process set keeps a busy
+    dispatcher from reopening state.db on every spawn just to read it. A
+    dispatcher tick must never fail because a session DB was busy or missing.
+    """
+    if workspaces_root_path in _retagged_workspace_roots:
+        return
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.retag_kanban_worker_sessions(workspaces_root_path)
+        finally:
+            db.close()
+        _retagged_workspace_roots.add(workspaces_root_path)
+    except Exception as exc:
+        _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -17286,6 +17406,14 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Tag the worker's session so it lands in state.db as `kanban`, not as an
+    # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
+    # read on the board and in `hermes kanban log` — it is not a conversation
+    # the user started, so every session-browsing surface (desktop sidebar, TUI
+    # resume picker, session_search) filters it out by source. Without this the
+    # sidebar renders one row per attempt, labeled with the worker's own prompt
+    # ("work kanban task t_…").
+    env["HERMES_SESSION_SOURCE"] = "kanban"
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already
@@ -17348,6 +17476,7 @@ def _default_spawn(
     # but unusual symlink / Docker layouts are caught here too.
     env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the
     # board slug still forces it to the right directory.
@@ -17404,6 +17533,11 @@ def _default_spawn(
         # the classic mis-set that stalls a board).
         if task.provider_override:
             cmd.extend(["--provider", task.provider_override])
+    # Per-task thinking depth. Independent of the model override — a task can
+    # run the profile's own model at a different depth — so this is its own
+    # branch, not a nested one.
+    if task.reasoning_effort:
+        cmd.extend(["--reasoning", task.reasoning_effort])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
@@ -17993,15 +18127,69 @@ def add_notify_sub(
             )
 
 
+def _notify_profile_filter(
+    notifier_profiles: Optional[Iterable[str]],
+    *,
+    include_unowned: bool,
+) -> tuple[str, list[str]]:
+    """Build an optional SQL predicate for notification profile ownership."""
+    if notifier_profiles is None:
+        return "", []
+
+    profiles = sorted(
+        {
+            str(profile).strip()
+            for profile in notifier_profiles
+            if str(profile).strip()
+        }
+    )
+    clauses: list[str] = []
+    params: list[str] = []
+    if profiles:
+        clauses.append(
+            "notifier_profile IN (" + ",".join("?" for _ in profiles) + ")"
+        )
+        params.extend(profiles)
+    if include_unowned:
+        clauses.append("notifier_profile IS NULL OR notifier_profile = ''")
+    if not clauses:
+        return "0", []
+    return "(" + ") OR (".join(clauses) + ")", params
+
 
 def list_notify_subs(
-    conn: sqlite3.Connection, task_id: Optional[str] = None, *, include_inactive: bool = False,
+    conn: sqlite3.Connection,
+    task_id: Optional[str] = None,
+    *,
+    include_inactive: bool = False,
+    notifier_profiles: Optional[Iterable[str]] = None,
+    include_unowned: bool = False,
 ) -> list[dict]:
-    where = "" if include_inactive else " WHERE active=1"
-    params: tuple[Any, ...] = ()
+    """List subscriptions, optionally restricted to notifier profile owners.
+
+    Passing no ``notifier_profiles`` preserves the historical all-subscriptions
+    result. Gateway notifier processes pass the profiles whose adapters they
+    own so they cannot claim another gateway's events. ``include_unowned`` is
+    used by the dispatch owner for legacy rows created before profile stamping.
+    ``include_inactive`` (fork: Tombstones/ABA-Generation) also returns rows
+    with ``active=0``; the default keeps the historical active-only contract.
+    """
+    owner_where, owner_params = _notify_profile_filter(
+        notifier_profiles, include_unowned=include_unowned,
+    )
+    clauses: list[str] = []
+    params: list[Any] = []
+    if not include_inactive:
+        clauses.append("active=1")
     if task_id is not None:
-        where = (" WHERE task_id=?" if include_inactive else " WHERE task_id=? AND active=1")
-        params = (task_id,)
+        clauses.append("task_id = ?")
+        params.append(task_id)
+    if owner_where:
+        clauses.append(owner_where)
+        params.extend(owner_params)
+    where = ""
+    if clauses:
+        where = " WHERE " + " AND ".join(f"({clause})" for clause in clauses)
     out: list[dict] = []
     for row in conn.execute("SELECT * FROM kanban_notify_subs" + where, params):
         item = dict(row)
@@ -18014,6 +18202,52 @@ def list_notify_subs(
             )
         out.append(item)
     return out
+
+
+def count_notify_subs(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+    notifier_profiles: Optional[Iterable[str]] = None,
+    include_unowned: bool = False,
+) -> int:
+    """Count ``kanban_notify_subs`` rows via a read-only connection.
+
+    Cheap probe for the gateway notifier's zero-subscription early exit:
+    unlike :func:`connect`, this never creates the DB file, never runs
+    schema init/migration, and never opens the database writable (no
+    write locks, no checkpoints — though a read-only open of a WAL
+    database may still create the ``-shm``/``-wal`` sidecars, it cannot
+    write table content). Rows in a not-yet-checkpointed WAL are
+    visible, so a freshly added subscription is never missed. A missing
+    DB, or a legacy DB that predates the subscriptions table, counts as
+    zero. When ``notifier_profiles`` is supplied, only subscriptions owned
+    by those profiles are counted; ``include_unowned`` also includes legacy
+    rows without an owner stamp. Path resolution matches :func:`connect`
+    (explicit ``db_path``, else ``board`` via :func:`kanban_db_path`). Raises
+    :class:`sqlite3.Error` when the DB exists but cannot be read
+    (locked, corrupt); callers choose their own fallback.
+    """
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    if not path.exists():
+        return 0
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        try:
+            owner_where, owner_params = _notify_profile_filter(
+                notifier_profiles, include_unowned=include_unowned,
+            )
+            sql = "SELECT COUNT(*) FROM kanban_notify_subs"
+            if owner_where:
+                sql += " WHERE " + owner_where
+            row = conn.execute(sql, owner_params).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return 0
+            raise
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
 
 
 def remove_notify_sub(
