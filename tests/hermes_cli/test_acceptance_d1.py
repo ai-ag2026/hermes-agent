@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_cli import board_resolver, kanban_db, work_promotion
+from hermes_cli import kanban_db, work_promotion
 
 
 @pytest.fixture
@@ -60,12 +60,14 @@ def test_a4_runtimes_share_one_work_graph(board, tmp_path):
     ]
     board.commit()
 
-    # One identity scheme for all three: every item resolves through work_uid.
+    # One identity scheme for all three: every item gets a well-formed work_uid.
+    # (board_resolver.resolve was removed with hermes_cli/board_resolver.py —
+    # audit decision 2026-07-31, same as test_work_promotion; git history
+    # preserves the end-to-end resolution test.)
     board_uuid = kanban_db.get_board_uuid(board)
     for item in [parent, *children]:
         work_uid = kanban_db.build_work_uid(board_uuid, item.task_id)
-        resolved = board_resolver.resolve(work_uid, roots=[tmp_path])
-        assert resolved.task_id == item.task_id
+        assert work_uid and item.task_id in work_uid
 
     # And one graph: each child hangs under the same parent.
     linked = {
