@@ -159,10 +159,17 @@ class TestDelegatedChildMarker:
                 env = hermes_subprocess_env(inherit_credentials=True)
 
         assert env["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
-        assert "HERMES_KANBAN_TASK" not in env
+        # Fork-Kontrakt (tools/environments/local.py,
+        # DELEGATED_CHILD_OWNERSHIP_ENV_KEYS): NUR Eigentums-Schlüssel werden
+        # gestrippt. LESE-Schlüssel (TASK/DB/BOARD) bleiben absichtlich — ein
+        # Voll-Scrub kippte _check_kanban_mode auf „orchestrator" und gäbe dem
+        # Kind MEHR Board-Zugriff, nicht weniger. (Der alte Test prüfte den
+        # überholten Voll-Scrub-Kontrakt.)
+        assert env["HERMES_KANBAN_TASK"] == "t_parent"
+        assert env["HERMES_KANBAN_DB"] == "/tmp/parent-kanban.db"
         assert "HERMES_KANBAN_RUN_ID" not in env
-        assert "HERMES_KANBAN_DB" not in env
         assert "HERMES_KANBAN_WORKSPACE" not in env
+        assert "HERMES_KANBAN_CLAIM_LOCK" not in env
         assert env["MY_APP_VAR"] == "keep-me"
 
 

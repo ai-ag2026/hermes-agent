@@ -172,6 +172,9 @@ def _install_fake_tools_package():
         check_all_command_guards=lambda *args, **kwargs: {"approved": True},
         load_permanent_allowlist=lambda *args, **kwargs: [],
         DANGEROUS_PATTERNS=[],
+        # terminal_tool importiert inzwischen auch diese beiden Guards:
+        _check_non_overridable_deny_floor=lambda *args, **kwargs: None,
+        _match_safe_readonly_heredoc=lambda *args, **kwargs: None,
     )
 
     class _Registry:

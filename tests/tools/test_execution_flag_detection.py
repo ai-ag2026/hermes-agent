@@ -49,6 +49,17 @@ def test_real_binaries_execute_leading_dash_program_payload(
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+    # uutils coreutils (Rust) parst `-payload-marker` als Option und lehnt ab,
+    # statt es als Programm auszuführen — die GNU-Footgun-Prämisse gilt dort
+    # nicht (das Binary ist SICHERER, nicht kaputt). Nur diesen Fall
+    # überspringen; die anderen Tools sind unberührt.
+    if tool == "sort":
+        _ver = subprocess.run(
+            ["sort", "--version"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        ).stdout.lower()
+        if "uutils" in _ver:
+            pytest.skip("uutils sort rejects -program options (no GNU footgun)")
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"

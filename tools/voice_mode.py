@@ -310,8 +310,13 @@ def detect_audio_environment() -> dict:
     # When the user mounts a PulseAudio/PipeWire socket into the container
     # and points PULSE_SERVER / PIPEWIRE_REMOTE at it, audio works fine
     # (issue #21203).  Only block when no forwarding is configured.
+    # Termux ist KEIN Docker/Podman/LXC, sieht der cgroup-/Namespace-Heuristik
+    # aber containerartig aus (#31015): der harte Container-Block verdeckte
+    # sonst die verfügbare Termux:API-Mikrofonaufnahme und blockte /voice on.
+    # Termux hat seinen eigenen Audiopfad (termux_capture unten), daher hier
+    # überspringen.
     from hermes_constants import is_container
-    if is_container():
+    if is_container() and not _is_termux_environment():
         if has_forwarded_audio:
             notices.append("Running inside container (Docker/Podman/LXC) with host audio forwarding")
         else:

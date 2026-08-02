@@ -676,9 +676,18 @@ class TestPollTransport:
         with _fake_download(b"x" * (128 * 1024)):
             parsed, _requests = _call(flux3._handle_get_result, {"id": "bfl_job_1"}, response)
 
-        from gateway.platforms.base import validate_media_delivery_path
+        from gateway.platforms.base import get_video_cache_dir, validate_media_delivery_path
 
         saved = parsed["details"]["saved_path"]
+        # Kernaussage 1: der Clip landet im (dynamisch aufgelösten) Video-Cache.
+        cache_dir = str(get_video_cache_dir())
+        assert saved.startswith(cache_dir), (saved, cache_dir)
+        # Kernaussage 2: validate lässt ihn durch. MEDIA_DELIVERY_SAFE_ROOTS
+        # friert beim Modul-Import ein (produktiv korrekt — HERMES_HOME wechselt
+        # nie mid-process); unter per-Test-Homes zeigt der eingefrorene Root auf
+        # ein anderes tmp. Der Operator-Allowlist-Env wird dagegen bei jedem
+        # Aufruf gelesen — genau dafür ist er da.
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", cache_dir)
         assert validate_media_delivery_path(saved), "the gateway must be allowed to send it"
         # The exact line to copy, so the path is never retyped from memory.
         assert f"\nMEDIA:{saved}\n" in parsed["result"]
