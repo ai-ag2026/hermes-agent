@@ -879,14 +879,17 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     finally:
         conn.close()
 
-    original_claim = kb.claim_unseen_events_for_sub
+    # F-5: der Notifier least jetzt statt zu claimen — der Isolations-Seam
+    # wandert auf acquire_notify_sub_lease (gleiches Szenario #59269: EINE
+    # kaputte Subscription darf den Tick nicht für alle anderen blockieren).
+    original_acquire = kb.acquire_notify_sub_lease
 
-    def selective_claim(conn, task_id, **kwargs):
+    def selective_acquire(conn, *, task_id, **kwargs):
         if task_id == tid_bad:
             raise RuntimeError("simulated DB corruption for bad task")
-        return original_claim(conn, task_id=task_id, **kwargs)
+        return original_acquire(conn, task_id=task_id, **kwargs)
 
-    monkeypatch.setattr(kb, "claim_unseen_events_for_sub", selective_claim)
+    monkeypatch.setattr(kb, "acquire_notify_sub_lease", selective_acquire)
 
     # Force the failing subscription to be iterated FIRST regardless of the
     # unordered SELECT's scan order.
@@ -955,3 +958,49 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_notifier_recovers_delivery_after_crashed_lease(tmp_path, monkeypatch):
+    """F-5/B0-Kernvertrag: Ein Prozess, der NACH dem Lease-Erwerb und VOR dem
+    Send stirbt, verliert keine Nachricht — der Cursor bewegte sich nie, die
+    abgelaufene Lease ist reclaimbar, der nächste Tick liefert nach. Der alte
+    Claim→Send→Rewind-Pfad verlor das Event hier dauerhaft."""
+    db_path = tmp_path / "crash-lease.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_completed_subscription()
+
+    conn = kb.connect()
+    try:
+        dead = kb.acquire_notify_sub_lease(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            owner="tot-vor-send:99999",
+        )
+        assert dead is not None
+        cursor_before = int(dead["last_event_id"])
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    # Lebende fremde Lease: dieser Tick darf NICHT doppelt zustellen.
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.sent == []
+
+    # Der Halter ist tot; nach Ablauf ist die Lease reclaimbar und der
+    # unbewegte Cursor liefert alles nach.
+    conn = kb.connect()
+    try:
+        row = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs WHERE task_id=?", (tid,),
+        ).fetchone()
+        assert int(row["last_event_id"]) == cursor_before, "Cursor darf ohne Zustellung nie wandern"
+        with kb.write_txn(conn):
+            conn.execute("UPDATE kanban_notify_subs SET lease_until = 1 WHERE task_id=?", (tid,))
+    finally:
+        conn.close()
+
+    adapter2 = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter2)))
+    assert len(adapter2.sent) == 1
+    assert _unseen_terminal_events(tid) == []

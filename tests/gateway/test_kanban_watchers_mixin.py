@@ -15,9 +15,9 @@ from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 KANBAN_METHODS = [
     "_kanban_notifier_watcher",
     "_kanban_dispatcher_watcher",
-    "_kanban_advance",
+    "_kanban_commit_delivery",
     "_kanban_unsub",
-    "_kanban_rewind",
+    "_kanban_release_lease",
     "_deliver_kanban_artifacts",
 ]
 

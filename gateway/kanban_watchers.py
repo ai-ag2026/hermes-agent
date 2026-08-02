@@ -309,6 +309,16 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+def _notify_lease_owner() -> str:
+    """Stable per-process lease-owner identity (same shape as claim locks)."""
+    import socket
+    try:
+        host = socket.gethostname() or "unknown"
+    except Exception:
+        host = "unknown"
+    return f"{host}:{os.getpid()}"
+
+
 def _resolve_operator_authors(load_config: Callable[[], Any]) -> "frozenset[str]":
     """Resolve ``kanban.operator_authors`` — read live each tick, same as
     :func:`_resolve_auto_decompose_settings`, so an operator can widen/narrow
@@ -1395,7 +1405,27 @@ class GatewayKanbanWatchersMixin:
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
                                     )
-                                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                                    # F-5 / B0 (2026-08-02): Lease statt
+                                    # Claim\u2192Send\u2192Rewind. Der Cursor bewegt sich
+                                    # erst NACH erfolgreicher Zustellung
+                                    # (commit); ein Crash zwischen Lease und
+                                    # Send kostet einen Retry nach Lease-Ablauf,
+                                    # nie mehr eine Nachricht. Der alte Pfad
+                                    # verlor Events, wenn der Prozess zwischen
+                                    # Cursor-Vorschub und Send starb.
+                                    lease = _kb.acquire_notify_sub_lease(
+                                        conn,
+                                        task_id=sub["task_id"],
+                                        platform=sub["platform"],
+                                        chat_id=sub["chat_id"],
+                                        thread_id=sub.get("thread_id") or "",
+                                        owner=_notify_lease_owner(),
+                                    )
+                                    if lease is None:
+                                        continue
+                                    lease["owner"] = _notify_lease_owner()
+                                    old_cursor = int(lease["last_event_id"])
+                                    cursor, events = _kb.unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
                                         platform=sub["platform"],
@@ -1404,10 +1434,20 @@ class GatewayKanbanWatchersMixin:
                                         kinds=TERMINAL_KINDS,
                                     )
                                     if not events:
+                                        _kb.release_notify_sub_lease(
+                                            conn,
+                                            task_id=sub["task_id"],
+                                            platform=sub["platform"],
+                                            chat_id=sub["chat_id"],
+                                            thread_id=sub.get("thread_id") or "",
+                                            owner=lease["owner"],
+                                            generation=lease["generation"],
+                                            lease_version=lease["lease_version"],
+                                        )
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
                                     logger.debug(
-                                        "kanban notifier: claimed %d event(s) for %s on board %s cursor %s\u2192%s",
+                                        "kanban notifier: leased %d event(s) for %s on board %s cursor %s\u2192%s (pending commit)",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
                                     )
                                     deliveries.append({
@@ -1418,6 +1458,7 @@ class GatewayKanbanWatchersMixin:
                                         "task": task,
                                         "board": slug,
                                         "suppress_blocked": suppress_blocked,
+                                        "lease": lease,
                                     })
                                 except Exception as sub_exc:
                                     # upstream: eine kaputte Subscription darf den Tick
@@ -1512,7 +1553,7 @@ class GatewayKanbanWatchersMixin:
                         # Unknown platform string; skip and advance cursor so
                         # we don't replay forever.
                         await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
+                            self._kanban_commit_delivery, sub, d["lease"], d["cursor"], board_slug,
                         )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
@@ -1532,10 +1573,9 @@ class GatewayKanbanWatchersMixin:
                             platform_str, sub["task_id"],
                         )
                         await asyncio.to_thread(
-                            self._kanban_rewind,
+                            self._kanban_release_lease,
                             sub,
-                            d["cursor"],
-                            d.get("old_cursor", 0),
+                            d["lease"],
                             board_slug,
                         )
                         continue
@@ -1741,10 +1781,9 @@ class GatewayKanbanWatchersMixin:
                                 sub_fail_counts.pop(sub_key, None)
                             else:
                                 await asyncio.to_thread(
-                                    self._kanban_rewind,
+                                    self._kanban_release_lease,
                                     sub,
-                                    d["cursor"],
-                                    d.get("old_cursor", 0),
+                                    d["lease"],
                                     board_slug,
                                 )
                             # Rewind the pre-send claim on transient failure so
@@ -1843,10 +1882,9 @@ class GatewayKanbanWatchersMixin:
                                     # tick retries the self-post — the event
                                     # is NOT lost.
                                     await asyncio.to_thread(
-                                        self._kanban_rewind,
+                                        self._kanban_release_lease,
                                         sub,
-                                        d["cursor"],
-                                        d.get("old_cursor", 0),
+                                        d["lease"],
                                         board_slug,
                                     )
                                 continue
@@ -1856,7 +1894,7 @@ class GatewayKanbanWatchersMixin:
                         # is the dedup mechanism — it prevents re-delivery
                         # of the same event on subsequent ticks.
                         await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
+                            self._kanban_commit_delivery, sub, d["lease"], d["cursor"], board_slug,
                         )
                         if not _is_push_adapter:
                             # Nothing left to deliver on this path (the wake,
@@ -1976,24 +2014,56 @@ class GatewayKanbanWatchersMixin:
         finally:
             conn.close()
 
-    def _kanban_advance(
-        self, sub: dict, cursor: int, board: Optional[str] = None,
+    def _kanban_commit_delivery(
+        self, sub: dict, lease: dict, new_cursor: int, board: Optional[str] = None,
     ) -> None:
-        """Sync helper: advance a subscription's cursor. Runs in to_thread.
+        """Sync helper: cursor vorschieben + Lease freigeben, gefenced (F-5/B0).
 
-        ``board`` scopes the DB connection to the board that owns this
-        subscription. Unsub cursors in one board can't touch another's.
+        Nur der aktuelle Lease-Halter derselben Generation darf committen; ein
+        verlorener CAS heißt: ein anderer Owner hat übernommen — dann ist
+        Nichtstun korrekt (dessen Zustellung zählt). Runs in to_thread.
         """
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
-            _kb.advance_notify_cursor(
+            ok = _kb.commit_notify_sub_delivery(
                 conn,
                 task_id=sub["task_id"],
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
-                new_cursor=cursor,
+                owner=lease["owner"],
+                generation=lease["generation"],
+                lease_version=lease["lease_version"],
+                new_cursor=new_cursor,
+            )
+            if not ok:
+                logger.debug(
+                    "kanban notifier: delivery commit lost the lease CAS for %s "
+                    "(reclaimed or resubscribed) — no cursor change",
+                    sub["task_id"],
+                )
+        finally:
+            conn.close()
+
+    def _kanban_release_lease(
+        self, sub: dict, lease: dict, board: Optional[str] = None,
+        retry_after_seconds: int = 0,
+    ) -> None:
+        """Sync helper: Lease zurückgeben OHNE Cursor-Bewegung (Retry-Pfad)."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kb.release_notify_sub_lease(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                owner=lease["owner"],
+                generation=lease["generation"],
+                lease_version=lease["lease_version"],
+                retry_after_seconds=retry_after_seconds,
             )
         finally:
             conn.close()
@@ -2061,29 +2131,6 @@ class GatewayKanbanWatchersMixin:
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
-            )
-        finally:
-            conn.close()
-
-    def _kanban_rewind(
-        self,
-        sub: dict,
-        claimed_cursor: int,
-        old_cursor: int,
-        board: Optional[str] = None,
-    ) -> None:
-        """Sync helper: undo a claimed notification cursor after send failure."""
-        from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
-        try:
-            _kb.rewind_notify_cursor(
-                conn,
-                task_id=sub["task_id"],
-                platform=sub["platform"],
-                chat_id=sub["chat_id"],
-                thread_id=sub.get("thread_id") or "",
-                claimed_cursor=claimed_cursor,
-                old_cursor=old_cursor,
             )
         finally:
             conn.close()
