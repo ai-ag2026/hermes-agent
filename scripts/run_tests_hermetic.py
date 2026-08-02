@@ -208,7 +208,14 @@ def build_bwrap_command(bwrap: str, sandbox: Path, protected: list[Path],
            "--bind", str(REPO), str(REPO)]
     for root in protected:
         cmd += ["--ro-bind", str(root), str(root)]
-    cmd += ["--die-with-parent", "--", *inner_cmd]
+    # F-3 (2026-08-02): eigener PID-Namespace. Tests feuern echte
+    # Kill-Primitive (test_live_system_guard_self_test.py: os.kill(-1),
+    # ``pkill -f python``, killall) und verlassen sich auf den conftest-Guard —
+    # ohne --unshare-pid schlug jeder Durchrutscher auf HOST-Prozesse durch
+    # (beobachtet: parallele Suiten-Läufe per SIGTERM abgeräumt). Mit dem
+    # Namespace sieht /proc nur noch Sandbox-Prozesse und kill(-1) endet an
+    # der Namespace-Grenze; bwrap reapt als PID-1-Init die Zombies.
+    cmd += ["--unshare-pid", "--die-with-parent", "--", *inner_cmd]
     return cmd
 
 
