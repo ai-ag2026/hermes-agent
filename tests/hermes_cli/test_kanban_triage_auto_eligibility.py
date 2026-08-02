@@ -68,3 +68,32 @@ def test_recurrences_below_limit_stay_eligible(isolated_board):
         tid = _triage_task(conn, recurrences=kb.BLOCK_RECURRENCE_LIMIT - 1)
     assert tid in kanban_decompose.list_triage_ids()
     assert tid in kanban_specify.list_triage_ids()
+
+
+def test_triage_card_is_completable(isolated_board):
+    """Vorfall 2026-08-02: eine (ggf. loop-geparkte) Triage-Karte muss sich
+    als erledigt schließen lassen — das Status-Set stammte von vor dem
+    Loop-Breaker und verweigerte triage/todo."""
+    with kb.connect() as conn:
+        tid = _triage_task(conn, recurrences=kb.BLOCK_RECURRENCE_LIMIT)
+        assert kb.complete_task(conn, tid, result="operator closed") is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_todo_card_is_completable(isolated_board):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="todo card", assignee="backend-eng")
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+        conn.commit()
+        assert kb.complete_task(conn, tid, result="already done elsewhere") is True
+
+
+def test_gated_blocked_card_still_refuses_completion_without_token(isolated_board):
+    """Die Erweiterung des Status-Sets darf das Human-Gate auf blocked
+    NICHT aufweichen."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="backend-eng")
+        assert kb.claim_task(conn, tid, claimer="w") is not None
+        kb.block_task(conn, tid, kind="needs_input", reason="gate", human_gate=True)
+        with pytest.raises(kb.GateTokenError):
+            kb.complete_task(conn, tid, result="sneaky")

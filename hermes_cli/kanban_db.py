@@ -8777,7 +8777,13 @@ def _complete_task_locked(
 
     # Validate and promote evidence before the done CAS and scratch cleanup.
     task = get_task(conn, task_id)
-    if task is None or task.status not in {"running", "ready", "blocked"}:
+    # ``triage``/``todo`` sind seit dem Loop-Breaker (31.07., Terminal-Park nach
+    # BLOCK_RECURRENCE_LIMIT) legitime Endlagen, aus denen ein Operator eine
+    # Karte als erledigt schließen können muss (Vorfall 2026-08-02: gated
+    # Triage-Karte war aus dem WebUI unabschließbar, „Karte nicht lösbar").
+    # Das Set stammt vom 10.07. und ist älter als der Breaker. Human-Gate und
+    # Acceptance-Guards oberhalb gelten unverändert für alle Quellstatus.
+    if task is None or task.status not in {"running", "ready", "blocked", "triage", "todo"}:
         return False
     # Orphaned-run recovery (worker-containment 2026-07-16): a still-alive
     # worker whose gate-blocked run was cleared back to 'ready' by an operator
@@ -8900,7 +8906,7 @@ def _complete_task_locked(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'triage', 'todo')
                 """,
                 (result, now, task_id),
             )
@@ -8917,7 +8923,7 @@ def _complete_task_locked(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'triage', 'todo')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
