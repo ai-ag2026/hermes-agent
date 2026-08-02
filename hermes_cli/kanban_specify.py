@@ -261,4 +261,8 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             include_archived=False,
         )
-        return [t.id for t in tasks if kb.get_pending_action(conn, t.id) is None]
+        return [
+            t.id for t in tasks
+            if kb.get_pending_action(conn, t.id) is None
+            and kb.triage_auto_eligible(t)
+        ]

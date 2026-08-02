@@ -3334,6 +3334,27 @@ def get_board_uuid(conn: sqlite3.Connection) -> Optional[str]:
     return row[0] if row else None
 
 
+def triage_auto_eligible(task: "Task") -> bool:
+    """Whether automation (auto-decompose/specify sweeps) may pick up a triage card.
+
+    Zwei Kartenklassen sind in triage eine MENSCHEN-Entscheidung und dürfen
+    von keiner Automation re-spezifiziert oder promotet werden (Vorfall
+    2026-08-02, t_33a7ec10: Loop-Breaker parkt → auto-decompose promotet →
+    Worker blockt → Breaker parkt … 17 Rekurrenzen in einer Nacht):
+
+    * vom Loop-Breaker geparkte Karten — erkennbar am über die Promotion
+      hinweg persistierenden ``block_recurrences``-Zähler am Limit;
+    * human-gated Karten (``human_gate=1``) — das Gate existiert genau damit
+      ein Mensch entscheidet.
+
+    Ein Mensch kann beide weiterhin GEZIELT per id decompose/specify geben;
+    nur die automatischen Sweeps (``list_triage_ids``) filtern hier.
+    """
+    if task.human_gate:
+        return False
+    return int(task.block_recurrences or 0) < BLOCK_RECURRENCE_LIMIT
+
+
 def build_work_uid(board_uuid: str, task_id: str) -> str:
     """Compose the globally unique work identifier.
 

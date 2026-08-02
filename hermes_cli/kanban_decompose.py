@@ -637,4 +637,5 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
         return [
             row.id for row in rows
             if kb.get_pending_action(conn, row.id) is None
+            and kb.triage_auto_eligible(row)
         ]
