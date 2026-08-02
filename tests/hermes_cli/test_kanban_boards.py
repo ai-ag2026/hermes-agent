@@ -319,7 +319,7 @@ class TestWorkerSpawnEnv:
         assert env["HERMES_KANBAN_BOARD"] == "default"
         assert env["HERMES_KANBAN_DB"] == str(fresh_home / "kanban.db")
 
-    def _spawn_capture_env(self, fresh_home, monkeypatch, *, effort):
+    def _spawn_capture_env(self, fresh_home, monkeypatch, *, effort=None, reasoning_effort=None):
         """Spawn a task with the given ``effort`` and return the worker env."""
         captured = {}
 
@@ -348,6 +348,7 @@ class TestWorkerSpawnEnv:
             claim_expires=None,
             tenant=None,
             effort=effort,
+            reasoning_effort=reasoning_effort,
         )
         kb._default_spawn(task, str(fresh_home / "ws"), board=None)
         return captured["env"]
@@ -357,6 +358,22 @@ class TestWorkerSpawnEnv:
         # HERMES_REASONING_EFFORT so cli.py can give it precedence over the
         # profile's agent.reasoning_effort.
         env = self._spawn_capture_env(fresh_home, monkeypatch, effort="high")
+        assert env["HERMES_REASONING_EFFORT"] == "high"
+
+    def test_default_spawn_resolves_reasoning_effort_over_fork_effort(self, fresh_home, monkeypatch):
+        # F-7 (2026-08-02): Upstream-Spalte reasoning_effort gewinnt über die
+        # Fork-Spalte effort; beide Transportkanäle (env + --reasoning) tragen
+        # denselben aufgelösten Wert — eine doppelt gesetzte Karte darf nie
+        # zwei verschiedene Tiefen transportieren.
+        env = self._spawn_capture_env(
+            fresh_home, monkeypatch, effort="low", reasoning_effort="max",
+        )
+        assert env["HERMES_REASONING_EFFORT"] == "max"
+
+    def test_default_spawn_falls_back_to_fork_effort_column(self, fresh_home, monkeypatch):
+        env = self._spawn_capture_env(
+            fresh_home, monkeypatch, effort="high", reasoning_effort=None,
+        )
         assert env["HERMES_REASONING_EFFORT"] == "high"
 
     def test_default_spawn_omits_effort_env_when_unset(self, fresh_home, monkeypatch):

@@ -17477,12 +17477,17 @@ def _default_spawn(
         env["HERMES_KANBAN_GOAL_MODE"] = "1"
         if task.goal_max_turns is not None:
             env["HERMES_KANBAN_GOAL_MAX_TURNS"] = str(int(task.goal_max_turns))
-    # Per-task reasoning-effort override (tars-workflow chained goal cards).
+    # Per-task reasoning-effort override. F-7 (2026-08-02): Upstream-Spalte
+    # ``reasoning_effort`` und Fork-Spalte ``effort`` (tars-workflow) werden
+    # HIER auf EINEN Wert aufgelöst (Upstream-Spalte gewinnt) und speisen
+    # beide Transportkanäle — env für den Fork-Vertrag (cli.py: env >
+    # --reasoning > config) und --reasoning weiter unten. Damit kann eine
+    # doppelt gesetzte Karte nie zwei verschiedene Tiefen transportieren.
     # Only set when present so non-overridden tasks keep a clean env and fall
-    # through to the profile's agent.reasoning_effort. The worker's config
-    # loader gives this env value precedence (see cli.py reasoning_config).
-    if task.effort:
-        env["HERMES_REASONING_EFFORT"] = str(task.effort)
+    # through to the profile's agent.reasoning_effort.
+    _resolved_effort = task.reasoning_effort or task.effort
+    if _resolved_effort:
+        env["HERMES_REASONING_EFFORT"] = str(_resolved_effort)
     terminal_timeout = _worker_terminal_timeout_env(
         task.max_runtime_seconds,
         env.get("TERMINAL_TIMEOUT"),
@@ -17562,9 +17567,10 @@ def _default_spawn(
             cmd.extend(["--provider", task.provider_override])
     # Per-task thinking depth. Independent of the model override — a task can
     # run the profile's own model at a different depth — so this is its own
-    # branch, not a nested one.
-    if task.reasoning_effort:
-        cmd.extend(["--reasoning", task.reasoning_effort])
+    # branch, not a nested one. F-7: gleicher aufgelöster Wert wie der
+    # HERMES_REASONING_EFFORT-Export oben (reasoning_effort vor effort).
+    if task.reasoning_effort or task.effort:
+        cmd.extend(["--reasoning", task.reasoning_effort or task.effort])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
