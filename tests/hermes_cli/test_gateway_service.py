@@ -492,6 +492,11 @@ class TestGatewayServiceDetection:
 class TestGatewaySystemServiceRouting:
     def test_systemd_restart_gracefully_restarts_running_service_and_waits(self, monkeypatch, capsys):
         calls = []
+        # Umgebungsprobe ist nicht Testgegenstand: im hermetischen Sandkasten
+        # existiert kein User-D-Bus-/systemd-Socket (XDG_RUNTIME_DIR zeigt auf
+        # ein leeres tmpfs) — der Restart-Routing-Pfad soll trotzdem laufen.
+        monkeypatch.setattr(gateway_cli, "_user_systemd_socket_ready", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_wait_for_user_dbus_socket", lambda timeout=3.0: True)
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
@@ -511,6 +516,11 @@ class TestGatewaySystemServiceRouting:
         # A plain start does not break systemd's auto-restart timer once the
         # old gateway has exited with the planned restart code.
         def fake_subprocess_run(cmd, **kwargs):
+            if cmd and cmd[0] == "loginctl":
+                # Idempotente Linger-Absicherung der User-Unit (Gateway soll
+                # Logouts überleben) — legitimer Begleit-Call, kein Fehler.
+                calls.append(("loginctl", cmd))
+                return SimpleNamespace(stdout="", returncode=0)
             if "reset-failed" in cmd:
                 calls.append(("reset-failed", cmd))
                 return SimpleNamespace(stdout="", returncode=0)

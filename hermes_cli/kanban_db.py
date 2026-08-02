@@ -9474,7 +9474,7 @@ def _maybe_cleanup_worktree(conn: sqlite3.Connection, task_id: str, path: str) -
             steps.append(("branch", ["git", "-C", str(repo_root), "branch", "-D", branch]))
         for label, cmd in steps:
             try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+                res = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30, check=False)
                 if res.returncode != 0 and label == "remove":
                     # A failed removal leaves a stale worktree the cron reaper must
                     # mop up — surface it instead of silently swallowing (re-audit).

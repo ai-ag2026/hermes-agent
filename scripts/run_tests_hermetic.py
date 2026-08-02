@@ -229,7 +229,7 @@ def cron_manifest() -> str:
     jobs_file = REAL_HERMES / "cron" / "jobs.json"
     if not jobs_file.exists():
         return "absent"
-    data = json.loads(jobs_file.read_text())
+    data = json.loads(jobs_file.read_text(encoding='utf-8'))
     jobs = data.get("jobs", data) if isinstance(data, dict) else data
     ids = sorted(jobs.keys()) if isinstance(jobs, dict) else sorted(
         j["id"] for j in jobs)
@@ -381,7 +381,7 @@ def _untracked(repo: Path, ignored: bool) -> list[str]:
     """Untracked paths, either the normal ones or the *relevant* ignored ones."""
     cmd = ["git", "ls-files", "--others", "-z"]
     cmd += ["--ignored", "--exclude-standard"] if ignored else ["--exclude-standard"]
-    out = subprocess.run(cmd, cwd=repo, capture_output=True, text=True).stdout
+    out = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, encoding='utf-8', errors='replace').stdout
     paths = [p for p in out.split("\0") if p]
     if not ignored:
         return paths

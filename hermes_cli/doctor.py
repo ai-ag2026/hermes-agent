@@ -1727,7 +1727,12 @@ def run_doctor(args):
         # not found" warning. If the user has explicitly chosen
         # TERMINAL_ENV=docker inside the container they likely mounted
         # /var/run/docker.sock, so fall through to the normal check.
-        if terminal_env != "docker":
+        # Gleiches gilt für explizit gewählte CLOUD-Backends: vercel_sandbox/
+        # daytona brauchen keinen lokalen Daemon und funktionieren aus
+        # Containern — ihre Diagnosesektionen dürfen nicht durch die
+        # local-Degradierung verschluckt werden (F-4b: der Vercel-Check lief
+        # in Containern/Sandboxen nie).
+        if terminal_env not in ("docker", "vercel_sandbox", "daytona"):
             check_info(
                 "Running inside a container — using local terminal backend "
                 "(docker-in-docker is not configured by default)"

@@ -490,7 +490,15 @@ def _seed_supervise_skeleton(svc_dir: Path) -> None:
         path.chmod(mode)
         try:
             os.chown(path, _HERMES_UID, _HERMES_GID)
-        except PermissionError:
+        except OSError as _chown_exc:
+            import errno as _errno
+            if not isinstance(_chown_exc, PermissionError) and _chown_exc.errno != _errno.EINVAL:
+                raise
+            # EPERM: unprivilegierter Aufrufer (hermes-User selbst).
+            # EINVAL: User-Namespace ohne Mapping fuer UID 10000
+            #         (rootless Container, bwrap-Sandbox) - chown ist
+            #         dort prinzipbedingt unmoeglich, Besitz stimmt schon.
+
             # Running as the hermes user already — directory is hermes-
             # owned by default. The chown is a no-op in that case, so
             # swallowing this keeps both root and unprivileged callers
@@ -520,7 +528,15 @@ def _seed_supervise_skeleton(svc_dir: Path) -> None:
         control.chmod(0o660)
         try:
             os.chown(control, _HERMES_UID, _HERMES_GID)
-        except PermissionError:
+        except OSError as _chown_exc:
+            import errno as _errno
+            if not isinstance(_chown_exc, PermissionError) and _chown_exc.errno != _errno.EINVAL:
+                raise
+            # EPERM: unprivilegierter Aufrufer (hermes-User selbst).
+            # EINVAL: User-Namespace ohne Mapping fuer UID 10000
+            #         (rootless Container, bwrap-Sandbox) - chown ist
+            #         dort prinzipbedingt unmoeglich, Besitz stimmt schon.
+
             pass
 
     # If a log/ subdir is present (the canonical s6 logger pattern —
@@ -540,7 +556,15 @@ def _seed_supervise_skeleton(svc_dir: Path) -> None:
             log_control.chmod(0o660)
             try:
                 os.chown(log_control, _HERMES_UID, _HERMES_GID)
-            except PermissionError:
+            except OSError as _chown_exc:
+                import errno as _errno
+                if not isinstance(_chown_exc, PermissionError) and _chown_exc.errno != _errno.EINVAL:
+                    raise
+                # EPERM: unprivilegierter Aufrufer (hermes-User selbst).
+                # EINVAL: User-Namespace ohne Mapping fuer UID 10000
+                #         (rootless Container, bwrap-Sandbox) - chown ist
+                #         dort prinzipbedingt unmoeglich, Besitz stimmt schon.
+    
                 pass
 
 

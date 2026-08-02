@@ -369,6 +369,20 @@ def atomic_yaml_write(
         raise
 
 
+def _add_yaml11_string_bridge(yaml_rt) -> None:
+    """Dialekt-Brücke: ruamel schreibt YAML 1.2 ("off"/"yes" sind Strings und
+    landen unquoted), unsere Leser sind PyYAML 1.1 (plain "off" -> bool). Ambige
+    Plain-Strings werden gequotet, damit Werte wie tool_progress: "off" nicht
+    bei jedem Write zu False kippen (F-4b, 2026-08-02)."""
+    _boolish = {"y", "yes", "n", "no", "true", "false", "on", "off", "null", "~"}
+
+    def _repr_str(representer, s):
+        style = "'" if s.strip().lower() in _boolish else None
+        return representer.represent_scalar("tag:yaml.org,2002:str", s, style=style)
+
+    yaml_rt.representer.add_representer(str, _repr_str)
+
+
 def atomic_roundtrip_yaml_update(
     path: Union[str, Path],
     key_path: str,
@@ -392,6 +406,7 @@ def atomic_roundtrip_yaml_update(
     yaml_rt.allow_unicode = True
     yaml_rt.default_flow_style = False
     yaml_rt.indent(mapping=2, sequence=4, offset=2)
+    _add_yaml11_string_bridge(yaml_rt)
 
     if path.exists():
         with path.open("r", encoding="utf-8") as f:
@@ -501,6 +516,7 @@ def atomic_roundtrip_yaml_write(
     # Match atomic_roundtrip_yaml_update's layout so all round-trip writes emit
     # a consistent (non-mixed) indentation that stricter parsers accept (#31999).
     yaml_rt.indent(mapping=2, sequence=4, offset=2)
+    _add_yaml11_string_bridge(yaml_rt)
 
     merged: Any = data
     if isinstance(data, dict) and path.exists():

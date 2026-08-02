@@ -147,13 +147,30 @@ def test_env_key_still_used_for_public_https_base_url(monkeypatch, tmp_path):
     assert captured["api_key"] == "sk-proxy-key"
 
 
-def test_requirements_true_for_self_hosted_without_env_key(monkeypatch):
-    """check_tts_requirements() is True for a config base_url even with no env key."""
+def test_requirements_false_for_self_hosted_without_explicit_key(monkeypatch):
+    """Deployter Origin-Guard-Kontrakt (d2798a38, 01.08.): ein privater
+    base_url OHNE expliziten ``tts.openai.api_key`` ist NICHT verfügbar —
+    der Operator muss den (nicht-geheimen) Platzhalter bewusst setzen,
+    genau das erzwang das Human-Gate beim Live-Deploy. (Der alte Test
+    erwartete den Auto-Platzhalter-Kontrakt; überholt.)"""
     from tools import tts_tool
 
     monkeypatch.setattr(
         tts_tool, "_load_tts_config",
         lambda: {"provider": "openai", "openai": {"base_url": SELF, "model": "m"}},
+    )
+    monkeypatch.setattr(tts_tool, "_import_openai_client", lambda: object)
+
+    assert tts_tool.check_tts_requirements() is False
+
+
+def test_requirements_true_for_self_hosted_with_explicit_placeholder(monkeypatch):
+    from tools import tts_tool
+
+    monkeypatch.setattr(
+        tts_tool, "_load_tts_config",
+        lambda: {"provider": "openai", "openai": {
+            "base_url": SELF, "model": "m", "api_key": "not-needed"}},
     )
     monkeypatch.setattr(tts_tool, "_import_openai_client", lambda: object)
 

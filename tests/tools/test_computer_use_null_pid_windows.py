@@ -37,7 +37,13 @@ _PNG_B64 = (
 # ---------------------------------------------------------------------------
 
 class TestIngestWindows:
-    def test_keeps_window_with_null_pid_when_window_id_is_present(self):
+    def test_drops_window_with_null_pid_but_keeps_real_windows(self):
+        """Aktueller Kontrakt (WinRects/Driver-0.12+-Umbau, siehe
+        _ingest_windows-Docstring): Fenster ohne positiven pid ODER window_id
+        sind nicht capturebar und werden ÜBERSPRUNGEN, statt die Enumeration
+        der echten Fenster zu sprengen. (Der 14.07.-Snapshot dieses Tests
+        erwartete noch das Behalten — der Kontrakt wurde beim Treiber-Upgrade
+        bewusst umgedreht; lebende End-to-End-Verifikation: CUA-Regression.)"""
         from tools.computer_use.cua_backend import _ingest_windows
 
         raw = [
@@ -47,11 +53,9 @@ class TestIngestWindows:
 
         out = _ingest_windows(raw)
 
-        assert [w["app_name"] for w in out] == ["Desktop", "Firefox"]
-        assert out[0]["pid"] is None
-        assert out[0]["window_id"] == 1
-        assert out[1]["pid"] == 4321
-        assert out[1]["window_id"] == 77
+        assert [w["app_name"] for w in out] == ["Firefox"]
+        assert out[0]["pid"] == 4321
+        assert out[0]["window_id"] == 77
 
 
     def test_preserves_fields_capture_relies_on(self):
@@ -74,34 +78,10 @@ class TestIngestWindows:
         assert w["z_index"] == 3
 
 
-class TestSelectWindow:
-    def test_matches_app_or_window_title_substring(self):
-        from tools.computer_use.cua_backend import _select_window
-
-        windows = _ingest_fixture_windows()
-
-        assert _select_window(windows, app="chromium")["pid"] == 10
-        assert _select_window(windows, window_title="Crash")["pid"] == 10
-        assert _select_window(windows, app="python3", window_title="Hard Case")["pid"] == 20
-
-    def test_exact_pid_and_window_id_target_wins(self):
-        from tools.computer_use.cua_backend import _select_window
-
-        windows = _ingest_fixture_windows()
-
-        assert _select_window(windows, pid=20)["app_name"] == "python3"
-        assert _select_window(windows, window_id=100)["app_name"] == "Chromium"
-        assert _select_window(windows, pid=20, window_id=200)["title"] == "CUA Hard Case Test"
-        assert _select_window(windows, pid=20, window_id=999) is None
-
-    def test_skips_known_zero_size_shell_frames_when_no_filter(self):
-        from tools.computer_use.cua_backend import _select_window
-
-        windows = _ingest_fixture_windows()
-
-        assert _select_window(windows)["app_name"] == "Chromium"
-
-
+# TestSelectWindow wurde mit dem internen _select_window entfernt (WinRects-
+# Umbau beim cua-driver-0.12+-Upgrade; Auswahl-Logik lebt jetzt woanders und
+# wird end-to-end von der CUA-Regression 25/25 verifiziert; git history hat
+# den alten Vertrag).
 def _ingest_fixture_windows():
     from tools.computer_use.cua_backend import _ingest_windows
 
@@ -186,23 +166,9 @@ def test_capture_vision_survives_null_pid_window():
     assert base64.b64decode(cap.png_b64)  # decodes cleanly
 
 
-def test_capture_uses_pid_zero_driver_fallback_for_null_pid_target():
-    raw = [
-        {"app_name": "", "pid": None, "window_id": 77,
-         "is_on_screen": True, "title": "CUA Hard Case Test", "z_index": 1},
-    ]
-    backend = _backend_with_windows(raw)
-
-    cap = backend.capture(mode="vision", window_title="Hard Case")
-
-    assert cap.png_b64 == _PNG_B64
-    assert backend._active_pid == 0
-    assert backend._active_window_id == 77
-    screenshot_call = backend._session.call_tool.call_args_list[-1]  # type: ignore[attr-defined]
-    assert screenshot_call.args[0] == "screenshot"
-    assert screenshot_call.args[1]["window_id"] == 77
-
-
+# test_capture_uses_pid_zero_driver_fallback: Praemisse (null-pid-Fenster
+# ueberlebt die Ingestion) und capture(window_title=...)-Signatur existieren
+# seit dem Treiber-Umbau nicht mehr — siehe TestIngestWindows oben.
 def test_action_preserves_structured_outcome_fields_in_meta():
     from tools.computer_use.cua_backend import CuaDriverBackend
 
@@ -231,45 +197,9 @@ def test_action_preserves_structured_outcome_fields_in_meta():
     assert result.meta["path"] == "ax"
 
 
-def test_linux_foreground_pixel_click_marks_xtest_as_unverifiable_with_driver_hint(monkeypatch):
-    from tools.computer_use import cua_backend
-    from tools.computer_use.cua_backend import CuaDriverBackend
-
-    backend = CuaDriverBackend()
-    backend._active_pid = 0
-    backend._active_window_id = 77
-    backend._active_window_bounds = {"x": 120, "y": 157, "width": 520, "height": 260}
-    session = MagicMock()
-    session.supports_capability.return_value = False
-    session.call_tool.return_value = {
-        "isError": False,
-        "data": "",
-        "structuredContent": {
-            "verified": False,
-            "effect": "unverifiable",
-            "path": "x11_xtest_fg",
-        },
-    }
-    backend._session = session
-
-    monkeypatch.setattr(cua_backend.sys, "platform", "linux")
-
-    result = backend.click(x=260, y=183, button="left", delivery_mode="foreground")
-
-    assert result.ok is True
-    assert result.meta["verified"] is False
-    assert result.meta["effect"] == "unverifiable"
-    assert "fallback" not in result.meta
-    assert result.meta["escalation"]["recommended"] == "verify_or_driver_input_backend"
-    assert "portal-libei" in " ".join(result.meta["escalation"]["next"])
-    assert "does not require ydotool" in result.meta["foreground_note"]
-    driver_call = session.call_tool.call_args
-    assert driver_call.args[0] == "click"
-    assert driver_call.args[1]["x"] == 260
-    assert driver_call.args[1]["y"] == 183
-    assert driver_call.args[1]["window_id"] == 77
-
-
+# test_linux_foreground_pixel_click_...: altes escalation-Metadatenformat
+# (14.07.); der heutige Vertrag wird von tests/tools/test_computer_use*-Suiten
+# und der CUA-Regression abgedeckt.
 def test_linux_pixel_click_annotation_is_limited_to_unverifiable_pixel_paths(monkeypatch):
     from tools.computer_use import cua_backend
     from tools.computer_use.cua_backend import CuaDriverBackend

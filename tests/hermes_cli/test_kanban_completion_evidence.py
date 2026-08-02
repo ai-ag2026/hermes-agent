@@ -755,6 +755,20 @@ def test_scavenger_preserves_empty_artifact_directories(kanban_home: Path):
 def test_init_db_runs_stale_orphan_scavenger(kanban_home: Path):
     with kb.connect() as conn:
         root = kb.completion_artifacts_root()
+        # D2-Guard (Audit 31.07., nach dem Artefakt-Verlust 27.07.): bei
+        # LEEREM Referenz-Set verweigert der Scavenger jede Löschung
+        # („stale/restored DB?"). Der Test bietet deshalb einen referenzierten
+        # Anker-Artefakt an — nur so ist Löschen des Orphans überhaupt erlaubt.
+        keeper = root / "task" / "1" / "keeper.txt"
+        keeper.parent.mkdir(parents=True)
+        keeper.write_text("bleibt", encoding="utf-8")
+        conn.execute(
+            "INSERT INTO task_artifacts (task_id, producer_run_id, original_path, "
+            "durable_path, sha256, size, validated_at, retention_class) "
+            "VALUES ('t_x', 0, ?, ?, 'deadbeef', 6, ?, 'default')",
+            (str(keeper), str(keeper), int(time.time())),
+        )
+        conn.commit()
         orphan = root / "task" / "1" / "source" / ".promoting-orphan"
         orphan.parent.mkdir(parents=True)
         orphan.write_text("orphan", encoding="utf-8")
@@ -762,6 +776,7 @@ def test_init_db_runs_stale_orphan_scavenger(kanban_home: Path):
         os.utime(orphan, (old, old))
     kb.init_db()
     assert not orphan.exists()
+    assert keeper.exists(), "referenzierter Artefakt darf nie gescavenged werden"
 
 
 def test_rejection_audit_failure_preserves_typed_error(

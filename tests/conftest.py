@@ -620,6 +620,12 @@ def _isolated_cron_store(tmp_path, monkeypatch, _hermetic_environment):
                 raising=False)
 
     yield hermes_home
+
+
+# Dekorator ging im Upstream-Merge 30.07. (3579cb222) verloren — damit war die
+# suite-weite Browser-Neutralisierung (#35404) still deaktiviert und zwei Tests
+# fanden ihre Fixture nicht (F-4b, 02.08.).
+@pytest.fixture(autouse=True)
 def _neutralize_webbrowser(monkeypatch):
     """Record browser-open attempts instead of opening real browser windows."""
     import webbrowser as _webbrowser

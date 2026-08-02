@@ -111,8 +111,13 @@ class TestProviderSitesGuarded:
                           return_value={"provider": "xai",
                                         "xai": {"base_url": "http://192.168.1.9:9000/v1"}}), \
              patch("requests.post", _fake_post):
-            tt._transcribe_xai(str(wav), "grok")
-        assert captured["auth"] == f"Bearer {PLACEHOLDER_KEY}"
+            result = tt._transcribe_xai(str(wav), "grok")
+        # Deployter Origin-Guard-Kontrakt (d2798a38): privater Endpunkt ohne
+        # Config-Key => fail-closed OHNE HTTP-Call — der Cloud-Key verlaesst
+        # den Prozess nie (vorher: Platzhalter-Kontrakt, ueberholt).
+        assert "auth" not in captured
+        assert result["success"] is False
+        assert "stt.xai.api_key" in result["error"]
 
     def test_elevenlabs_stt_guarded(self, tmp_path):
         import tools.transcription_tools as tt
@@ -132,8 +137,10 @@ class TestProviderSitesGuarded:
                           return_value={"provider": "elevenlabs",
                                         "elevenlabs": {"base_url": "http://192.168.1.9:9000"}}), \
              patch("requests.post", _fake_post):
-            tt._transcribe_elevenlabs(str(wav), "scribe_v1")
-        assert captured["key"] == PLACEHOLDER_KEY
+            result = tt._transcribe_elevenlabs(str(wav), "scribe_v1")
+        assert "key" not in captured
+        assert result["success"] is False
+        assert "stt.elevenlabs.api_key" in result["error"]
 
     def test_deepinfra_stt_guarded(self, tmp_path):
         import tools.transcription_tools as tt
@@ -151,5 +158,7 @@ class TestProviderSitesGuarded:
                           return_value={"provider": "deepinfra",
                                         "deepinfra": {"base_url": "http://192.168.1.9:9000/v1"}}), \
              patch.object(tt, "_transcribe_openai", _fake_transcribe_openai):
-            tt._transcribe_deepinfra(str(wav), "some-model")
-        assert captured["api_key"] == PLACEHOLDER_KEY
+            result = tt._transcribe_deepinfra(str(wav), "some-model")
+        assert "api_key" not in captured
+        assert result["success"] is False
+        assert "stt.deepinfra.api_key" in result["error"]

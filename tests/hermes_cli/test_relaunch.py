@@ -106,6 +106,9 @@ class TestRelaunch:
             calls.append((path, argv))
             raise SystemExit(0)
 
+        # Hermetisch: der Runner ruft pytest mit "-p no:cacheprovider" auf,
+        # und -p ist ein inherit-getaggtes Hermes-Flag - argv sauber stellen.
+        monkeypatch.setattr(relaunch_mod.sys, "argv", ["hermes"])
         monkeypatch.setattr(relaunch_mod.os, "execvp", fake_execvp)
         monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: "/usr/bin/hermes")
 
@@ -119,6 +122,9 @@ class TestRelaunch:
         target is a .cmd shim or console-script wrapper (both common for
         hermes).  relaunch() must detect win32 and use subprocess.run +
         sys.exit instead."""
+        # Hermetisch: der Runner ruft pytest mit "-p no:cacheprovider" auf,
+        # und -p ist ein inherit-getaggtes Hermes-Flag - argv sauber stellen.
+        monkeypatch.setattr(relaunch_mod.sys, "argv", ["hermes"])
         monkeypatch.setattr(relaunch_mod.sys, "platform", "win32")
         monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: r"C:\Users\test\hermes.exe")
 
