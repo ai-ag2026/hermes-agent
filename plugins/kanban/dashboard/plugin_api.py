@@ -185,6 +185,13 @@ def _task_dict(
         "goal_mode": task.goal_mode,
         "goal_max_turns": task.goal_max_turns,
         "skills": task.skills,
+        # Operator-facing routing overrides (upstream 2026-08 cockpit fields):
+        # model/provider/thinking-depth are cockpit content, not secrets —
+        # they stay on the whitelist deliberately, the redaction stance below
+        # continues to apply to worker/session/gate internals.
+        "model_override": task.model_override,
+        "provider_override": task.provider_override,
+        "reasoning_effort": task.reasoning_effort,
         # Blocker prose is history/internal context, never dashboard payload.
         "block_reason": None,
     }
